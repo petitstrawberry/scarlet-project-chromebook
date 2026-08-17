@@ -1,0 +1,36 @@
+# Nix / direnv
+.direnv/
+/result
+/result-*
+
+# Local upstream checkouts and analysis artifacts
+/.cache/
+/work/
+/artifacts/
+
+# Rust / Scarlet generated output
+/target/
+target/
+/.scarlet/
+.scarlet/
+*.img
+*.cpio
+*.ext2
+*.vboot
+*.vboot.manifest.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs and editor/OS state
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Reproducibility locks are source files.
+!flake.lock
+!scarlet.lock
+!**/Cargo.lock

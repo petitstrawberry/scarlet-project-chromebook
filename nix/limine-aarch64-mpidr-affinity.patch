@@ -1,0 +1,40 @@
+From 8498055e43a1f10387d430691b2a95ecf1d4ef63 Mon Sep 17 00:00:00 2001
+From: Mintsuki <mintsuki@protonmail.com>
+Date: Sun, 2 Aug 2026 20:33:31 +0200
+Subject: [PATCH] sys/smp: Mask the aarch64 BSP MPIDR to its affinity fields
+
+Backport the AArch64 part of upstream Limine commit
+8498055e43a1f10387d430691b2a95ecf1d4ef63 onto the 12.4.0 release.
+
+---
+ common/sys/smp.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/common/sys/smp.c b/common/sys/smp.c
+index bf6c87b0..3c319068 100644
+--- a/common/sys/smp.c
++++ b/common/sys/smp.c
+@@ -499,8 +499,8 @@ static struct limine_mp_info *try_acpi_smp(size_t   *cpu_count,
+     uint64_t bsp_mpidr;
+     asm volatile ("mrs %0, mpidr_el1" : "=r"(bsp_mpidr));
+ 
+-    // This bit is Res1 in the system reg, but not included in the MPIDR from MADT
+-    bsp_mpidr &= ~((uint64_t)1 << 31);
++    // The MADT carries the affinity fields alone, so Res1, U and MT must go.
++    bsp_mpidr &= (uint64_t)0xff00ffffff;
+ 
+     *_bsp_mpidr = bsp_mpidr;
+ 
+@@ -607,8 +607,8 @@ static struct limine_mp_info *try_dtb_smp( void *dtb,
+     uint64_t bsp_mpidr;
+     asm volatile ("mrs %0, mpidr_el1" : "=r"(bsp_mpidr));
+ 
+-    // This bit is Res1 in the system reg, but not included in the MPIDR from DT
+-    bsp_mpidr &= ~((uint64_t)1 << 31);
++    // The device tree carries the affinity fields alone, so Res1, U and MT must go.
++    bsp_mpidr &= (uint64_t)0xff00ffffff;
+ 
+     *_bsp_mpidr = bsp_mpidr;
+ 
+-- 
+2.50.1

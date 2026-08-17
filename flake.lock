@@ -1,0 +1,119 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1786410043,
+        "narHash": "sha256-JTbODJPDcd3d8U7lO4MVUU3Yo0jz2KQSAHXka+IWBEo=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "8e2eeb9477c9d40009a5bd51cd3eef2f5abb26f1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1780365719,
+        "narHash": "sha256-QfWfccTN+70ZQ4m2qlU9PiKfz2Yppq94058iJyARNwc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "ffa10e26ae11d676b2db836259889f1f571cb14f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "scarlet-rust-toolchain": "scarlet-rust-toolchain",
+        "scarlet-sdk": "scarlet-sdk",
+        "vboot-reference": "vboot-reference"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "scarlet-rust-toolchain",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1780715792,
+        "narHash": "sha256-4+8gPeiPeud89mjo865RwpqmKwa1MThRsq2SvRxo7mg=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "27b7e78c6935293ee868469cc4172e9b8b17823b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "scarlet-rust-toolchain": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_2",
+        "rust-overlay": "rust-overlay"
+      },
+      "locked": {
+        "lastModified": 1786338406,
+        "narHash": "sha256-qaKBWju7H4LLigBgMKYkNsCGEKFh/Q9gkAlEqxxGfgw=",
+        "owner": "petitstrawberry",
+        "repo": "scarlet-rust-nix",
+        "rev": "6e6e8922ccc9f81f3c576df2fe368eb938f2cb8d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "petitstrawberry",
+        "repo": "scarlet-rust-nix",
+        "type": "github"
+      }
+    },
+    "scarlet-sdk": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786175829,
+        "narHash": "sha256-Sg0KfnnJuukvmLaSKLJXEhkIC2RhM1GRAfB1U7srhHA=",
+        "owner": "petitstrawberry",
+        "repo": "scarlet-sdk",
+        "rev": "a27a10a04452ecef3cbce65367d73e09ac91e264",
+        "type": "github"
+      },
+      "original": {
+        "owner": "petitstrawberry",
+        "repo": "scarlet-sdk",
+        "type": "github"
+      }
+    },
+    "vboot-reference": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786573359,
+        "narHash": "sha256-lgYNRXE1eJVMQY+AwlEoQufLiVNg6pDyJr5Wip0Uidg=",
+        "ref": "refs/heads/main",
+        "rev": "c71f57be588c1ca69052e6f7208cc16437db513e",
+        "revCount": 3825,
+        "type": "git",
+        "url": "https://chromium.googlesource.com/chromiumos/platform/vboot_reference"
+      },
+      "original": {
+        "rev": "c71f57be588c1ca69052e6f7208cc16437db513e",
+        "type": "git",
+        "url": "https://chromium.googlesource.com/chromiumos/platform/vboot_reference"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
