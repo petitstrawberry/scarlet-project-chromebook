@@ -3,6 +3,9 @@ schema_version = 2
 [project]
 name = "scarlet-aarch64-coachz-limine"
 
+[hooks.post-image]
+command = "tools/inject-limine-efi.sh"
+
 [bsp]
 path = "bsp"
 package = "scarlet"

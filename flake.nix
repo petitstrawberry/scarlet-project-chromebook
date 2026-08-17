@@ -12,7 +12,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     scarlet-rust-toolchain.url = "github:petitstrawberry/scarlet-rust-nix";
     scarlet-sdk = {
-      url = "github:petitstrawberry/scarlet-sdk";
+      url = "git+https://github.com/petitstrawberry/scarlet-sdk.git?ref=main";
       flake = false;
     };
     vboot-reference = {

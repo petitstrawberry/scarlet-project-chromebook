@@ -83,17 +83,18 @@
     "scarlet-sdk": {
       "flake": false,
       "locked": {
-        "lastModified": 1786175829,
-        "narHash": "sha256-Sg0KfnnJuukvmLaSKLJXEhkIC2RhM1GRAfB1U7srhHA=",
-        "owner": "petitstrawberry",
-        "repo": "scarlet-sdk",
-        "rev": "a27a10a04452ecef3cbce65367d73e09ac91e264",
-        "type": "github"
+        "lastModified": 1786975649,
+        "narHash": "sha256-Nam5HyNUuPRv5zKP8Amec2Jav/QgvK4EpjGh0fHttAY=",
+        "ref": "main",
+        "rev": "523afd75133d9ec110abce016762a27656dd45f4",
+        "revCount": 42,
+        "type": "git",
+        "url": "https://github.com/petitstrawberry/scarlet-sdk.git"
       },
       "original": {
-        "owner": "petitstrawberry",
-        "repo": "scarlet-sdk",
-        "type": "github"
+        "ref": "main",
+        "type": "git",
+        "url": "https://github.com/petitstrawberry/scarlet-sdk.git"
       }
     },
     "vboot-reference": {
