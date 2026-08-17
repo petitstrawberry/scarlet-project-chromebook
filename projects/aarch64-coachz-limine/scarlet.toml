@@ -1,0 +1,37 @@
+schema_version = 2
+
+[project]
+name = "scarlet-aarch64-coachz-limine"
+
+[bsp]
+path = "bsp"
+package = "scarlet"
+
+[bsp.kernel]
+source = { path = "../../../Scarlet/kernel" }
+features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = true }
+
+[images]
+
+[images.initramfs]
+format = "newc"
+output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
+
+[[images.initramfs.layers]]
+kind = "bundle"
+path = "../../../Scarlet/bundles/base/bundle.toml"
+
+[[images.initramfs.layers]]
+kind = "bundle"
+path = "../../../Scarlet/bundles/cli-utils/bundle.toml"
+
+[images.boot]
+format = "limine-uefi"
+output = ".scarlet/images/esp-aarch64-coachz.img"
+cmdline = "rootwait"
+deps = ["initramfs"]
+
+[[images.boot.layers]]
+kind = "image"
+source = "initramfs"
+to = "/boot/initramfs"
