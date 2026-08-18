@@ -16,6 +16,7 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 
 [modules]
 "scarlet-driver-qcom-geni-i2c" = { path = "../../drivers/i2c/qcom-geni", enabled = true }
+"scarlet-driver-ti-sn65dsi86" = { path = "../../drivers/display/bridge/ti-sn65dsi86", enabled = true }
 
 [images]
 
