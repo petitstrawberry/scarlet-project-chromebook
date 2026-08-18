@@ -128,7 +128,11 @@ impl Sc7180DisplayEngine {
         #[cfg(feature = "diagnostic-border-fill")]
         println!("[qcom-sc7180-mdss] DPU border-only diagnostic enabled (white)");
         self.dpu.configure(timing, scanout_dma_addr)?;
-        dsi.clear_fifo_status();
+        let pre_video_fifo = dsi.clear_fifo_status();
+        println!(
+            "[mdss-diag] dsi pre-video fifo={:#010x}",
+            pre_video_fifo,
+        );
         dsi.configure_video(timing);
         self.dpu.start();
         #[cfg(feature = "diagnostic-dsi-pattern")]

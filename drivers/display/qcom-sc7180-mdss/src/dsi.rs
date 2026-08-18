@@ -138,9 +138,13 @@ impl DsiHost {
         self.update(CLOCK_CONTROL, 0, 1 << 2);
         self.update(CLOCK_CONTROL, 0, (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5));
         self.write(TRIGGER_CONTROL, 4);
+        // Keep the video engine stopped until timing and the upstream DPU are
+        // ready. Linux makes the same split between host power-on and video
+        // mode enable; starting it here can latch a FIFO overflow while the
+        // SN65 link is still being trained.
         self.write(
             CONTROL,
-            (lane_mask << 4) | CONTROL_ENABLE | CONTROL_VIDEO_ENABLE | CONTROL_CLOCK_LANE_ENABLE,
+            (lane_mask << 4) | CONTROL_ENABLE | CONTROL_CLOCK_LANE_ENABLE,
         );
         self.write(COMMAND_DMA_CONTROL, (1 << 28) | (1 << 26));
         self.write(EOT_PACKET_CONTROL, 1);
@@ -184,11 +188,12 @@ impl DsiHost {
     /// Clear FIFO faults accumulated while the host is enabled but the DPU
     /// stream is not running. The register is write-one-to-clear; the live
     /// FIFO empty/full state remains readable after this write.
-    pub(crate) fn clear_fifo_status(&self) {
+    pub(crate) fn clear_fifo_status(&self) -> u32 {
         let status = self.read(FIFO_STATUS);
         if status != 0 {
             self.write(FIFO_STATUS, status);
         }
+        status
     }
 
     /// Enable the DSI6G video-mode test-pattern generator used by Linux.
