@@ -4,11 +4,9 @@
 
 //! TI SN65DSI86 MIPI DSI to embedded DisplayPort bridge.
 //!
-//! This first stage binds the bridge as an I2C client, verifies its device ID,
-//! and exposes non-destructive diagnostics to later native DSI/display
-//! modules. It deliberately preserves the display state inherited from
-//! Depthcharge and U-Boot; native link programming belongs in the DSI/DPU
-//! takeover stage.
+//! The driver binds the bridge as an I2C client, exposes DisplayPort AUX, reads
+//! and decodes the preferred EDID timing, and programs the DSI-to-eDP link for
+//! a native display controller.
 //!
 //! # Provenance
 //!
@@ -40,7 +38,21 @@ const DP_PLL_SOURCE: u8 = 0x0a;
 const PLL_ENABLE: u8 = 0x0d;
 const DSI_LANES: u8 = 0x10;
 const DSI_CLOCK: u8 = 0x12;
+const ACTIVE_WIDTH_LOW: u8 = 0x20;
+const ACTIVE_WIDTH_HIGH: u8 = 0x21;
+const ACTIVE_HEIGHT_LOW: u8 = 0x24;
+const ACTIVE_HEIGHT_HIGH: u8 = 0x25;
+const HSYNC_WIDTH_LOW: u8 = 0x2c;
+const HSYNC_WIDTH_HIGH: u8 = 0x2d;
+const VSYNC_WIDTH_LOW: u8 = 0x30;
+const VSYNC_WIDTH_HIGH: u8 = 0x31;
+const HORIZONTAL_BACK_PORCH: u8 = 0x34;
+const VERTICAL_BACK_PORCH: u8 = 0x36;
+const HORIZONTAL_FRONT_PORCH: u8 = 0x38;
+const VERTICAL_FRONT_PORCH: u8 = 0x3a;
+const COLOR_BAR: u8 = 0x3c;
 const ENHANCED_FRAME: u8 = 0x5a;
+const DATA_FORMAT: u8 = 0x5b;
 const HPD_DISABLE: u8 = 0x5c;
 const SSC_CONFIG: u8 = 0x93;
 const DATA_RATE: u8 = 0x94;
@@ -57,6 +69,9 @@ const DP_PLL_LOCKED: u8 = 1 << 7;
 const VIDEO_STREAM_ENABLED: u8 = 1 << 3;
 const HPD_IS_DISABLED: u8 = 1 << 0;
 const HPD_DEBOUNCED_STATE: u8 = 1 << 4;
+const MAIN_LINK_OFF: u8 = 0x0;
+const MAIN_LINK_NORMAL: u8 = 0x1;
+const MAIN_LINK_SEMI_AUTOMATIC_TRAINING: u8 = 0x0a;
 const AUX_SEND: u8 = 1 << 0;
 const AUX_REPLY_TIMEOUT: u8 = 1 << 3;
 const AUX_DEFERRED: u8 = 1 << 4;
@@ -69,6 +84,27 @@ const AUX_MAX_PAYLOAD: usize = 16;
 const AUX_ADDRESS_MASK: u32 = 0x000f_ffff;
 const AUX_TIMEOUT_US: u64 = 50_000;
 const AUX_POLL_INTERVAL_US: u64 = 10;
+const PLL_TIMEOUT_US: u64 = 500_000;
+const LINK_TRAINING_TIMEOUT_US: u64 = 500_000;
+const LINK_TRAINING_RETRIES: usize = 10;
+
+const DPCD_MAX_LINK_RATE: u32 = 0x001;
+const DPCD_CONFIGURATION_SET: u32 = 0x10a;
+const DPCD_DISPLAY_CONTROL: u32 = 0x720;
+const DPCD_BACKLIGHT_MODE: u32 = 0x721;
+const DPCD_BACKLIGHT_BRIGHTNESS_MSB: u32 = 0x722;
+const DPCD_BACKLIGHT_CONTROL_MODE: u8 = 0x2;
+const DPCD_BACKLIGHT_ENABLE: u8 = 0x1;
+const DPCD_LANE_COUNT_MASK: u8 = 0x1f;
+
+const DP_RATE_MBPS: [u32; 8] = [0, 1620, 2160, 2430, 2700, 3240, 4320, 5400];
+const DP_LINK_RATE_1_62: u8 = 0x06;
+const DP_LINK_RATE_2_70: u8 = 0x0a;
+const DP_LINK_RATE_5_40: u8 = 0x14;
+
+const DSI_MIN_CLOCK_MHZ: u64 = 40;
+const DSI_MAX_CLOCK_MHZ: u64 = 750;
+const DSI_CLOCK_STEP_MHZ: u64 = 5;
 
 const EDID_I2C_ADDRESS: u32 = 0x50;
 const EDID_BLOCK_SIZE: usize = 128;
@@ -123,6 +159,96 @@ impl From<I2cError> for Sn65dsi86AuxError {
     }
 }
 
+/// Complete timing for one progressive display mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayTiming {
+    /// Pixel clock in kHz.
+    pub pixel_clock_khz: u32,
+    /// Active horizontal pixels.
+    pub hactive: u16,
+    /// Total horizontal blanking pixels.
+    pub hblank: u16,
+    /// Horizontal front porch in pixels.
+    pub hsync_offset: u16,
+    /// Horizontal sync pulse width in pixels.
+    pub hsync_width: u16,
+    /// Active vertical lines.
+    pub vactive: u16,
+    /// Total vertical blanking lines.
+    pub vblank: u16,
+    /// Vertical front porch in lines.
+    pub vsync_offset: u16,
+    /// Vertical sync pulse width in lines.
+    pub vsync_width: u16,
+}
+
+impl DisplayTiming {
+    /// Total horizontal pixels including blanking.
+    pub const fn horizontal_total(self) -> u32 {
+        self.hactive as u32 + self.hblank as u32
+    }
+
+    /// Total vertical lines including blanking.
+    pub const fn vertical_total(self) -> u32 {
+        self.vactive as u32 + self.vblank as u32
+    }
+
+    /// Horizontal back porch in pixels.
+    pub fn horizontal_back_porch(self) -> Option<u16> {
+        self.hblank
+            .checked_sub(self.hsync_offset)?
+            .checked_sub(self.hsync_width)
+    }
+
+    /// Vertical back porch in lines.
+    pub fn vertical_back_porch(self) -> Option<u16> {
+        self.vblank
+            .checked_sub(self.vsync_offset)?
+            .checked_sub(self.vsync_width)
+    }
+
+    fn validate(self) -> Result<Self, Sn65dsi86LinkError> {
+        if self.pixel_clock_khz == 0
+            || self.hactive == 0
+            || self.vactive == 0
+            || self.horizontal_back_porch().is_none()
+            || self.vertical_back_porch().is_none()
+        {
+            return Err(Sn65dsi86LinkError::InvalidTiming);
+        }
+        Ok(self)
+    }
+}
+
+/// Error returned while preparing or training the native display link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sn65dsi86LinkError {
+    /// The bridge's register I2C transaction failed.
+    I2c(I2cError),
+    /// A DisplayPort AUX transaction failed.
+    Aux(Sn65dsi86AuxError),
+    /// The EDID preferred timing is absent or malformed.
+    InvalidTiming,
+    /// The sink and bridge have no usable lane/rate combination.
+    UnsupportedLink,
+    /// The DisplayPort PLL did not lock.
+    PllTimeout,
+    /// Semi-automatic DisplayPort link training did not converge.
+    LinkTrainingFailed,
+}
+
+impl From<I2cError> for Sn65dsi86LinkError {
+    fn from(error: I2cError) -> Self {
+        Self::I2c(error)
+    }
+}
+
+impl From<Sn65dsi86AuxError> for Sn65dsi86LinkError {
+    fn from(error: Sn65dsi86AuxError) -> Self {
+        Self::Aux(error)
+    }
+}
+
 /// Up to two validated 128-byte EDID blocks read through DisplayPort AUX.
 #[derive(Clone)]
 pub struct Sn65dsi86Edid {
@@ -139,6 +265,40 @@ impl Sn65dsi86Edid {
     /// Return the number of complete EDID blocks.
     pub const fn block_count(&self) -> usize {
         self.blocks
+    }
+
+    /// Decode the first detailed timing descriptor from the base EDID block.
+    pub fn preferred_timing(&self) -> Result<DisplayTiming, Sn65dsi86LinkError> {
+        const DETAILED_TIMING_OFFSET: usize = 54;
+        const DETAILED_TIMING_SIZE: usize = 18;
+
+        let descriptor = self
+            .as_bytes()
+            .get(DETAILED_TIMING_OFFSET..DETAILED_TIMING_OFFSET + DETAILED_TIMING_SIZE)
+            .ok_or(Sn65dsi86LinkError::InvalidTiming)?;
+        let pixel_clock_khz = u32::from(u16::from_le_bytes([descriptor[0], descriptor[1]])) * 10;
+        let hactive = u16::from(descriptor[2]) | (u16::from(descriptor[4] & 0xf0) << 4);
+        let hblank = u16::from(descriptor[3]) | (u16::from(descriptor[4] & 0x0f) << 8);
+        let vactive = u16::from(descriptor[5]) | (u16::from(descriptor[7] & 0xf0) << 4);
+        let vblank = u16::from(descriptor[6]) | (u16::from(descriptor[7] & 0x0f) << 8);
+        let hsync_offset = u16::from(descriptor[8]) | (u16::from(descriptor[11] & 0xc0) << 2);
+        let hsync_width = u16::from(descriptor[9]) | (u16::from(descriptor[11] & 0x30) << 4);
+        let vsync_offset = u16::from(descriptor[10] >> 4) | (u16::from(descriptor[11] & 0x0c) << 2);
+        let vsync_width =
+            u16::from(descriptor[10] & 0x0f) | (u16::from(descriptor[11] & 0x03) << 4);
+
+        DisplayTiming {
+            pixel_clock_khz,
+            hactive,
+            hblank,
+            hsync_offset,
+            hsync_width,
+            vactive,
+            vblank,
+            vsync_offset,
+            vsync_width,
+        }
+        .validate()
     }
 }
 
@@ -235,6 +395,34 @@ impl Sn65dsi86 {
 
     fn read_u8(&self, register: u8) -> Result<u8, I2cError> {
         Ok(self.read_exact::<1>(register)?[0])
+    }
+
+    fn write_u8(&self, register: u8, value: u8) -> Result<(), I2cError> {
+        self.write_bytes(register, &[value])
+    }
+
+    fn update_u8(&self, register: u8, mask: u8, value: u8) -> Result<(), I2cError> {
+        let current = self.read_u8(register)?;
+        self.write_u8(register, (current & !mask) | (value & mask))
+    }
+
+    fn wait_register(
+        &self,
+        register: u8,
+        timeout_us: u64,
+        predicate: impl Fn(u8) -> bool,
+    ) -> Result<u8, I2cError> {
+        let start = time::current_time();
+        loop {
+            let value = self.read_u8(register)?;
+            if predicate(value) {
+                return Ok(value);
+            }
+            if time::current_time().saturating_sub(start) >= timeout_us {
+                return Err(I2cError::Timeout);
+            }
+            time::udelay(100);
+        }
     }
 
     fn verify_device_id(&self) -> Result<(), I2cError> {
@@ -351,6 +539,27 @@ impl Sn65dsi86 {
         Ok(())
     }
 
+    /// Write an arbitrary DPCD range using native AUX requests.
+    pub fn write_dpcd(&self, mut address: u32, input: &[u8]) -> Result<(), Sn65dsi86AuxError> {
+        let _guard = self.aux_lock.lock();
+        for chunk in input.chunks(AUX_MAX_PAYLOAD) {
+            let mut payload = [0u8; AUX_MAX_PAYLOAD];
+            payload[..chunk.len()].copy_from_slice(chunk);
+            let sent = self.aux_transfer_locked(
+                DpAuxRequest::NativeWrite,
+                address,
+                &mut payload[..chunk.len()],
+            )?;
+            if sent != chunk.len() {
+                return Err(Sn65dsi86AuxError::ShortReply);
+            }
+            address = address
+                .checked_add(chunk.len() as u32)
+                .ok_or(Sn65dsi86AuxError::InvalidArgument)?;
+        }
+        Ok(())
+    }
+
     fn read_edid_block(
         &self,
         block: usize,
@@ -404,6 +613,160 @@ impl Sn65dsi86 {
             edid.blocks = 2;
         }
         Ok(edid)
+    }
+
+    /// Select the board's 19.2 MHz reference clock and ignore the HPD input.
+    ///
+    /// CoachZ wires the bridge interrupt as HPD but declares `no-hpd`; the
+    /// panel power sequence is controlled by the board instead.
+    pub fn initialize_reference_clock(&self) -> Result<(), I2cError> {
+        self.update_u8(HPD_DISABLE, HPD_IS_DISABLED, HPD_IS_DISABLED)?;
+        // REFCLK_FREQ bits 3:1: selector 1 is 19.2 MHz.
+        self.update_u8(DP_PLL_SOURCE, 0x0e, 1 << 1)
+    }
+
+    fn required_dp_rate_mbps(
+        timing: DisplayTiming,
+        dp_lanes: u8,
+    ) -> Result<u32, Sn65dsi86LinkError> {
+        if dp_lanes == 0 {
+            return Err(Sn65dsi86LinkError::UnsupportedLink);
+        }
+        // The bridge emits an 18-bit eDP stream. Account for DisplayPort's
+        // 8b/10b encoding when selecting the per-lane symbol rate.
+        let numerator = u64::from(timing.pixel_clock_khz) * 18 * 10;
+        let denominator = u64::from(dp_lanes) * 8 * 1_000;
+        let rate = numerator.div_ceil(denominator);
+        u32::try_from(rate).map_err(|_| Sn65dsi86LinkError::UnsupportedLink)
+    }
+
+    fn select_dp_rate(
+        timing: DisplayTiming,
+        dp_lanes: u8,
+        sink_max_rate: u8,
+    ) -> Result<u8, Sn65dsi86LinkError> {
+        let required = Self::required_dp_rate_mbps(timing, dp_lanes)?;
+        let max_selector = match sink_max_rate {
+            DP_LINK_RATE_1_62 => 1,
+            DP_LINK_RATE_2_70 => 4,
+            DP_LINK_RATE_5_40 => 7,
+            _ => 7,
+        };
+        [1usize, 4, 7]
+            .into_iter()
+            .find(|selector| *selector <= max_selector && DP_RATE_MBPS[*selector] >= required)
+            .and_then(|selector| u8::try_from(selector).ok())
+            .ok_or(Sn65dsi86LinkError::UnsupportedLink)
+    }
+
+    fn configure_timing_registers(&self, timing: DisplayTiming) -> Result<(), Sn65dsi86LinkError> {
+        let hback = timing
+            .horizontal_back_porch()
+            .ok_or(Sn65dsi86LinkError::InvalidTiming)?;
+        let vback = timing
+            .vertical_back_porch()
+            .ok_or(Sn65dsi86LinkError::InvalidTiming)?;
+        let hfront =
+            u8::try_from(timing.hsync_offset).map_err(|_| Sn65dsi86LinkError::InvalidTiming)?;
+        let vfront =
+            u8::try_from(timing.vsync_offset).map_err(|_| Sn65dsi86LinkError::InvalidTiming)?;
+        let hback = u8::try_from(hback).map_err(|_| Sn65dsi86LinkError::InvalidTiming)?;
+        let vback = u8::try_from(vback).map_err(|_| Sn65dsi86LinkError::InvalidTiming)?;
+
+        self.write_u8(ACTIVE_WIDTH_LOW, timing.hactive as u8)?;
+        self.write_u8(ACTIVE_WIDTH_HIGH, (timing.hactive >> 8) as u8)?;
+        self.write_u8(ACTIVE_HEIGHT_LOW, timing.vactive as u8)?;
+        self.write_u8(ACTIVE_HEIGHT_HIGH, (timing.vactive >> 8) as u8)?;
+        self.write_u8(HSYNC_WIDTH_LOW, timing.hsync_width as u8)?;
+        self.write_u8(HSYNC_WIDTH_HIGH, (timing.hsync_width >> 8) as u8)?;
+        self.write_u8(VSYNC_WIDTH_LOW, timing.vsync_width as u8)?;
+        self.write_u8(VSYNC_WIDTH_HIGH, (timing.vsync_width >> 8) as u8)?;
+        self.write_u8(HORIZONTAL_BACK_PORCH, hback)?;
+        self.write_u8(VERTICAL_BACK_PORCH, vback)?;
+        self.write_u8(HORIZONTAL_FRONT_PORCH, hfront)?;
+        self.write_u8(VERTICAL_FRONT_PORCH, vfront)?;
+        Ok(())
+    }
+
+    fn train_link(&self) -> Result<(), Sn65dsi86LinkError> {
+        self.write_u8(PLL_ENABLE, 1)?;
+        if self
+            .wait_register(DP_PLL_SOURCE, PLL_TIMEOUT_US, |value| {
+                value & DP_PLL_LOCKED != 0
+            })
+            .is_err()
+        {
+            return Err(Sn65dsi86LinkError::PllTimeout);
+        }
+
+        self.write_dpcd(DPCD_CONFIGURATION_SET, &[1])?;
+        for _ in 0..LINK_TRAINING_RETRIES {
+            self.write_u8(MAIN_LINK_MODE, MAIN_LINK_SEMI_AUTOMATIC_TRAINING)?;
+            match self.wait_register(MAIN_LINK_MODE, LINK_TRAINING_TIMEOUT_US, |value| {
+                value == MAIN_LINK_NORMAL || value == MAIN_LINK_OFF
+            }) {
+                Ok(MAIN_LINK_NORMAL) => return Ok(()),
+                Ok(_) | Err(I2cError::Timeout) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(Sn65dsi86LinkError::LinkTrainingFailed)
+    }
+
+    /// Configure and train the bridge for one DSI video mode.
+    ///
+    /// The native SC7180 path uses four DSI lanes. The eDP lane count is
+    /// clamped to the sink capability reported through DPCD.
+    pub fn configure_link(
+        &self,
+        timing: DisplayTiming,
+        dsi_lanes: u8,
+        dsi_bits_per_pixel: u8,
+    ) -> Result<(), Sn65dsi86LinkError> {
+        let timing = timing.validate()?;
+        if !(1..=4).contains(&dsi_lanes) || dsi_bits_per_pixel == 0 {
+            return Err(Sn65dsi86LinkError::UnsupportedLink);
+        }
+
+        self.initialize_reference_clock()?;
+        let mut sink = [0u8; 2];
+        self.read_dpcd(DPCD_MAX_LINK_RATE, &mut sink)?;
+        let dp_lanes = (sink[1] & DPCD_LANE_COUNT_MASK).min(4);
+        if dp_lanes == 0 {
+            return Err(Sn65dsi86LinkError::UnsupportedLink);
+        }
+        let dp_rate = Self::select_dp_rate(timing, dp_lanes, sink[0])?;
+
+        self.update_u8(DSI_LANES, 0x1f << 3, (4 - dsi_lanes) << 3)?;
+        self.update_u8(SSC_CONFIG, 0x7 << 4, dp_lanes.min(3) << 4)?;
+
+        let dsi_clock_mhz = (u64::from(timing.pixel_clock_khz) * u64::from(dsi_bits_per_pixel)
+            / u64::from(dsi_lanes)
+            / 2
+            / 1_000)
+            .clamp(DSI_MIN_CLOCK_MHZ, DSI_MAX_CLOCK_MHZ);
+        self.write_u8(DSI_CLOCK, (dsi_clock_mhz / DSI_CLOCK_STEP_MHZ) as u8)?;
+        self.update_u8(DATA_RATE, 0xe0, dp_rate << 5)?;
+
+        self.update_u8(ENHANCED_FRAME, VIDEO_STREAM_ENABLED, 0)?;
+        self.train_link()?;
+        self.configure_timing_registers(timing)?;
+        // The SN65 bridge consumes RGB888 over DSI and emits its 18-bit eDP
+        // stream when this selector is set.
+        self.write_u8(DATA_FORMAT, 1)?;
+        self.write_u8(COLOR_BAR, 5)?;
+        self.update_u8(ENHANCED_FRAME, VIDEO_STREAM_ENABLED, VIDEO_STREAM_ENABLED)?;
+        Ok(())
+    }
+
+    /// Enable sink-controlled eDP backlight at full brightness.
+    ///
+    /// CoachZ normally uses the Chrome EC PWM path, so callers should only use
+    /// this fallback when the sink advertises DPCD backlight control.
+    pub fn enable_dpcd_backlight(&self) -> Result<(), Sn65dsi86AuxError> {
+        self.write_dpcd(DPCD_BACKLIGHT_MODE, &[DPCD_BACKLIGHT_CONTROL_MODE])?;
+        self.write_dpcd(DPCD_BACKLIGHT_BRIGHTNESS_MSB, &[0xff])?;
+        self.write_dpcd(DPCD_DISPLAY_CONTROL, &[DPCD_BACKLIGHT_ENABLE])
     }
 
     /// Return the bridge's Device Tree phandle.
@@ -469,7 +832,37 @@ fn resolve_i2c_bus(device: &PlatformDeviceInfo) -> Result<(u32, Arc<dyn I2cBus>)
     }
 }
 
+fn read_be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn enable_bridge_gpio(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+    let Some(property) = device.property("enable-gpios") else {
+        return Ok(());
+    };
+    let bytes = property.value();
+    let controller_phandle = read_be_u32(bytes, 0).ok_or("ti-sn65dsi86: malformed enable-gpios")?;
+    let pin = read_be_u32(bytes, 4).ok_or("ti-sn65dsi86: malformed enable-gpios")?;
+    let flags = read_be_u32(bytes, 8).ok_or("ti-sn65dsi86: malformed enable-gpios")?;
+    let controller = DeviceManager::get_manager()
+        .get_gpio_controller(controller_phandle)
+        .ok_or_else(|| {
+            early_println!(
+                "[ti-sn65dsi86] GPIO controller {:#x} is not ready, deferring",
+                controller_phandle
+            );
+            scarlet::device::manager::PROBE_DEFER
+        })?;
+    let asserted = flags & 1 == 0;
+    controller.set_direction_output(pin, asserted);
+    time::udelay(2_000);
+    Ok(())
+}
+
 fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+    enable_bridge_gpio(device)?;
     let (bus_phandle, bus) = resolve_i2c_bus(device)?;
     let address = read_i2c_address(device)?;
     let phandle = read_phandle(device)?;
