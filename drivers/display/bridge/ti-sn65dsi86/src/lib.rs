@@ -63,6 +63,8 @@ const AUX_LENGTH: u8 = 0x77;
 const AUX_COMMAND: u8 = 0x78;
 const AUX_READ_DATA: u8 = 0x79;
 const AUX_STATUS: u8 = 0xf4;
+const ERROR_STATUS_START: u8 = 0xf0;
+const VIDEO_ERROR_STATUS_END: u8 = 0xf7;
 
 const DEVICE_ID: [u8; 8] = *b"68ISD   ";
 const DP_PLL_LOCKED: u8 = 1 << 7;
@@ -325,6 +327,10 @@ pub struct Sn65dsi86DiagnosticSnapshot {
     pub data_rate: u8,
     /// Raw main-link mode register.
     pub main_link_mode: u8,
+    /// Raw internal color-bar generator register.
+    pub color_bar: u8,
+    /// Raw status/error register window `0xF0..=0xF8`.
+    pub error_status: [u8; 9],
 }
 
 impl Sn65dsi86DiagnosticSnapshot {
@@ -347,6 +353,33 @@ impl Sn65dsi86DiagnosticSnapshot {
     pub const fn hpd_asserted(self) -> bool {
         self.hpd & HPD_DEBOUNCED_STATE != 0
     }
+
+    /// Return whether the bridge's internal color-bar generator is enabled.
+    pub const fn color_bar_enabled(self) -> bool {
+        self.color_bar & (1 << 4) != 0
+    }
+}
+
+/// Internal SN65DSI86 DisplayPort test-pattern selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Sn65dsi86ColorBar {
+    /// Eight vertical SMPTE color bars.
+    VerticalEightColors = 0,
+    /// Eight vertical grayscale bars.
+    VerticalEightGrayscale = 1,
+    /// Three vertical color bars.
+    VerticalThreeColors = 2,
+    /// Vertical stripe pattern.
+    VerticalStripes = 3,
+    /// Eight horizontal SMPTE color bars.
+    HorizontalEightColors = 4,
+    /// Eight horizontal grayscale bars.
+    HorizontalEightGrayscale = 5,
+    /// Three horizontal color bars.
+    HorizontalThreeColors = 6,
+    /// Horizontal stripe pattern.
+    HorizontalStripes = 7,
 }
 
 /// An SN65DSI86 bridge connected to a Scarlet I2C bus.
@@ -446,7 +479,18 @@ impl Sn65dsi86 {
             ssc_config: self.read_u8(SSC_CONFIG)?,
             data_rate: self.read_u8(DATA_RATE)?,
             main_link_mode: self.read_u8(MAIN_LINK_MODE)?,
+            color_bar: self.read_u8(COLOR_BAR)?,
+            error_status: self.read_exact::<9>(ERROR_STATUS_START)?,
         })
+    }
+
+    /// Select the bridge's DisplayPort-side test pattern.
+    ///
+    /// The generator bypasses the DSI input and isolates panel, backlight, and
+    /// eDP link failures from the source display-controller path.
+    pub fn set_color_bar(&self, pattern: Option<Sn65dsi86ColorBar>) -> Result<(), I2cError> {
+        let value = pattern.map_or(0, |pattern| (1 << 4) | pattern as u8);
+        self.write_u8(COLOR_BAR, value)
     }
 
     fn aux_transfer_locked(
@@ -713,6 +757,13 @@ impl Sn65dsi86 {
         Err(Sn65dsi86LinkError::LinkTrainingFailed)
     }
 
+    fn clear_video_error_status(&self) -> Result<(), I2cError> {
+        for register in ERROR_STATUS_START..=VIDEO_ERROR_STATUS_END {
+            self.write_u8(register, 0xff)?;
+        }
+        Ok(())
+    }
+
     /// Configure and train the bridge for one DSI video mode.
     ///
     /// The native SC7180 path uses four DSI lanes. The eDP lane count is
@@ -755,6 +806,9 @@ impl Sn65dsi86 {
         // stream when this selector is set.
         self.write_u8(DATA_FORMAT, 1)?;
         self.write_u8(COLOR_BAR, 5)?;
+        // TI recommends clearing latched bring-up errors before examining the
+        // active stream. Preserve F8 so the link-training result remains visible.
+        self.clear_video_error_status()?;
         self.update_u8(ENHANCED_FRAME, VIDEO_STREAM_ENABLED, VIDEO_STREAM_ENABLED)?;
         Ok(())
     }

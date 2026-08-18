@@ -34,6 +34,8 @@ const SOURCE_EXTENSION_C3: usize = 0x128;
 
 const MIXER_OPERATION_MODE: usize = 0x000;
 const MIXER_OUTPUT_SIZE: usize = 0x004;
+const MIXER_BORDER_COLOR_0: usize = 0x008;
+const MIXER_BORDER_COLOR_1: usize = 0x010;
 const MIXER_BLEND_BASE: usize = 0x020;
 const MIXER_BLEND_STRIDE: usize = 0x018;
 const MIXER_BLEND_OPERATION: usize = 0x000;
@@ -73,6 +75,28 @@ pub(crate) struct Dpu {
     registers: RegisterWindow,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DpuDiagnosticSnapshot {
+    pub(crate) control_layer0: u32,
+    pub(crate) control_flush: u32,
+    pub(crate) interface_active: u32,
+    pub(crate) source_address: u32,
+    pub(crate) source_stride: u32,
+    pub(crate) source_format: u32,
+    pub(crate) source_operation: u32,
+    pub(crate) mixer_output_size: u32,
+    pub(crate) mixer_border_color_0: u32,
+    pub(crate) mixer_border_color_1: u32,
+    pub(crate) timing_enable: u32,
+    pub(crate) interface_config: u32,
+    pub(crate) hsync_control: u32,
+    pub(crate) vsync_period: u32,
+    pub(crate) display_hcontrol: u32,
+    pub(crate) panel_format: u32,
+    pub(crate) fetch_start: u32,
+    pub(crate) interface_mux: u32,
+}
+
 impl Dpu {
     pub(crate) const fn new(registers: RegisterWindow) -> Self {
         Self { registers }
@@ -80,6 +104,10 @@ impl Dpu {
 
     fn write(&self, base: usize, offset: usize, value: u32) {
         self.registers.write(base + offset, value)
+    }
+
+    fn read(&self, base: usize, offset: usize) -> u32 {
+        self.registers.read(base + offset)
     }
 
     fn configure_timing_generator(&self, timing: DisplayTiming) {
@@ -189,12 +217,23 @@ impl Dpu {
         let size = (u32::from(timing.vactive) << 16) | u32::from(timing.hactive);
         self.write(LAYER_MIXER_BASE, MIXER_OUTPUT_SIZE, size);
         self.write(LAYER_MIXER_BASE, MIXER_OPERATION_MODE, 0);
+        #[cfg(feature = "diagnostic-border-fill")]
+        {
+            // SC7180 LM border channels are 12-bit G/B in COLOR_0 and
+            // 12-bit R/A in COLOR_1. Full scale in all channels produces an
+            // unmistakable white frame without enabling a source pipe.
+            self.write(LAYER_MIXER_BASE, MIXER_BORDER_COLOR_0, 0x0fff_0fff);
+            self.write(LAYER_MIXER_BASE, MIXER_BORDER_COLOR_1, 0x0fff_0fff);
+        }
         for stage in 0..6 {
             let blend = MIXER_BLEND_BASE + stage * MIXER_BLEND_STRIDE;
             self.write(LAYER_MIXER_BASE, blend + MIXER_BLEND_OPERATION, 0x100);
             self.write(LAYER_MIXER_BASE, blend + MIXER_BLEND_ALPHA, 0x00ff_0000);
         }
 
+        #[cfg(feature = "diagnostic-border-fill")]
+        self.write(CONTROL_BASE, CONTROL_LAYER0, LAYER_BORDER_OUTPUT);
+        #[cfg(not(feature = "diagnostic-border-fill"))]
         self.write(
             CONTROL_BASE,
             CONTROL_LAYER0,
@@ -207,11 +246,11 @@ impl Dpu {
 
     fn flush(&self) {
         self.write(CONTROL_BASE, CONTROL_INTERFACE_FLUSH, INTERFACE1_FLUSH);
-        self.write(
-            CONTROL_BASE,
-            CONTROL_FLUSH,
-            FLUSH_VIG0 | FLUSH_MIXER0 | FLUSH_CONTROL | FLUSH_INTERFACE,
-        );
+        #[cfg(feature = "diagnostic-border-fill")]
+        let flush = FLUSH_MIXER0 | FLUSH_CONTROL | FLUSH_INTERFACE;
+        #[cfg(not(feature = "diagnostic-border-fill"))]
+        let flush = FLUSH_VIG0 | FLUSH_MIXER0 | FLUSH_CONTROL | FLUSH_INTERFACE;
+        self.write(CONTROL_BASE, CONTROL_FLUSH, flush);
         arch::io_wmb();
     }
 
@@ -234,6 +273,30 @@ impl Dpu {
         self.flush();
         self.write(INTERFACE_BASE, INTERFACE_TIMING_ENABLE, 1);
         arch::io_wmb();
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> DpuDiagnosticSnapshot {
+        arch::io_rmb();
+        DpuDiagnosticSnapshot {
+            control_layer0: self.read(CONTROL_BASE, CONTROL_LAYER0),
+            control_flush: self.read(CONTROL_BASE, CONTROL_FLUSH),
+            interface_active: self.read(CONTROL_BASE, CONTROL_INTERFACE_ACTIVE),
+            source_address: self.read(SOURCE_PIPE_BASE, SOURCE_ADDRESS0),
+            source_stride: self.read(SOURCE_PIPE_BASE, SOURCE_STRIDE0),
+            source_format: self.read(SOURCE_PIPE_BASE, SOURCE_FORMAT),
+            source_operation: self.read(SOURCE_PIPE_BASE, SOURCE_OPERATION_MODE),
+            mixer_output_size: self.read(LAYER_MIXER_BASE, MIXER_OUTPUT_SIZE),
+            mixer_border_color_0: self.read(LAYER_MIXER_BASE, MIXER_BORDER_COLOR_0),
+            mixer_border_color_1: self.read(LAYER_MIXER_BASE, MIXER_BORDER_COLOR_1),
+            timing_enable: self.read(INTERFACE_BASE, INTERFACE_TIMING_ENABLE),
+            interface_config: self.read(INTERFACE_BASE, INTERFACE_CONFIG),
+            hsync_control: self.read(INTERFACE_BASE, INTERFACE_HSYNC_CONTROL),
+            vsync_period: self.read(INTERFACE_BASE, INTERFACE_VSYNC_PERIOD),
+            display_hcontrol: self.read(INTERFACE_BASE, INTERFACE_DISPLAY_HCONTROL),
+            panel_format: self.read(INTERFACE_BASE, INTERFACE_PANEL_FORMAT),
+            fetch_start: self.read(INTERFACE_BASE, INTERFACE_FETCH_START),
+            interface_mux: self.read(INTERFACE_BASE, INTERFACE_MUX),
+        }
     }
 
     pub(crate) fn present(&self, framebuffer: usize) -> Result<(), &'static str> {

@@ -18,6 +18,8 @@ const COMMON_VREG_CONTROL: usize = 0x20;
 const COMMON_CONTROL0: usize = 0x24;
 const COMMON_CONTROL1: usize = 0x28;
 const COMMON_CONTROL2: usize = 0x2c;
+const COMMON_LANE_CONFIG0: usize = 0x30;
+const COMMON_LANE_CONFIG1: usize = 0x34;
 const COMMON_PLL_CONTROL: usize = 0x38;
 const COMMON_LANE_CONTROL0: usize = 0x98;
 const COMMON_TIMING_CONTROL0: usize = 0xac;
@@ -151,6 +153,10 @@ impl DsiPhy {
         self.phy_write(COMMON_CONTROL0, 0x60);
         self.phy_write(COMMON_PLL_CONTROL, 0);
         self.phy_write(COMMON_RESYNC_BUFFER_CONTROL, 0);
+        // ChromeOS Linux and upstream Linux both program the SC7180 10 nm
+        // PHY's fixed logical-to-physical lane map before powering the lanes.
+        self.phy_write(COMMON_LANE_CONFIG0, 0x21);
+        self.phy_write(COMMON_LANE_CONFIG1, 0x84);
         self.phy_write(COMMON_CONTROL0, 0x7f);
         self.phy_write(COMMON_LANE_CONTROL0, 0x1f);
 

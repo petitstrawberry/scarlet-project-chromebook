@@ -18,7 +18,13 @@
 
 extern crate alloc;
 
-mod clock;
+#[cfg(any(
+    all(feature = "diagnostic-color-bar", feature = "diagnostic-border-fill"),
+    all(feature = "diagnostic-color-bar", feature = "diagnostic-dsi-pattern"),
+    all(feature = "diagnostic-border-fill", feature = "diagnostic-dsi-pattern"),
+))]
+compile_error!("display diagnostic modes are mutually exclusive");
+
 mod dpu;
 mod dsi;
 mod phy;
@@ -27,7 +33,6 @@ mod registers;
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::{any::Any, ptr};
 
-use clock::DisplayClocks;
 use dpu::Dpu;
 use dsi::{DSI_BASE, DsiHost};
 use phy::DsiPhy;
@@ -37,8 +42,11 @@ use scarlet::{
     device::{
         Device, DeviceType,
         graphics::{FramebufferConfig, GraphicsDevice, PixelFormat, output::DisplayRegion},
+        iommu::{DmaMapping, IommuDomainConfig, IommuDomainType, IommuMapFlags},
         manager::{DeviceManager, DriverPriority, probe_defer},
-        platform::{PlatformDeviceDriver, PlatformDeviceInfo},
+        platform::{
+            PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
+        },
     },
     environment::PAGE_SIZE,
     mem::page::ContiguousPages,
@@ -48,13 +56,16 @@ use scarlet::{
     },
     println,
     sync::IrqSpinLock,
-    time, vm,
+    time,
+    vm::{self, vmem::MemoryAttribute},
 };
-use scarlet_driver_cros_ec_spi::get_cros_ec_spi_by_phandle;
+use scarlet_driver_cros_ec_spi::get_primary_cros_ec_spi;
+use scarlet_driver_qcom_sc7180_dispcc::Sc7180DispCc;
+#[cfg(feature = "diagnostic-color-bar")]
+use scarlet_driver_ti_sn65dsi86::Sn65dsi86ColorBar;
 use scarlet_driver_ti_sn65dsi86::{DisplayTiming, Sn65dsi86, get_sn65dsi86_by_phandle};
 
 const MDSS_MAP_SIZE: usize = 0x0c_0000;
-const DISPCC_MAP_SIZE: usize = 0x1_0000;
 const DSI_LANES: u8 = 4;
 const DSI_BITS_PER_PIXEL: u8 = 24;
 const MAXIMUM_SCANOUT_ADDRESS: usize = u32::MAX as usize;
@@ -82,10 +93,10 @@ impl Sc7180DisplayEngine {
     fn initialize(
         &self,
         mdss: RegisterWindow,
-        dispcc: RegisterWindow,
+        dispcc: &Sc7180DispCc,
         bridge: &Sn65dsi86,
         timing: DisplayTiming,
-        scanout_paddr: usize,
+        scanout_dma_addr: usize,
     ) -> Result<(), &'static str> {
         let dsi = DsiHost::new(mdss);
         dsi.reset();
@@ -95,7 +106,7 @@ impl Sc7180DisplayEngine {
             u32::from(DSI_BITS_PER_PIXEL),
             DSI_BASE,
         )?;
-        DisplayClocks::new(dispcc).enable_dsi0()?;
+        dispcc.enable_dsi0()?;
         dsi.configure_host(u32::from(DSI_LANES))?;
 
         bridge
@@ -107,15 +118,170 @@ impl Sc7180DisplayEngine {
                 );
                 "qcom-sc7180-mdss: bridge link setup failed"
             })?;
-        self.dpu.configure(timing, scanout_paddr)?;
+        #[cfg(feature = "diagnostic-color-bar")]
+        {
+            bridge
+                .set_color_bar(Some(Sn65dsi86ColorBar::VerticalEightColors))
+                .map_err(|_| "qcom-sc7180-mdss: failed to enable bridge color bar")?;
+            println!("[qcom-sc7180-mdss] SN65DSI86 diagnostic color bar enabled");
+        }
+        #[cfg(feature = "diagnostic-border-fill")]
+        println!("[qcom-sc7180-mdss] DPU border-only diagnostic enabled (white)");
+        self.dpu.configure(timing, scanout_dma_addr)?;
         dsi.configure_video(timing);
         self.dpu.start();
+        #[cfg(feature = "diagnostic-dsi-pattern")]
+        {
+            dsi.enable_video_test_pattern();
+            println!("[qcom-sc7180-mdss] DSI host checkerboard diagnostic enabled");
+        }
+        time::udelay(20_000);
+
+        let dpu = self.dpu.diagnostic_snapshot();
+        println!(
+            "[mdss-diag] dpu layer={:#010x} flush={:#010x}",
+            dpu.control_layer0, dpu.control_flush,
+        );
+        println!(
+            "[mdss-diag] dpu active={:#010x} address={:#010x}",
+            dpu.interface_active, dpu.source_address,
+        );
+        println!(
+            "[mdss-diag] dpu stride={:#010x} format={:#010x} op={:#010x}",
+            dpu.source_stride, dpu.source_format, dpu.source_operation,
+        );
+        println!(
+            "[mdss-diag] dpu mixer={:#010x} border={:#010x}/{:#010x}",
+            dpu.mixer_output_size, dpu.mixer_border_color_0, dpu.mixer_border_color_1,
+        );
+        println!(
+            "[mdss-diag] dpu enable={:#010x} config={:#010x}",
+            dpu.timing_enable, dpu.interface_config,
+        );
+        println!(
+            "[mdss-diag] dpu hsync={:#010x} vsync={:#010x}",
+            dpu.hsync_control, dpu.vsync_period,
+        );
+        println!(
+            "[mdss-diag] dpu hctl={:#010x} panel={:#010x}",
+            dpu.display_hcontrol, dpu.panel_format,
+        );
+        println!(
+            "[mdss-diag] dpu fetch={:#010x} mux={:#010x}",
+            dpu.fetch_start, dpu.interface_mux,
+        );
+
+        let dsi = dsi.diagnostic_snapshot();
+        println!(
+            "[mdss-diag] dsi hw={:#010x} ctrl={:#010x}",
+            dsi.hardware_version, dsi.control,
+        );
+        println!(
+            "[mdss-diag] dsi status={:#010x} fifo={:#010x}",
+            dsi.status, dsi.fifo_status,
+        );
+        println!(
+            "[mdss-diag] dsi video={:#010x} clk={:#010x}",
+            dsi.video_mode_control, dsi.clock_control,
+        );
+        println!("[mdss-diag] dsi clk-status={:#010x}", dsi.clock_status,);
+        println!(
+            "[mdss-diag] dsi lane={:#010x} lane-ctrl={:#010x}",
+            dsi.lane_status, dsi.lane_control,
+        );
+        println!(
+            "[mdss-diag] dsi ack={:#010x} phy0={:#010x}",
+            dsi.ack_error_status, dsi.data_lane0_phy_error,
+        );
+        println!(
+            "[mdss-diag] dsi timeout={:#010x} intr={:#010x}",
+            dsi.timeout_status, dsi.interrupt_control,
+        );
+        println!("[mdss-diag] dsi tpg={:#010x}", dsi.test_pattern_control,);
+        println!(
+            "[mdss-diag] phy clk={:#010x}/{:#010x}",
+            dsi.phy_clock_config0, dsi.phy_clock_config1,
+        );
+        println!(
+            "[mdss-diag] phy global={:#010x} vreg={:#010x}",
+            dsi.phy_global_control, dsi.phy_vreg_control,
+        );
+        println!(
+            "[mdss-diag] phy ctrl={:#010x}/{:#010x}",
+            dsi.phy_control0, dsi.phy_control2,
+        );
+        println!(
+            "[mdss-diag] phy map={:#010x}/{:#010x}",
+            dsi.phy_lane_config0, dsi.phy_lane_config1,
+        );
+        println!(
+            "[mdss-diag] phy pll-ctrl={:#010x} lane={:#010x}",
+            dsi.phy_pll_control, dsi.phy_lane_control0,
+        );
+        println!(
+            "[mdss-diag] phy status={:#010x} pll={:#010x}",
+            dsi.phy_status, dsi.pll_status,
+        );
+
+        let clocks = dispcc.dsi0_clock_snapshot();
+        println!(
+            "[mdss-diag] pclk cmd={:#010x} cfg={:#010x}",
+            clocks.pclk0_command, clocks.pclk0_config,
+        );
+        println!("[mdss-diag] pclk branch={:#010x}", clocks.pclk0_branch,);
+        println!(
+            "[mdss-diag] byte cmd={:#010x} cfg={:#010x}",
+            clocks.byte0_command, clocks.byte0_config,
+        );
+        println!("[mdss-diag] byte branch={:#010x}", clocks.byte0_branch,);
+        println!(
+            "[mdss-diag] byte-intf div={:#010x} branch={:#010x}",
+            clocks.byte0_interface_divider, clocks.byte0_interface_branch,
+        );
+        println!(
+            "[mdss-diag] esc cmd={:#010x} cfg={:#010x}",
+            clocks.esc0_command, clocks.esc0_config,
+        );
+        println!("[mdss-diag] esc branch={:#010x}", clocks.esc0_branch,);
+
+        let bridge = bridge.diagnostic_snapshot().map_err(|error| {
+            println!(
+                "[qcom-sc7180-mdss] SN65DSI86 post-start diagnostic failed: {:?}",
+                error
+            );
+            "qcom-sc7180-mdss: bridge post-start diagnostic failed"
+        })?;
+        println!(
+            "[mdss-diag] bridge pll={} lock={} stream={}",
+            bridge.pll_enabled,
+            bridge.dp_pll_locked(),
+            bridge.video_stream_enabled(),
+        );
+        println!(
+            "[mdss-diag] bridge hpd={} disabled={}",
+            bridge.hpd_asserted(),
+            bridge.hpd_disabled(),
+        );
+        println!(
+            "[mdss-diag] bridge color={} reg={:#04x}",
+            bridge.color_bar_enabled(),
+            bridge.color_bar,
+        );
+        println!(
+            "[mdss-diag] bridge dsi-lanes={:#04x} dsi-clk={:#04x}",
+            bridge.dsi_lanes, bridge.dsi_clock,
+        );
+        println!(
+            "[mdss-diag] bridge dp-lanes={:#04x} rate={:#04x} link={:#04x}",
+            bridge.ssc_config, bridge.data_rate, bridge.main_link_mode,
+        );
+        println!("[mdss-diag] bridge f0..f8={:02x?}", bridge.error_status,);
         Ok(())
     }
 
-    fn present(&self, scanout_paddr: usize) -> Result<(), &'static str> {
+    fn present(&self, scanout_dma_addr: usize) -> Result<(), &'static str> {
         let _guard = self.present_lock.lock();
-        self.dpu.present(scanout_paddr)
+        self.dpu.present(scanout_dma_addr)
     }
 }
 
@@ -123,11 +289,17 @@ pub struct Sc7180GraphicsDevice {
     config: FramebufferConfig,
     timing: DisplayTiming,
     scanout: ContiguousPages,
+    scanout_dma: DmaMapping,
     engine: Sc7180DisplayEngine,
 }
 
 impl Sc7180GraphicsDevice {
     fn clean_regions(&self, regions: &[DisplayRegion]) -> Result<(), &'static str> {
+        if self.scanout.memory_attribute() != MemoryAttribute::Normal {
+            arch::io_wmb();
+            return Ok(());
+        }
+
         if regions.is_empty() {
             arch::clean_dcache_to_poc_range(self.scanout.as_vaddr(), self.config.size());
             return Ok(());
@@ -221,7 +393,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
     ) -> Result<(), &'static str> {
         self.validate_scanout(config, physical_addr)?;
         self.clean_regions(&[region])?;
-        self.engine.present(physical_addr)
+        self.engine.present(self.scanout_dma.dma_addr() as usize)
     }
 
     fn scanout_buffer_count(&self) -> usize {
@@ -255,7 +427,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
             return Err("qcom-sc7180-mdss: invalid scanout index");
         }
         self.clean_regions(regions)?;
-        self.engine.present(self.scanout.as_paddr())
+        self.engine.present(self.scanout_dma.dma_addr() as usize)
     }
 
     fn init_graphics(&self) -> Result<(), &'static str> {
@@ -325,21 +497,6 @@ fn compatible_phandle(wanted: &str) -> Option<u32> {
             .property("phandle")
             .or_else(|| node.property("linux,phandle"))?;
         return read_be_u32(property.value, 0);
-    }
-    None
-}
-
-fn compatible_register(wanted: &str, index: usize) -> Option<(usize, usize)> {
-    let fdt = scarlet::device::fdt::FdtManager::get_manager().get_fdt()?;
-    for node in fdt.all_nodes() {
-        if !node
-            .compatible()
-            .is_some_and(|compatible| compatible.all().any(|value| value == wanted))
-        {
-            continue;
-        }
-        let region = node.reg()?.nth(index)?;
-        return Some((region.starting_address as usize, region.size.unwrap_or(0)));
     }
     None
 }
@@ -426,7 +583,7 @@ fn allocate_scanout(config: &FramebufferConfig) -> Result<ContiguousPages, &'sta
         .checked_add(PAGE_SIZE - 1)
         .map(|size| size / PAGE_SIZE)
         .ok_or("qcom-sc7180-mdss: scanout size overflow")?;
-    let scanout = ContiguousPages::new(pages)
+    let mut scanout = ContiguousPages::new(pages)
         .ok_or("qcom-sc7180-mdss: failed to allocate contiguous scanout")?;
     let end = scanout
         .as_paddr()
@@ -439,10 +596,14 @@ fn allocate_scanout(config: &FramebufferConfig) -> Result<ContiguousPages, &'sta
     // SAFETY: `scanout` owns `pages` contiguous, CPU-mapped pages and the
     // write is bounded by that exact allocation.
     unsafe { ptr::write_bytes(scanout.as_ptr().cast::<u8>(), 0, pages * PAGE_SIZE) };
+    // `/dev/fb0` and `/dev/display0` expose scanout pages as DeviceBurstable.
+    // Keep the kernel direct-map alias at the same attribute, matching the
+    // Apple DCP driver and Scarlet's direct-map aliasing contract.
+    scanout.retag_memory_attribute(MemoryAttribute::DeviceBurstable)?;
     Ok(scanout)
 }
 
-fn probe_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     if DeviceManager::get_manager()
         .get_device_by_name("qcom-sc7180-mdss")
         .is_some()
@@ -450,13 +611,23 @@ fn probe_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         return Ok(());
     }
 
-    let backlight_enable = power_panel_path()?;
-    let ec_phandle = compatible_phandle("google,cros-ec-spi")
-        .ok_or("qcom-sc7180-mdss: Chrome EC phandle not found")?;
-    let ec = match get_cros_ec_spi_by_phandle(ec_phandle) {
+    let dispcc_phandle = compatible_phandle("qcom,sc7180-dispcc")
+        .ok_or("qcom-sc7180-mdss: DISP_CC phandle not found")?;
+    let dispcc =
+        match scarlet_driver_qcom_sc7180_dispcc::get_sc7180_dispcc_by_phandle(dispcc_phandle) {
+            Some(controller) => controller,
+            None => {
+                println!("[qcom-sc7180-mdss] DISP_CC is not ready, deferring");
+                return probe_defer();
+            }
+        };
+    println!("[qcom-sc7180-mdss] phase 1/5: restoring MDSS power and foundational clocks");
+    dispcc.prepare_for_scanout()?;
+
+    let ec = match get_primary_cros_ec_spi() {
         Some(ec) => ec,
         None => {
-            println!("[qcom-sc7180-mdss] Chrome EC is not ready, deferring");
+            println!("[qcom-sc7180-mdss] primary Chrome EC is not ready, deferring");
             return probe_defer();
         }
     };
@@ -470,6 +641,8 @@ fn probe_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         }
     };
 
+    println!("[qcom-sc7180-mdss] phase 2/5: enabling bridge and panel rails");
+    let backlight_enable = power_panel_path()?;
     bridge
         .initialize_reference_clock()
         .map_err(|_| "qcom-sc7180-mdss: failed to select bridge reference clock")?;
@@ -490,29 +663,45 @@ fn probe_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     };
     let scanout = allocate_scanout(&config)?;
 
-    // Bind this board-level pipeline to the panel node. The MDSS parent node
-    // carries an SMMU stream contract used by Linux, while this early native
-    // scanout deliberately uses a physical DMA32 buffer and does not require
-    // an IOMMU domain. Resolve the SoC register block independently so
-    // Scarlet's generic pre-probe dependency resolver does not wait for an
-    // unrelated SMMU driver.
-    let (mdss_paddr, _) = compatible_register("qcom,sc7180-mdss", 0)
-        .ok_or("qcom-sc7180-mdss: MDSS resource not found")?;
-    let mdss_vaddr = vm::ioremap(mdss_paddr, MDSS_MAP_SIZE)
+    let dma_context = DeviceManager::get_manager().resolve_platform_dma_context(
+        device,
+        IommuDomainConfig {
+            domain_type: IommuDomainType::Identity,
+            iova_base: 0,
+            iova_size: 0,
+        },
+    )?;
+    let scanout_dma = dma_context
+        .map_phys_owned(
+            scanout.as_paddr(),
+            scanout
+                .len()
+                .checked_mul(PAGE_SIZE)
+                .ok_or("qcom-sc7180-mdss: scanout DMA length overflow")?,
+            IommuMapFlags::READ | IommuMapFlags::COHERENT,
+        )
+        .map_err(|_| "qcom-sc7180-mdss: failed to map scanout for DPU DMA")?;
+    let scanout_dma_addr = usize::try_from(scanout_dma.dma_addr())
+        .map_err(|_| "qcom-sc7180-mdss: DPU DMA address exceeds usize")?;
+
+    let mdss_resource = device
+        .get_resources()
+        .iter()
+        .find(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
+        .ok_or("qcom-sc7180-mdss: missing MDSS memory resource")?;
+    let mdss_vaddr = vm::ioremap(mdss_resource.start, MDSS_MAP_SIZE)
         .map_err(|_| "qcom-sc7180-mdss: MDSS ioremap failed")?;
-    let (dispcc_paddr, dispcc_size) = compatible_register("qcom,sc7180-dispcc", 0)
-        .ok_or("qcom-sc7180-mdss: DISP_CC resource not found")?;
-    if dispcc_size < DISPCC_MAP_SIZE {
-        return Err("qcom-sc7180-mdss: DISP_CC resource is too small");
-    }
-    let dispcc_vaddr = vm::ioremap(dispcc_paddr, DISPCC_MAP_SIZE)
-        .map_err(|_| "qcom-sc7180-mdss: DISP_CC ioremap failed")?;
     let mdss = RegisterWindow::new(mdss_vaddr);
-    let dispcc = RegisterWindow::new(dispcc_vaddr);
     let engine = Sc7180DisplayEngine::new(mdss);
 
-    arch::clean_dcache_to_poc_range(scanout.as_vaddr(), config.size());
-    engine.initialize(mdss, dispcc, &bridge, timing, scanout.as_paddr())?;
+    println!("[qcom-sc7180-mdss] phase 3/5: programming DSI PHY, bridge link, and DPU");
+    if scanout.memory_attribute() == MemoryAttribute::Normal {
+        arch::clean_dcache_to_poc_range(scanout.as_vaddr(), config.size());
+    } else {
+        arch::io_wmb();
+    }
+    engine.initialize(mdss, &dispcc, &bridge, timing, scanout_dma_addr)?;
+    println!("[qcom-sc7180-mdss] phase 4/5: enabling EC backlight PWM");
     ec.set_display_backlight_percent(80).map_err(|error| {
         println!(
             "[qcom-sc7180-mdss] failed to restore EC display PWM: {:?}",
@@ -524,10 +713,13 @@ fn probe_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         drive_gpio(enable, true)?;
     }
 
+    println!("[qcom-sc7180-mdss] phase 5/5: publishing native framebuffer");
+
     let graphics = Arc::new(Sc7180GraphicsDevice {
         config,
         timing,
         scanout,
+        scanout_dma,
         engine,
     });
     let device_id = DeviceManager::get_manager()
@@ -543,11 +735,12 @@ fn probe_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         scarlet::earlyfb::deactivate();
     }
     println!(
-        "[qcom-sc7180-mdss] native panel {}x{} pixel-clock={} kHz scanout={:#x} bytes={} refresh={} mHz",
+        "[qcom-sc7180-mdss] native panel {}x{} pixel-clock={} kHz scanout-paddr={:#x} scanout-dma={:#x} bytes={} refresh={} mHz",
         graphics.timing.hactive,
         graphics.timing.vactive,
         graphics.timing.pixel_clock_khz,
         graphics.scanout.as_paddr(),
+        graphics.scanout_dma.dma_addr(),
         graphics.config.size(),
         u64::from(graphics.timing.pixel_clock_khz) * 1_000_000
             / u64::from(graphics.timing.horizontal_total())
@@ -565,7 +758,7 @@ fn register_driver() {
         "qcom-sc7180-mdss",
         probe_fn,
         remove_fn,
-        vec!["boe,nv110wtm-n61"],
+        vec!["qcom,sc7180-mdss"],
     );
     DeviceManager::get_manager().register_driver(Box::new(driver), DriverPriority::Late);
 }

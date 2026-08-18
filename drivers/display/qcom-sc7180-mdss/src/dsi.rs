@@ -8,7 +8,10 @@ use crate::registers::RegisterWindow;
 
 pub(crate) const DSI_BASE: usize = 0x94000;
 
+const HARDWARE_VERSION: usize = 0x000;
 const CONTROL: usize = 0x004;
+const STATUS: usize = 0x008;
+const FIFO_STATUS: usize = 0x00c;
 const VIDEO_MODE_CONTROL: usize = 0x010;
 const VIDEO_ACTIVE_HORIZONTAL: usize = 0x024;
 const VIDEO_ACTIVE_VERTICAL: usize = 0x028;
@@ -17,12 +20,38 @@ const VIDEO_ACTIVE_HSYNC: usize = 0x030;
 const VIDEO_ACTIVE_VSYNC: usize = 0x034;
 const VIDEO_ACTIVE_VSYNC_POSITION: usize = 0x038;
 const COMMAND_DMA_CONTROL: usize = 0x03c;
+const ACK_ERROR_STATUS: usize = 0x068;
 const TRIGGER_CONTROL: usize = 0x084;
+const LANE_STATUS: usize = 0x0a8;
+const LANE_CONTROL: usize = 0x0ac;
+const DATA_LANE0_PHY_ERROR: usize = 0x0b4;
 const HS_TIMER_CONTROL: usize = 0x0bc;
+const TIMEOUT_STATUS: usize = 0x0c0;
 const EOT_PACKET_CONTROL: usize = 0x0d0;
+const INTERRUPT_CONTROL: usize = 0x110;
 const SOFT_RESET: usize = 0x118;
 const CLOCK_CONTROL: usize = 0x11c;
+const CLOCK_STATUS: usize = 0x120;
+const TEST_PATTERN_CONTROL: usize = 0x15c;
+const TEST_PATTERN_VIDEO_INITIAL_VALUE: usize = 0x164;
+const TEST_PATTERN_MAIN_CONTROL: usize = 0x19c;
+const TEST_PATTERN_VIDEO_CONFIG: usize = 0x1a4;
 const TPG_DMA_FIFO_RESET: usize = 0x1ec;
+
+const PHY_BASE: usize = 0x94400;
+const PHY_CLOCK_CONFIG0: usize = 0x010;
+const PHY_CLOCK_CONFIG1: usize = 0x014;
+const PHY_GLOBAL_CONTROL: usize = 0x018;
+const PHY_VREG_CONTROL: usize = 0x020;
+const PHY_CONTROL0: usize = 0x024;
+const PHY_CONTROL2: usize = 0x02c;
+const PHY_LANE_CONFIG0: usize = 0x030;
+const PHY_LANE_CONFIG1: usize = 0x034;
+const PHY_PLL_CONTROL: usize = 0x038;
+const PHY_LANE_CONTROL0: usize = 0x098;
+const PHY_STATUS: usize = 0x0ec;
+const PLL_BASE: usize = 0x94a00;
+const PLL_COMMON_STATUS: usize = 0x1a0;
 
 const CONTROL_ENABLE: u32 = 1;
 const CONTROL_VIDEO_ENABLE: u32 = 1 << 1;
@@ -31,9 +60,43 @@ const VIDEO_TRAFFIC_MODE: u32 = 1 << 8;
 const VIDEO_BLANKING_LOW_POWER: u32 = 9 << 12;
 const VIDEO_FORMAT_RGB888: u32 = 3 << 4;
 const HIGH_SPEED_TIMEOUT: u32 = 0xea60 | (4 << 16);
+const TEST_PATTERN_CHECKERBOARD: u32 = 1 << 8;
+const TEST_PATTERN_VIDEO_RGB888: u32 = 1 | (1 << 2);
+const TEST_PATTERN_VIDEO_GENERAL: u32 = 3 << 4;
+const TEST_PATTERN_ENABLE: u32 = 1;
 
 pub(crate) struct DsiHost {
     mdss: RegisterWindow,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DsiDiagnosticSnapshot {
+    pub(crate) hardware_version: u32,
+    pub(crate) control: u32,
+    pub(crate) status: u32,
+    pub(crate) fifo_status: u32,
+    pub(crate) video_mode_control: u32,
+    pub(crate) clock_control: u32,
+    pub(crate) clock_status: u32,
+    pub(crate) lane_status: u32,
+    pub(crate) lane_control: u32,
+    pub(crate) ack_error_status: u32,
+    pub(crate) data_lane0_phy_error: u32,
+    pub(crate) timeout_status: u32,
+    pub(crate) interrupt_control: u32,
+    pub(crate) test_pattern_control: u32,
+    pub(crate) phy_clock_config0: u32,
+    pub(crate) phy_clock_config1: u32,
+    pub(crate) phy_global_control: u32,
+    pub(crate) phy_vreg_control: u32,
+    pub(crate) phy_control0: u32,
+    pub(crate) phy_control2: u32,
+    pub(crate) phy_lane_config0: u32,
+    pub(crate) phy_lane_config1: u32,
+    pub(crate) phy_pll_control: u32,
+    pub(crate) phy_lane_control0: u32,
+    pub(crate) phy_status: u32,
+    pub(crate) pll_status: u32,
 }
 
 impl DsiHost {
@@ -47,6 +110,10 @@ impl DsiHost {
 
     fn update(&self, offset: usize, clear: u32, set: u32) {
         self.mdss.update(DSI_BASE + offset, clear, set)
+    }
+
+    fn read(&self, offset: usize) -> u32 {
+        self.mdss.read(DSI_BASE + offset)
     }
 
     pub(crate) fn reset(&self) {
@@ -110,5 +177,52 @@ impl DsiHost {
             CONTROL,
             (0x0f << 4) | CONTROL_ENABLE | CONTROL_VIDEO_ENABLE | CONTROL_CLOCK_LANE_ENABLE,
         );
+    }
+
+    /// Enable the DSI6G video-mode test-pattern generator used by Linux.
+    ///
+    /// This substitutes a generated checkerboard at the DSI host boundary,
+    /// bypassing DPU source, mixer, and interface pixel data while retaining
+    /// the real DSI host, PHY, bridge, eDP link, and panel path.
+    pub(crate) fn enable_video_test_pattern(&self) {
+        self.write(TEST_PATTERN_VIDEO_INITIAL_VALUE, 0xff);
+        self.write(TEST_PATTERN_MAIN_CONTROL, TEST_PATTERN_CHECKERBOARD);
+        self.write(TEST_PATTERN_VIDEO_CONFIG, TEST_PATTERN_VIDEO_RGB888);
+        self.update(
+            TEST_PATTERN_CONTROL,
+            0,
+            TEST_PATTERN_VIDEO_GENERAL | TEST_PATTERN_ENABLE,
+        );
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> DsiDiagnosticSnapshot {
+        DsiDiagnosticSnapshot {
+            hardware_version: self.read(HARDWARE_VERSION),
+            control: self.read(CONTROL),
+            status: self.read(STATUS),
+            fifo_status: self.read(FIFO_STATUS),
+            video_mode_control: self.read(VIDEO_MODE_CONTROL),
+            clock_control: self.read(CLOCK_CONTROL),
+            clock_status: self.read(CLOCK_STATUS),
+            lane_status: self.read(LANE_STATUS),
+            lane_control: self.read(LANE_CONTROL),
+            ack_error_status: self.read(ACK_ERROR_STATUS),
+            data_lane0_phy_error: self.read(DATA_LANE0_PHY_ERROR),
+            timeout_status: self.read(TIMEOUT_STATUS),
+            interrupt_control: self.read(INTERRUPT_CONTROL),
+            test_pattern_control: self.read(TEST_PATTERN_CONTROL),
+            phy_clock_config0: self.mdss.read(PHY_BASE + PHY_CLOCK_CONFIG0),
+            phy_clock_config1: self.mdss.read(PHY_BASE + PHY_CLOCK_CONFIG1),
+            phy_global_control: self.mdss.read(PHY_BASE + PHY_GLOBAL_CONTROL),
+            phy_vreg_control: self.mdss.read(PHY_BASE + PHY_VREG_CONTROL),
+            phy_control0: self.mdss.read(PHY_BASE + PHY_CONTROL0),
+            phy_control2: self.mdss.read(PHY_BASE + PHY_CONTROL2),
+            phy_lane_config0: self.mdss.read(PHY_BASE + PHY_LANE_CONFIG0),
+            phy_lane_config1: self.mdss.read(PHY_BASE + PHY_LANE_CONFIG1),
+            phy_pll_control: self.mdss.read(PHY_BASE + PHY_PLL_CONTROL),
+            phy_lane_control0: self.mdss.read(PHY_BASE + PHY_LANE_CONTROL0),
+            phy_status: self.mdss.read(PHY_BASE + PHY_STATUS),
+            pll_status: self.mdss.read(PLL_BASE + PLL_COMMON_STATUS),
+        }
     }
 }
