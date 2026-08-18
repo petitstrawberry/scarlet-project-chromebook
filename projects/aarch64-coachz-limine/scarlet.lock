@@ -12,241 +12,241 @@ kind = "cargo"
 package = "user-bin"
 bin = "init"
 to = "/system/scarlet/bin/init"
-hash = "sha256:6b24c20d0e454484889cf34fca4b945165c3b601e4c0022dcce6e2690c69abf9"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "sh"
 to = "/system/scarlet/bin/sh"
-hash = "sha256:bc75a6c642061345a3678d511a720c1fc458c7ec9382308ab1b88dc6cd81dafe"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "login"
 to = "/system/scarlet/bin/login"
-hash = "sha256:d3af53014752ac81eaa507c7344442241a1aa2c1f035d3313bd3d55de4b401a4"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "stemd"
 to = "/system/scarlet/bin/stemd"
-hash = "sha256:a56310910eb2ff0908d24d3a0196c8503c8172f8e57d975d569273599f764ad5"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "sbusd"
 to = "/system/scarlet/bin/sbusd"
-hash = "sha256:335ac5c6a974a99868faca5e8802ee1e1f13398cef34ffc94317bc3de7b1a86f"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "hello"
 to = "/system/scarlet/bin/hello"
-hash = "sha256:36f917cd548f6056677c24fcbfcb3377a1469c09de8e3f68652db376365fff1e"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "ps"
 to = "/system/scarlet/bin/ps"
-hash = "sha256:2c2526bdd31a59a01d745248cbf5803777d8ebac433a49c3fa09a48867505a94"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "shutdown"
 to = "/system/scarlet/bin/shutdown"
-hash = "sha256:484c59695ce49a9a09ca2bcf1f01d594b6223945e4954d8d5bfc734ce59225c0"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "scarlet-std-bin"
 bin = "top"
 to = "/system/scarlet/bin/top"
-hash = "sha256:50fc24e92d211fddb6546de982c7eb1c614a498d308a2f33c499eeaef1d45388"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "scarlet-std-bin"
 bin = "kill"
 to = "/system/scarlet/bin/kill"
-hash = "sha256:7b38a29ac33338140162da7aa8a92672fa68c0f272d5eafc5ba15e9e160d9da0"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "scpm"
 to = "/system/scarlet/bin/scpm"
-hash = "sha256:0388f0d7a316bfafb9eb2011fc4a2cc350e51b283d698cda02b9e727a939741a"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "netcfgd"
 to = "/system/scarlet/bin/netcfgd"
-hash = "sha256:802b1b2e1e97784c9c2d414c2556fa9cd04dfc21d6973b0b36357f436e322b11"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "resolverd"
 to = "/system/scarlet/bin/resolverd"
-hash = "sha256:8fb691783a8824268aaf20af3bc999c95a1b52a995adcc636fc3a8b3ea564dc9"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "ls"
 to = "/system/scarlet/bin/ls"
-hash = "sha256:6218dad08c2c268e6d9433897309c21f982c7188db3d4c4476d6e8611dc9bbfe"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "cat"
 to = "/system/scarlet/bin/cat"
-hash = "sha256:369726f779bfe46c3e8156e99d233b4da9e96b7140d9f2235e27d895c726a08c"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "rm"
 to = "/system/scarlet/bin/rm"
-hash = "sha256:57d91e31fba7cd1283e3fc0c3b458cca889cff2e7710fde34dda6ae6b618f8a9"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "resolve"
 to = "/system/scarlet/bin/resolve"
-hash = "sha256:f82ab1ac179eb7d95dc7cb6f7d3376c870ee32d69fc7d5ed7192b8907ab2d4ff"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "nc"
 to = "/system/scarlet/bin/nc"
-hash = "sha256:8f541b58885a5660eac83f54de793f04b2ca0e29a0dae6c326fa4ecfdadd0bd8"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "ping"
 to = "/system/scarlet/bin/ping"
-hash = "sha256:d6a5bf82819697825d41c4f1824e023fd0791d886c457f6b7e3de21eea30e521"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "netcfg"
 to = "/system/scarlet/bin/netcfg"
-hash = "sha256:38faa9020e5a06c83d760ee6e214f861ac60451352b65b77e58706e56a2a1658"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "watch"
 to = "/system/scarlet/bin/watch"
-hash = "sha256:fed28018ad3e4b2a9a874dbb141e23c1b14455710eab13b4eda0bc8ea5d0e35c"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 bin = "date"
 to = "/system/scarlet/bin/date"
-hash = "sha256:5d4accfc77224e8df0975b09758e04579469eec8019bcfbb594a28b25136526d"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/std-bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [[sections.initramfs.layers]]
 kind = "cargo"
 package = "user-bin"
 bin = "fb_test"
 to = "/system/scarlet/bin/fb_test"
-hash = "sha256:dbb6c2bcc8bb36965312ef1f6ad70814e2c6af8a1c1f8dafcf89ae9416d802c6"
+hash = ""
 
 [sections.initramfs.layers.source]
 type = "path"
-path = "../../../Scarlet/user/bin"
+path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"

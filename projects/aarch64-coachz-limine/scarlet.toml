@@ -11,7 +11,7 @@ path = "bsp"
 package = "scarlet"
 
 [bsp.kernel]
-source = { path = "../../../Scarlet/kernel" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet" }
 features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = true }
 
 [images]
@@ -22,11 +22,15 @@ output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-path = "../../../Scarlet/bundles/base/bundle.toml"
+source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev" }
+subdir = "bundles/base"
+bundle = "bundle.toml"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-path = "../../../Scarlet/bundles/cli-utils/bundle.toml"
+source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev" }
+subdir = "bundles/cli-utils"
+bundle = "bundle.toml"
 
 [images.boot]
 format = "limine-uefi"
