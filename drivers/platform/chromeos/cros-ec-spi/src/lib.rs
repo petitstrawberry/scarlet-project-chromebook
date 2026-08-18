@@ -75,17 +75,25 @@ impl From<SpiError> for CrosEcError {
 pub struct CrosEcSpi {
     bus: Arc<dyn SpiBus>,
     phandle: u32,
+    primary: bool,
     chip_select: u8,
     speed_hz: u32,
     command_lock: IrqSpinLock<()>,
 }
 
 impl CrosEcSpi {
-    fn new(bus: Arc<dyn SpiBus>, phandle: u32, chip_select: u8, maximum_speed_hz: u32) -> Self {
+    fn new(
+        bus: Arc<dyn SpiBus>,
+        phandle: u32,
+        primary: bool,
+        chip_select: u8,
+        maximum_speed_hz: u32,
+    ) -> Self {
         Self {
             speed_hz: bus.bus_speed().min(maximum_speed_hz),
             bus,
             phandle,
+            primary,
             chip_select,
             command_lock: IrqSpinLock::new(()),
         }
@@ -205,6 +213,15 @@ pub fn get_cros_ec_spi_by_phandle(phandle: u32) -> Option<Arc<CrosEcSpi>> {
         .cloned()
 }
 
+/// Return the primary AP EC rather than a secondary fingerprint EC.
+pub fn get_primary_cros_ec_spi() -> Option<Arc<CrosEcSpi>> {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .find(|controller| controller.primary)
+        .cloned()
+}
+
 fn read_u32_property(device: &PlatformDeviceInfo, name: &str) -> Option<u32> {
     device
         .property(name)
@@ -233,15 +250,23 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .and_then(|value| u8::try_from(value).ok())
         .ok_or("cros-ec-spi: invalid chip select")?;
     let maximum_speed = read_u32_property(device, "spi-max-frequency").unwrap_or(1_010_000);
-    let controller = Arc::new(CrosEcSpi::new(bus, phandle, chip_select, maximum_speed));
+    let primary = !device.compatible().contains(&"google,cros-ec-fp");
+    let controller = Arc::new(CrosEcSpi::new(
+        bus,
+        phandle,
+        primary,
+        chip_select,
+        maximum_speed,
+    ));
     CONTROLLERS.lock().push(controller.clone());
     println!(
-        "[cros-ec-spi] registered {} phandle={:#x} bus={:#x} cs={} speed={} Hz",
+        "[cros-ec-spi] registered {} phandle={:#x} bus={:#x} cs={} speed={} Hz role={}",
         device.name(),
         phandle,
         bus_phandle,
         chip_select,
         controller.speed_hz,
+        if primary { "primary" } else { "fingerprint" },
     );
     Ok(())
 }
