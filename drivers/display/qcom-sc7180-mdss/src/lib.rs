@@ -34,7 +34,7 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::{any::Any, ptr};
 
 use dpu::Dpu;
-use dsi::{DSI_BASE, DsiHost};
+use dsi::DsiHost;
 use phy::DsiPhy;
 use registers::RegisterWindow;
 use scarlet::{
@@ -61,7 +61,7 @@ use scarlet::{
 };
 use scarlet_driver_cros_ec_spi::get_primary_cros_ec_spi;
 use scarlet_driver_qcom_sc7180_dispcc::Sc7180DispCc;
-#[cfg(feature = "diagnostic-color-bar")]
+#[cfg(any(feature = "diagnostic-color-bar", feature = "diagnostic-dsi-pattern"))]
 use scarlet_driver_ti_sn65dsi86::Sn65dsi86ColorBar;
 use scarlet_driver_ti_sn65dsi86::{DisplayTiming, Sn65dsi86, get_sn65dsi86_by_phandle};
 
@@ -99,16 +99,42 @@ impl Sc7180DisplayEngine {
         scanout_dma_addr: usize,
     ) -> Result<(), &'static str> {
         let dsi = DsiHost::new(mdss);
-        dsi.reset();
-        DsiPhy::new(mdss).initialize(
+        // Linux prepares the downstream bridge first and observes td7 before
+        // allowing DSI data onto the link.
+        bridge
+            .initialize_reference_clock()
+            .map_err(|_| "qcom-sc7180-mdss: failed to prepare bridge reference clock")?;
+        time::udelay(100);
+
+        dsi.reset_phy();
+        let dsi_clock_timings = DsiPhy::new(mdss).initialize(
             timing,
             u32::from(DSI_LANES),
             u32::from(DSI_BITS_PER_PIXEL),
-            DSI_BASE,
         )?;
         dispcc.enable_dsi0()?;
+        dsi.configure_timing(timing, dsi_clock_timings);
+        // The DSI controller can only be reset while the link clocks run.
+        dsi.reset();
         dsi.configure_host(u32::from(DSI_LANES))?;
 
+        #[cfg(feature = "diagnostic-border-fill")]
+        println!("[qcom-sc7180-mdss] DPU border-only diagnostic enabled (white)");
+        self.dpu.configure(timing, scanout_dma_addr)?;
+        let pre_video_fifo = dsi.clear_fifo_status();
+        println!("[mdss-diag] dsi pre-video fifo={:#010x}", pre_video_fifo,);
+        // The upstream DSI bridge is enabled during pre-enable, before the
+        // encoder starts feeding pixels.
+        dsi.enable_video();
+        #[cfg(feature = "diagnostic-dsi-pattern")]
+        {
+            dsi.enable_video_test_pattern();
+            println!("[qcom-sc7180-mdss] DSI host checkerboard diagnostic enabled");
+        }
+
+        // Linux enables and trains the downstream bridge after DSI pre-enable,
+        // but before the DPU commit kickoff. Only after VSTREAM is live does
+        // the DPU issue CTL flush/start and enable its timing engine.
         bridge
             .configure_link(timing, DSI_LANES, DSI_BITS_PER_PIXEL)
             .map_err(|error| {
@@ -118,6 +144,18 @@ impl Sc7180DisplayEngine {
                 );
                 "qcom-sc7180-mdss: bridge link setup failed"
             })?;
+        #[cfg(feature = "diagnostic-dsi-pattern")]
+        {
+            bridge.arm_dsi_clock_detector().map_err(|error| {
+                println!(
+                    "[qcom-sc7180-mdss] failed to arm SN65 DSI clock detector: {:?}",
+                    error
+                );
+                "qcom-sc7180-mdss: bridge DSI clock detector setup failed"
+            })?;
+            println!("[qcom-sc7180-mdss] SN65 DSI input clock detector armed");
+        }
+        self.dpu.start();
         #[cfg(feature = "diagnostic-color-bar")]
         {
             bridge
@@ -125,27 +163,12 @@ impl Sc7180DisplayEngine {
                 .map_err(|_| "qcom-sc7180-mdss: failed to enable bridge color bar")?;
             println!("[qcom-sc7180-mdss] SN65DSI86 diagnostic color bar enabled");
         }
-        #[cfg(feature = "diagnostic-border-fill")]
-        println!("[qcom-sc7180-mdss] DPU border-only diagnostic enabled (white)");
-        self.dpu.configure(timing, scanout_dma_addr)?;
-        let pre_video_fifo = dsi.clear_fifo_status();
-        println!(
-            "[mdss-diag] dsi pre-video fifo={:#010x}",
-            pre_video_fifo,
-        );
-        dsi.configure_video(timing);
-        self.dpu.start();
-        #[cfg(feature = "diagnostic-dsi-pattern")]
-        {
-            dsi.enable_video_test_pattern();
-            println!("[qcom-sc7180-mdss] DSI host checkerboard diagnostic enabled");
-        }
         time::udelay(20_000);
 
         let dpu = self.dpu.diagnostic_snapshot();
         println!(
-            "[mdss-diag] dpu layer={:#010x} flush={:#010x}",
-            dpu.control_layer0, dpu.control_flush,
+            "[mdss-diag] dpu layer={:#010x} flush={:#010x} start={:#010x}",
+            dpu.control_layer0, dpu.control_flush, dpu.control_start,
         );
         println!(
             "[mdss-diag] dpu active={:#010x} address={:#010x}",
@@ -170,6 +193,10 @@ impl Sc7180DisplayEngine {
         println!(
             "[mdss-diag] dpu hctl={:#010x} panel={:#010x}",
             dpu.display_hcontrol, dpu.panel_format,
+        );
+        println!(
+            "[mdss-diag] dpu data-hctl={:#010x} config2={:#010x} polarity={:#010x}",
+            dpu.display_data_hcontrol, dpu.interface_config2, dpu.polarity_control,
         );
         println!(
             "[mdss-diag] dpu fetch={:#010x} mux={:#010x}",
@@ -275,6 +302,29 @@ impl Sc7180DisplayEngine {
         println!(
             "[mdss-diag] bridge dsi-lanes={:#04x} dsi-clk={:#04x}",
             bridge.dsi_lanes, bridge.dsi_clock,
+        );
+        #[cfg(feature = "diagnostic-dsi-pattern")]
+        if bridge.dsi_clock == 0 {
+            println!("[mdss-diag] bridge DSI clock detector: no input clock observed");
+        } else {
+            println!(
+                "[mdss-diag] bridge DSI clock detector: measured range={:#04x}",
+                bridge.dsi_clock,
+            );
+        }
+        println!(
+            "[mdss-diag] bridge lane-map={:#04x} polarity={:#04x} format={:#04x} training={:#04x}",
+            bridge.dp_lane_assignment,
+            bridge.enhanced_frame & 0xf0,
+            bridge.data_format,
+            bridge.training_settings,
+        );
+        println!(
+            "[mdss-diag] bridge sync h-positive={} v-positive={} regs={:#04x}/{:#04x}",
+            timing.hsync_positive,
+            timing.vsync_positive,
+            bridge.hsync_width_high,
+            bridge.vsync_width_high,
         );
         println!(
             "[mdss-diag] bridge dp-lanes={:#04x} rate={:#04x} link={:#04x}",
@@ -663,7 +713,10 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let config = FramebufferConfig {
         width: u32::from(timing.hactive),
         height: u32::from(timing.vactive),
-        format: PixelFormat::XRGB8888,
+        // Scarlet's compositor produces byte-ordered BGRA scanout buffers.
+        // The DPU source pipe consumes those bytes as DRM ARGB/XRGB8888
+        // (B, G, R, A/X in little-endian memory).
+        format: PixelFormat::BGRA8888,
         stride: u32::from(timing.hactive) * 4,
     };
     let scanout = allocate_scanout(&config)?;
@@ -716,6 +769,18 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     })?;
     if let Some(enable) = backlight_enable {
         drive_gpio(enable, true)?;
+    }
+    #[cfg(feature = "diagnostic-dsi-pattern")]
+    {
+        bridge
+            .set_color_bar(Some(Sn65dsi86ColorBar::VerticalEightColors))
+            .map_err(|_| "qcom-sc7180-mdss: failed to enable bridge comparison pattern")?;
+        println!("[qcom-sc7180-mdss] showing SN65 comparison color bar for 2 seconds");
+        time::udelay(2_000_000);
+        bridge
+            .set_color_bar(None)
+            .map_err(|_| "qcom-sc7180-mdss: failed to restore DSI input video")?;
+        println!("[qcom-sc7180-mdss] switched from SN65 color bar to DSI checkerboard");
     }
 
     println!("[qcom-sc7180-mdss] phase 5/5: publishing native framebuffer");

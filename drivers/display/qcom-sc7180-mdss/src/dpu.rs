@@ -16,6 +16,7 @@ const VBIF_BASE: usize = 0xb0000;
 const CONTROL_LAYER0: usize = 0x000;
 const CONTROL_TOP: usize = 0x014;
 const CONTROL_FLUSH: usize = 0x018;
+const CONTROL_START: usize = 0x01c;
 const CONTROL_INTERFACE_ACTIVE: usize = 0x0f4;
 const CONTROL_INTERFACE_FLUSH: usize = 0x110;
 
@@ -48,9 +49,19 @@ const INTERFACE_VSYNC_PERIOD: usize = 0x00c;
 const INTERFACE_VSYNC_PULSE: usize = 0x014;
 const INTERFACE_DISPLAY_VSTART: usize = 0x01c;
 const INTERFACE_DISPLAY_VEND: usize = 0x024;
+const INTERFACE_ACTIVE_VSTART: usize = 0x02c;
+const INTERFACE_ACTIVE_VEND: usize = 0x034;
 const INTERFACE_DISPLAY_HCONTROL: usize = 0x03c;
+const INTERFACE_ACTIVE_HCONTROL: usize = 0x040;
+const INTERFACE_BORDER_COLOR: usize = 0x044;
 const INTERFACE_UNDERFLOW_COLOR: usize = 0x048;
+const INTERFACE_HSYNC_SKEW: usize = 0x04c;
+const INTERFACE_POLARITY_CONTROL: usize = 0x050;
+const INTERFACE_CONFIG2: usize = 0x060;
+const INTERFACE_DISPLAY_DATA_HCONTROL: usize = 0x064;
+const INTERFACE_ACTIVE_DATA_HCONTROL: usize = 0x068;
 const INTERFACE_PANEL_FORMAT: usize = 0x090;
+const INTERFACE_FRAME_LINE_COUNT_ENABLE: usize = 0x0a8;
 const INTERFACE_FETCH_START: usize = 0x170;
 const INTERFACE_MUX: usize = 0x25c;
 
@@ -61,6 +72,8 @@ const VBIF_QOS_LEVEL_BASE: usize = 0x590;
 
 const MAXIMUM_PREFILL_LINES: u32 = 24;
 const PROGRAMMABLE_FETCH_ENABLE: u32 = 1 << 31;
+const DATA_HCONTROL_ENABLE: u32 = 1 << 4;
+const RGB888_PANEL_FORMAT: u32 = 0x213f;
 const SOURCE_PIXEL_EXTENSION_OVERRIDE: u32 = 1 << 31;
 const LAYER_BORDER_OUTPUT: u32 = 1 << 24;
 const LAYER_VIG0_OUTPUT: u32 = 1;
@@ -79,6 +92,7 @@ pub(crate) struct Dpu {
 pub(crate) struct DpuDiagnosticSnapshot {
     pub(crate) control_layer0: u32,
     pub(crate) control_flush: u32,
+    pub(crate) control_start: u32,
     pub(crate) interface_active: u32,
     pub(crate) source_address: u32,
     pub(crate) source_stride: u32,
@@ -92,6 +106,9 @@ pub(crate) struct DpuDiagnosticSnapshot {
     pub(crate) hsync_control: u32,
     pub(crate) vsync_period: u32,
     pub(crate) display_hcontrol: u32,
+    pub(crate) display_data_hcontrol: u32,
+    pub(crate) interface_config2: u32,
+    pub(crate) polarity_control: u32,
     pub(crate) panel_format: u32,
     pub(crate) fetch_start: u32,
     pub(crate) interface_mux: u32,
@@ -140,8 +157,30 @@ impl Dpu {
         );
         self.write(INTERFACE_BASE, INTERFACE_DISPLAY_VSTART, display_vstart);
         self.write(INTERFACE_BASE, INTERFACE_DISPLAY_VEND, display_vend);
-        self.write(INTERFACE_BASE, INTERFACE_UNDERFLOW_COLOR, 0);
-        self.write(INTERFACE_BASE, INTERFACE_PANEL_FORMAT, 0x2100);
+        // With no border region Linux explicitly clears the active-window
+        // registers and uses the display window for RGB data timing.
+        self.write(INTERFACE_BASE, INTERFACE_ACTIVE_HCONTROL, 0);
+        self.write(INTERFACE_BASE, INTERFACE_ACTIVE_VSTART, 0);
+        self.write(INTERFACE_BASE, INTERFACE_ACTIVE_VEND, 0);
+        self.write(INTERFACE_BASE, INTERFACE_BORDER_COLOR, 0);
+        self.write(INTERFACE_BASE, INTERFACE_UNDERFLOW_COLOR, 0xff);
+        self.write(INTERFACE_BASE, INTERFACE_HSYNC_SKEW, 0);
+        // MSM DSI cannot consume active-low sync signals, so Linux forces both
+        // DPU interface polarities to active high regardless of panel flags.
+        self.write(INTERFACE_BASE, INTERFACE_POLARITY_CONTROL, 0);
+        self.write(INTERFACE_BASE, INTERFACE_FRAME_LINE_COUNT_ENABLE, 3);
+        // Linux rebuilds INTF_CONFIG from zero for every mode. This is
+        // important on a firmware handoff: bit 23 is DSI_VIDEO_STOP_MODE and
+        // may be left asserted by the previous display owner.
+        self.write(INTERFACE_BASE, INTERFACE_CONFIG, 0);
+        self.write(INTERFACE_BASE, INTERFACE_PANEL_FORMAT, RGB888_PANEL_FORMAT);
+        self.write(
+            INTERFACE_BASE,
+            INTERFACE_DISPLAY_DATA_HCONTROL,
+            (hsync_end << 16) | hsync_start,
+        );
+        self.write(INTERFACE_BASE, INTERFACE_ACTIVE_DATA_HCONTROL, 0);
+        self.write(INTERFACE_BASE, INTERFACE_CONFIG2, DATA_HCONTROL_ENABLE);
     }
 
     fn configure_fetch_start(&self, timing: DisplayTiming) {
@@ -159,7 +198,12 @@ impl Dpu {
         available = available.min(needed);
         let fetch_start = (vertical_total - available) * horizontal_total + horizontal_total + 1;
         self.write(INTERFACE_BASE, INTERFACE_FETCH_START, fetch_start);
-        self.write(INTERFACE_BASE, INTERFACE_CONFIG, PROGRAMMABLE_FETCH_ENABLE);
+        let config = self.read(INTERFACE_BASE, INTERFACE_CONFIG);
+        self.write(
+            INTERFACE_BASE,
+            INTERFACE_CONFIG,
+            config | PROGRAMMABLE_FETCH_ENABLE,
+        );
     }
 
     fn configure_vbif(&self) {
@@ -239,6 +283,10 @@ impl Dpu {
             CONTROL_LAYER0,
             LAYER_BORDER_OUTPUT | LAYER_VIG0_OUTPUT,
         );
+        // SC7180 advertises DPU_CTL_ACTIVE_CFG: video-mode routing lives in
+        // CTL_INTF_ACTIVE, while CTL_TOP only carries the mode selector and is
+        // zero for video mode. The legacy `(INTF_1 << 4)` encoding does not
+        // apply to this CTL generation.
         self.write(CONTROL_BASE, CONTROL_TOP, 0);
         self.write(CONTROL_BASE, CONTROL_INTERFACE_ACTIVE, INTERFACE1_ACTIVE);
         self.write(INTERFACE_BASE, INTERFACE_MUX, 0x000f_0000);
@@ -271,6 +319,8 @@ impl Dpu {
 
     pub(crate) fn start(&self) {
         self.flush();
+        self.write(CONTROL_BASE, CONTROL_START, 1);
+        arch::io_wmb();
         self.write(INTERFACE_BASE, INTERFACE_TIMING_ENABLE, 1);
         arch::io_wmb();
     }
@@ -280,6 +330,7 @@ impl Dpu {
         DpuDiagnosticSnapshot {
             control_layer0: self.read(CONTROL_BASE, CONTROL_LAYER0),
             control_flush: self.read(CONTROL_BASE, CONTROL_FLUSH),
+            control_start: self.read(CONTROL_BASE, CONTROL_START),
             interface_active: self.read(CONTROL_BASE, CONTROL_INTERFACE_ACTIVE),
             source_address: self.read(SOURCE_PIPE_BASE, SOURCE_ADDRESS0),
             source_stride: self.read(SOURCE_PIPE_BASE, SOURCE_STRIDE0),
@@ -293,6 +344,9 @@ impl Dpu {
             hsync_control: self.read(INTERFACE_BASE, INTERFACE_HSYNC_CONTROL),
             vsync_period: self.read(INTERFACE_BASE, INTERFACE_VSYNC_PERIOD),
             display_hcontrol: self.read(INTERFACE_BASE, INTERFACE_DISPLAY_HCONTROL),
+            display_data_hcontrol: self.read(INTERFACE_BASE, INTERFACE_DISPLAY_DATA_HCONTROL),
+            interface_config2: self.read(INTERFACE_BASE, INTERFACE_CONFIG2),
+            polarity_control: self.read(INTERFACE_BASE, INTERFACE_POLARITY_CONTROL),
             panel_format: self.read(INTERFACE_BASE, INTERFACE_PANEL_FORMAT),
             fetch_start: self.read(INTERFACE_BASE, INTERFACE_FETCH_START),
             interface_mux: self.read(INTERFACE_BASE, INTERFACE_MUX),

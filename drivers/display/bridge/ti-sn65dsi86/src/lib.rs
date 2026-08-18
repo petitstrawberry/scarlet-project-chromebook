@@ -51,11 +51,13 @@ const VERTICAL_BACK_PORCH: u8 = 0x36;
 const HORIZONTAL_FRONT_PORCH: u8 = 0x38;
 const VERTICAL_FRONT_PORCH: u8 = 0x3a;
 const COLOR_BAR: u8 = 0x3c;
+const DP_LANE_ASSIGNMENT: u8 = 0x59;
 const ENHANCED_FRAME: u8 = 0x5a;
 const DATA_FORMAT: u8 = 0x5b;
 const HPD_DISABLE: u8 = 0x5c;
 const SSC_CONFIG: u8 = 0x93;
 const DATA_RATE: u8 = 0x94;
+const TRAINING_SETTINGS: u8 = 0x95;
 const MAIN_LINK_MODE: u8 = 0x96;
 const AUX_WRITE_DATA: u8 = 0x64;
 const AUX_ADDRESS_HIGH: u8 = 0x74;
@@ -69,6 +71,13 @@ const VIDEO_ERROR_STATUS_END: u8 = 0xf7;
 const DEVICE_ID: [u8; 8] = *b"68ISD   ";
 const DP_PLL_LOCKED: u8 = 1 << 7;
 const VIDEO_STREAM_ENABLED: u8 = 1 << 3;
+const DSI_CHANNEL_MODE_MASK: u8 = 0x3 << 5;
+const DSI_SINGLE_CHANNEL_A: u8 = 1 << 5;
+const DSI_LANE_COUNT_MASK: u8 = 0x3 << 3;
+const DP_LANE_POLARITY_MASK: u8 = 0xf0;
+const DATA_FORMAT_18BPP_RGB: u8 = 1 << 0;
+const SCRAMBLER_DISABLED: u8 = 1 << 4;
+const SYNC_PULSE_NEGATIVE: u8 = 1 << 7;
 const HPD_IS_DISABLED: u8 = 1 << 0;
 const HPD_DEBOUNCED_STATE: u8 = 1 << 4;
 const MAIN_LINK_OFF: u8 = 0x0;
@@ -113,6 +122,8 @@ const EDID_BLOCK_SIZE: usize = 128;
 const EDID_MAX_BLOCKS: usize = 2;
 const EDID_EXTENSION_COUNT: usize = 0x7e;
 const EDID_HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+const EDID_DETAILED_TIMING_HSYNC_POSITIVE: u8 = 1 << 1;
+const EDID_DETAILED_TIMING_VSYNC_POSITIVE: u8 = 1 << 2;
 
 /// One DisplayPort AUX request supported by the bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +193,10 @@ pub struct DisplayTiming {
     pub vsync_offset: u16,
     /// Vertical sync pulse width in lines.
     pub vsync_width: u16,
+    /// Whether the horizontal sync pulse is active high.
+    pub hsync_positive: bool,
+    /// Whether the vertical sync pulse is active high.
+    pub vsync_positive: bool,
 }
 
 impl DisplayTiming {
@@ -288,6 +303,7 @@ impl Sn65dsi86Edid {
         let vsync_offset = u16::from(descriptor[10] >> 4) | (u16::from(descriptor[11] & 0x0c) << 2);
         let vsync_width =
             u16::from(descriptor[10] & 0x0f) | (u16::from(descriptor[11] & 0x03) << 4);
+        let sync = descriptor[17];
 
         DisplayTiming {
             pixel_clock_khz,
@@ -299,6 +315,8 @@ impl Sn65dsi86Edid {
             vblank,
             vsync_offset,
             vsync_width,
+            hsync_positive: sync & EDID_DETAILED_TIMING_HSYNC_POSITIVE != 0,
+            vsync_positive: sync & EDID_DETAILED_TIMING_VSYNC_POSITIVE != 0,
         }
         .validate()
     }
@@ -317,8 +335,18 @@ pub struct Sn65dsi86DiagnosticSnapshot {
     pub dsi_lanes: u8,
     /// Raw DSI clock-frequency selector.
     pub dsi_clock: u8,
+    /// Raw DisplayPort lane assignment.
+    pub dp_lane_assignment: u8,
     /// Raw enhanced-frame and video-stream register.
     pub enhanced_frame: u8,
+    /// Raw DisplayPort output data format.
+    pub data_format: u8,
+    /// Raw link-training settings, including the scrambler-disable bit.
+    pub training_settings: u8,
+    /// Raw high byte of the horizontal sync width and polarity.
+    pub hsync_width_high: u8,
+    /// Raw high byte of the vertical sync width and polarity.
+    pub vsync_width_high: u8,
     /// Raw HPD state/control register.
     pub hpd: u8,
     /// Raw spread-spectrum and DP lane-count register.
@@ -474,7 +502,12 @@ impl Sn65dsi86 {
             pll_enabled: self.read_u8(PLL_ENABLE)? & 1 != 0,
             dsi_lanes: self.read_u8(DSI_LANES)?,
             dsi_clock: self.read_u8(DSI_CLOCK)?,
+            dp_lane_assignment: self.read_u8(DP_LANE_ASSIGNMENT)?,
             enhanced_frame: self.read_u8(ENHANCED_FRAME)?,
+            data_format: self.read_u8(DATA_FORMAT)?,
+            training_settings: self.read_u8(TRAINING_SETTINGS)?,
+            hsync_width_high: self.read_u8(HSYNC_WIDTH_HIGH)?,
+            vsync_width_high: self.read_u8(VSYNC_WIDTH_HIGH)?,
             hpd: self.read_u8(HPD_DISABLE)?,
             ssc_config: self.read_u8(SSC_CONFIG)?,
             data_rate: self.read_u8(DATA_RATE)?,
@@ -672,13 +705,14 @@ impl Sn65dsi86 {
     fn required_dp_rate_mbps(
         timing: DisplayTiming,
         dp_lanes: u8,
+        output_bits_per_pixel: u8,
     ) -> Result<u32, Sn65dsi86LinkError> {
         if dp_lanes == 0 {
             return Err(Sn65dsi86LinkError::UnsupportedLink);
         }
-        // The bridge emits an 18-bit eDP stream. Account for DisplayPort's
-        // 8b/10b encoding when selecting the per-lane symbol rate.
-        let numerator = u64::from(timing.pixel_clock_khz) * 18 * 10;
+        // Account for DisplayPort's 8b/10b encoding when selecting the
+        // per-lane symbol rate for the selected bridge output format.
+        let numerator = u64::from(timing.pixel_clock_khz) * u64::from(output_bits_per_pixel) * 10;
         let denominator = u64::from(dp_lanes) * 8 * 1_000;
         let rate = numerator.div_ceil(denominator);
         u32::try_from(rate).map_err(|_| Sn65dsi86LinkError::UnsupportedLink)
@@ -688,8 +722,9 @@ impl Sn65dsi86 {
         timing: DisplayTiming,
         dp_lanes: u8,
         sink_max_rate: u8,
+        output_bits_per_pixel: u8,
     ) -> Result<u8, Sn65dsi86LinkError> {
-        let required = Self::required_dp_rate_mbps(timing, dp_lanes)?;
+        let required = Self::required_dp_rate_mbps(timing, dp_lanes, output_bits_per_pixel)?;
         let max_selector = match sink_max_rate {
             DP_LINK_RATE_1_62 => 1,
             DP_LINK_RATE_2_70 => 4,
@@ -722,9 +757,25 @@ impl Sn65dsi86 {
         self.write_u8(ACTIVE_HEIGHT_LOW, timing.vactive as u8)?;
         self.write_u8(ACTIVE_HEIGHT_HIGH, (timing.vactive >> 8) as u8)?;
         self.write_u8(HSYNC_WIDTH_LOW, timing.hsync_width as u8)?;
-        self.write_u8(HSYNC_WIDTH_HIGH, (timing.hsync_width >> 8) as u8)?;
+        self.write_u8(
+            HSYNC_WIDTH_HIGH,
+            ((timing.hsync_width >> 8) as u8 & !SYNC_PULSE_NEGATIVE)
+                | if timing.hsync_positive {
+                    0
+                } else {
+                    SYNC_PULSE_NEGATIVE
+                },
+        )?;
         self.write_u8(VSYNC_WIDTH_LOW, timing.vsync_width as u8)?;
-        self.write_u8(VSYNC_WIDTH_HIGH, (timing.vsync_width >> 8) as u8)?;
+        self.write_u8(
+            VSYNC_WIDTH_HIGH,
+            ((timing.vsync_width >> 8) as u8 & !SYNC_PULSE_NEGATIVE)
+                | if timing.vsync_positive {
+                    0
+                } else {
+                    SYNC_PULSE_NEGATIVE
+                },
+        )?;
         self.write_u8(HORIZONTAL_BACK_PORCH, hback)?;
         self.write_u8(VERTICAL_BACK_PORCH, vback)?;
         self.write_u8(HORIZONTAL_FRONT_PORCH, hfront)?;
@@ -744,6 +795,11 @@ impl Sn65dsi86 {
         }
 
         self.write_dpcd(DPCD_CONFIGURATION_SET, &[1])?;
+        // The SN65 supports the alternate scrambler-reset method used by eDP.
+        // Linux enables ASSR in the sink above and explicitly keeps the
+        // bridge scrambler enabled before starting link training. Do not
+        // inherit SCRAMBLE_DISABLE from an earlier firmware display owner.
+        self.update_u8(TRAINING_SETTINGS, SCRAMBLER_DISABLED, 0)?;
         for _ in 0..LINK_TRAINING_RETRIES {
             self.write_u8(MAIN_LINK_MODE, MAIN_LINK_SEMI_AUTOMATIC_TRAINING)?;
             match self.wait_register(MAIN_LINK_MODE, LINK_TRAINING_TIMEOUT_US, |value| {
@@ -764,6 +820,16 @@ impl Sn65dsi86 {
         Ok(())
     }
 
+    /// Arm the bridge's DSI input-clock detector for diagnostics.
+    ///
+    /// A zero value in the DSI clock-range register asks the bridge to
+    /// measure the incoming clock. The later diagnostic snapshot therefore
+    /// distinguishes a programmed expectation from an observed DSI signal.
+    pub fn arm_dsi_clock_detector(&self) -> Result<(), I2cError> {
+        self.clear_video_error_status()?;
+        self.write_u8(DSI_CLOCK, 0)
+    }
+
     /// Configure and train the bridge for one DSI video mode.
     ///
     /// The native SC7180 path uses four DSI lanes. The eDP lane count is
@@ -775,7 +841,11 @@ impl Sn65dsi86 {
         dsi_bits_per_pixel: u8,
     ) -> Result<(), Sn65dsi86LinkError> {
         let timing = timing.validate()?;
-        if !(1..=4).contains(&dsi_lanes) || dsi_bits_per_pixel == 0 {
+        let output_bits_per_pixel = match dsi_bits_per_pixel {
+            18 | 24 => dsi_bits_per_pixel,
+            _ => return Err(Sn65dsi86LinkError::UnsupportedLink),
+        };
+        if !(1..=4).contains(&dsi_lanes) {
             return Err(Sn65dsi86LinkError::UnsupportedLink);
         }
 
@@ -786,9 +856,17 @@ impl Sn65dsi86 {
         if dp_lanes == 0 {
             return Err(Sn65dsi86LinkError::UnsupportedLink);
         }
-        let dp_rate = Self::select_dp_rate(timing, dp_lanes, sink[0])?;
+        let dp_rate = Self::select_dp_rate(timing, dp_lanes, sink[0], output_bits_per_pixel)?;
 
-        self.update_u8(DSI_LANES, 0x1f << 3, (4 - dsi_lanes) << 3)?;
+        self.update_u8(
+            DSI_LANES,
+            DSI_CHANNEL_MODE_MASK | DSI_LANE_COUNT_MASK,
+            DSI_SINGLE_CHANNEL_A | (4 - dsi_lanes) << 3,
+        )?;
+        // CoachZ routes the bridge's eDP lanes as DT data-lanes <0 1 2 3>.
+        // Linux packs that identity mapping as 0xe4 at SN_LN_ASSIGN_REG.
+        self.write_u8(DP_LANE_ASSIGNMENT, 0xe4)?;
+        self.update_u8(ENHANCED_FRAME, DP_LANE_POLARITY_MASK, 0)?;
         self.update_u8(SSC_CONFIG, 0x7 << 4, dp_lanes.min(3) << 4)?;
 
         let dsi_clock_mhz = (u64::from(timing.pixel_clock_khz) * u64::from(dsi_bits_per_pixel)
@@ -799,12 +877,25 @@ impl Sn65dsi86 {
         self.write_u8(DSI_CLOCK, (dsi_clock_mhz / DSI_CLOCK_STEP_MHZ) as u8)?;
         self.update_u8(DATA_RATE, 0xe0, dp_rate << 5)?;
 
+        // Select the DP output width before training, matching the Linux
+        // bridge enable sequence.
+        self.update_u8(
+            DATA_FORMAT,
+            DATA_FORMAT_18BPP_RGB,
+            if output_bits_per_pixel == 18 {
+                DATA_FORMAT_18BPP_RGB
+            } else {
+                0
+            },
+        )?;
+
         self.update_u8(ENHANCED_FRAME, VIDEO_STREAM_ENABLED, 0)?;
         self.train_link()?;
         self.configure_timing_registers(timing)?;
-        // The SN65 bridge consumes RGB888 over DSI and emits its 18-bit eDP
-        // stream when this selector is set.
-        self.write_u8(DATA_FORMAT, 1)?;
+        // SN65DSI86 requires the programmed video timings to settle before
+        // VSTREAM is asserted. Linux follows the data-sheet recommendation
+        // and waits 10 ms here.
+        time::udelay(10_000);
         self.write_u8(COLOR_BAR, 5)?;
         // TI recommends clearing latched bring-up errors before examining the
         // active stream. Preserve F8 so the link-training result remains visible.

@@ -2,9 +2,10 @@
 
 //! SC7180 DSI0 host controller.
 
+use scarlet::{arch, time};
 use scarlet_driver_ti_sn65dsi86::DisplayTiming;
 
-use crate::registers::RegisterWindow;
+use crate::{phy::DsiHostClockTimings, registers::RegisterWindow};
 
 pub(crate) const DSI_BASE: usize = 0x94000;
 
@@ -13,6 +14,7 @@ const CONTROL: usize = 0x004;
 const STATUS: usize = 0x008;
 const FIFO_STATUS: usize = 0x00c;
 const VIDEO_MODE_CONTROL: usize = 0x010;
+const VIDEO_MODE_CONTROL1: usize = 0x020;
 const VIDEO_ACTIVE_HORIZONTAL: usize = 0x024;
 const VIDEO_ACTIVE_VERTICAL: usize = 0x028;
 const VIDEO_ACTIVE_TOTAL: usize = 0x02c;
@@ -24,20 +26,26 @@ const ACK_ERROR_STATUS: usize = 0x068;
 const TRIGGER_CONTROL: usize = 0x084;
 const LANE_STATUS: usize = 0x0a8;
 const LANE_CONTROL: usize = 0x0ac;
+const LANE_SWAP_CONTROL: usize = 0x0b0;
 const DATA_LANE0_PHY_ERROR: usize = 0x0b4;
 const HS_TIMER_CONTROL: usize = 0x0bc;
 const TIMEOUT_STATUS: usize = 0x0c0;
+const CLOCK_OUT_TIMING_CONTROL: usize = 0x0c4;
 const EOT_PACKET_CONTROL: usize = 0x0d0;
 const INTERRUPT_CONTROL: usize = 0x110;
 const SOFT_RESET: usize = 0x118;
 const CLOCK_CONTROL: usize = 0x11c;
 const CLOCK_STATUS: usize = 0x120;
+const PHY_RESET: usize = 0x12c;
 const TEST_PATTERN_CONTROL: usize = 0x15c;
+#[cfg(feature = "diagnostic-dsi-pattern")]
 const TEST_PATTERN_VIDEO_INITIAL_VALUE: usize = 0x164;
+#[cfg(feature = "diagnostic-dsi-pattern")]
 const TEST_PATTERN_MAIN_CONTROL: usize = 0x19c;
+#[cfg(feature = "diagnostic-dsi-pattern")]
 const TEST_PATTERN_VIDEO_CONFIG: usize = 0x1a4;
+const TEST_PATTERN_DMA_FIFO_RESET: usize = 0x1ec;
 const CLOCK_PRE_EXTEND: usize = 0x180;
-const TPG_DMA_FIFO_RESET: usize = 0x1ec;
 
 const PHY_BASE: usize = 0x94400;
 const PHY_CLOCK_CONFIG0: usize = 0x010;
@@ -61,9 +69,14 @@ const VIDEO_TRAFFIC_MODE: u32 = 1 << 8;
 const VIDEO_BLANKING_LOW_POWER: u32 = 9 << 12;
 const VIDEO_FORMAT_RGB888: u32 = 3 << 4;
 const HIGH_SPEED_TIMEOUT: u32 = 0xea60 | (4 << 16);
+const TRIGGER_LINUX_VIDEO: u32 = (1 << 31) | (1 << 12) | 4;
+#[cfg(feature = "diagnostic-dsi-pattern")]
 const TEST_PATTERN_CHECKERBOARD: u32 = 1 << 8;
+#[cfg(feature = "diagnostic-dsi-pattern")]
 const TEST_PATTERN_VIDEO_RGB888: u32 = 1 | (1 << 2);
+#[cfg(feature = "diagnostic-dsi-pattern")]
 const TEST_PATTERN_VIDEO_GENERAL: u32 = 3 << 4;
+#[cfg(feature = "diagnostic-dsi-pattern")]
 const TEST_PATTERN_ENABLE: u32 = 1;
 
 pub(crate) struct DsiHost {
@@ -118,13 +131,42 @@ impl DsiHost {
         self.mdss.read(DSI_BASE + offset)
     }
 
+    fn enable_internal_clocks(&self) {
+        self.write(CLOCK_CONTROL, 0);
+        self.update(CLOCK_CONTROL, 0, (1 << 1) | (1 << 9));
+        self.update(CLOCK_CONTROL, 0, 1 << 2);
+        self.update(CLOCK_CONTROL, 0, (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5));
+    }
+
+    /// Reset the DSI PHY through the host-side reset line before programming
+    /// the 10 nm PHY. This is the reset used by the Linux MSM DSI manager;
+    /// toggling a PHY common register is not equivalent.
+    pub(crate) fn reset_phy(&self) {
+        self.write(PHY_RESET, 1);
+        arch::io_wmb();
+        time::udelay(1_000);
+        self.write(PHY_RESET, 0);
+        time::udelay(100);
+    }
+
+    /// Reset the controller after its DISP_CC link clocks are running.
     pub(crate) fn reset(&self) {
         self.write(CONTROL, 0);
+        self.enable_internal_clocks();
+        arch::io_wmb();
         self.write(SOFT_RESET, 1);
+        time::udelay(20_000);
         self.write(SOFT_RESET, 0);
+        arch::io_wmb();
         self.write(HS_TIMER_CONTROL, HIGH_SPEED_TIMEOUT);
-        self.write(TPG_DMA_FIFO_RESET, 1);
-        self.write(TPG_DMA_FIFO_RESET, 0);
+        // Coreboot uses command-DMA test-pattern FIFO mode to issue panel
+        // transactions. Those controls survive the alternate-firmware
+        // handoff, so explicitly return both the selector and FIFO to the
+        // video-host baseline after the controller reset.
+        self.write(TEST_PATTERN_CONTROL, 0);
+        self.write(TEST_PATTERN_DMA_FIFO_RESET, 1);
+        arch::io_wmb();
+        self.write(TEST_PATTERN_DMA_FIFO_RESET, 0);
     }
 
     pub(crate) fn configure_host(&self, data_lanes: u32) -> Result<(), &'static str> {
@@ -133,25 +175,28 @@ impl DsiHost {
         }
         let lane_mask = (1u32 << data_lanes) - 1;
 
-        self.write(CLOCK_CONTROL, 0);
-        self.update(CLOCK_CONTROL, 0, (1 << 1) | (1 << 9));
-        self.update(CLOCK_CONTROL, 0, 1 << 2);
-        self.update(CLOCK_CONTROL, 0, (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5));
-        self.write(TRIGGER_CONTROL, 4);
-        // Keep the video engine stopped until timing and the upstream DPU are
-        // ready. Linux makes the same split between host power-on and video
-        // mode enable; starting it here can latch a FIFO overflow while the
-        // SN65 link is still being trained.
+        self.write(
+            VIDEO_MODE_CONTROL,
+            VIDEO_BLANKING_LOW_POWER | VIDEO_TRAFFIC_MODE | VIDEO_FORMAT_RGB888,
+        );
+        self.write(VIDEO_MODE_CONTROL1, 0);
+        self.write(COMMAND_DMA_CONTROL, (1 << 28) | (1 << 26));
+        self.write(TRIGGER_CONTROL, TRIGGER_LINUX_VIDEO);
+        self.write(EOT_PACKET_CONTROL, 1);
+        self.write(LANE_SWAP_CONTROL, 0);
+        self.write(HS_TIMER_CONTROL, HIGH_SPEED_TIMEOUT);
+        // Linux programs every host parameter before exposing enabled lanes to
+        // the video engine. Keep CONTROL as the final host-setup write.
         self.write(
             CONTROL,
             (lane_mask << 4) | CONTROL_ENABLE | CONTROL_CLOCK_LANE_ENABLE,
         );
-        self.write(COMMAND_DMA_CONTROL, (1 << 28) | (1 << 26));
-        self.write(EOT_PACKET_CONTROL, 1);
         Ok(())
     }
 
-    pub(crate) fn configure_video(&self, timing: DisplayTiming) {
+    /// Program the video and D-PHY clock timing registers before host reset,
+    /// following the ordering used by the Linux MSM DSI host driver.
+    pub(crate) fn configure_timing(&self, timing: DisplayTiming, clock: DsiHostClockTimings) {
         let horizontal_total = timing.horizontal_total();
         let vertical_total = timing.vertical_total();
         let horizontal_start = u32::from(timing.hblank - timing.hsync_offset);
@@ -175,14 +220,16 @@ impl DsiHost {
             u32::from(timing.vsync_width) << 16,
         );
         self.write(
-            VIDEO_MODE_CONTROL,
-            VIDEO_BLANKING_LOW_POWER | VIDEO_TRAFFIC_MODE | VIDEO_FORMAT_RGB888,
+            CLOCK_OUT_TIMING_CONTROL,
+            (clock.clock_post << 8) | clock.clock_pre,
         );
-        self.write(HS_TIMER_CONTROL, HIGH_SPEED_TIMEOUT);
-        self.write(
-            CONTROL,
-            (0x0f << 4) | CONTROL_ENABLE | CONTROL_VIDEO_ENABLE | CONTROL_CLOCK_LANE_ENABLE,
-        );
+        self.write(CLOCK_PRE_EXTEND, clock.clock_pre_double);
+    }
+
+    /// Switch the already-configured host into video mode without disturbing
+    /// its lane mask or clock-lane state.
+    pub(crate) fn enable_video(&self) {
+        self.update(CONTROL, 0, CONTROL_ENABLE | CONTROL_VIDEO_ENABLE);
     }
 
     /// Clear FIFO faults accumulated while the host is enabled but the DPU
@@ -201,13 +248,17 @@ impl DsiHost {
     /// This substitutes a generated checkerboard at the DSI host boundary,
     /// bypassing DPU source, mixer, and interface pixel data while retaining
     /// the real DSI host, PHY, bridge, eDP link, and panel path.
+    #[cfg(feature = "diagnostic-dsi-pattern")]
     pub(crate) fn enable_video_test_pattern(&self) {
         self.write(TEST_PATTERN_VIDEO_INITIAL_VALUE, 0xff);
         self.write(TEST_PATTERN_MAIN_CONTROL, TEST_PATTERN_CHECKERBOARD);
         self.write(TEST_PATTERN_VIDEO_CONFIG, TEST_PATTERN_VIDEO_RGB888);
-        self.update(
+        // Coreboot uses the same register's DMA-FIFO mode while issuing
+        // panel commands and that bit survives the firmware handoff. Select
+        // the Linux video-pattern state outright instead of inheriting an
+        // unrelated command-path mode.
+        self.write(
             TEST_PATTERN_CONTROL,
-            0,
             TEST_PATTERN_VIDEO_GENERAL | TEST_PATTERN_ENABLE,
         );
     }

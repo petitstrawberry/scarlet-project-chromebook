@@ -16,7 +16,6 @@ const COMMON_GLOBAL_CONTROL: usize = 0x18;
 const COMMON_RESYNC_BUFFER_CONTROL: usize = 0x1c;
 const COMMON_VREG_CONTROL: usize = 0x20;
 const COMMON_CONTROL0: usize = 0x24;
-const COMMON_CONTROL1: usize = 0x28;
 const COMMON_CONTROL2: usize = 0x2c;
 const COMMON_LANE_CONFIG0: usize = 0x30;
 const COMMON_LANE_CONFIG1: usize = 0x34;
@@ -42,11 +41,6 @@ const LANE_TX_CONTROL: usize = 0x2c;
 const PLL_SYSTEM_MUXES: usize = 0x24;
 const PLL_OUTPUT_DIVIDER_RATE: usize = 0x140;
 const PLL_COMMON_STATUS_ONE: usize = 0x1a0;
-
-// DSI6G v2.4 host register, including the four-byte HW-version prefix used by
-// SC7180. The 10 nm PHY timing calculation can require a doubled T_CLK_PRE
-// unit; the host must be told when that encoding is in use.
-const DSI_CLOCK_PRE_EXTEND: usize = 0x180;
 
 const REFERENCE_GENERATOR_TIMEOUT_US: u64 = 15_000;
 const PLL_LOCK_TIMEOUT_US: u64 = 15_000;
@@ -112,6 +106,13 @@ struct PllRate {
     clock_inverters: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DsiHostClockTimings {
+    pub(crate) clock_pre: u32,
+    pub(crate) clock_post: u32,
+    pub(crate) clock_pre_double: u32,
+}
+
 pub(crate) struct DsiPhy {
     mdss: RegisterWindow,
 }
@@ -144,11 +145,7 @@ impl DsiPhy {
         Ok(())
     }
 
-    fn reset_and_enable_lanes(&self) -> Result<(), &'static str> {
-        self.phy_write(COMMON_CONTROL1, 0x40);
-        time::udelay(100);
-        self.phy_write(COMMON_CONTROL1, 0);
-
+    fn prepare_common_block(&self) -> Result<(), &'static str> {
         self.wait_for_bit(
             PHY_BASE + COMMON_PHY_STATUS,
             1,
@@ -158,36 +155,60 @@ impl DsiPhy {
         self.phy_write(COMMON_CONTROL0, 0x60);
         self.phy_write(COMMON_PLL_CONTROL, 0);
         self.phy_write(COMMON_RESYNC_BUFFER_CONTROL, 0);
-        // ChromeOS Linux and upstream Linux both program the SC7180 10 nm
-        // PHY's fixed logical-to-physical lane map before powering the lanes.
+        // A standalone SC7180 PHY uses its internal PLL. Clear the inherited
+        // pixel-clock mux and global-clock enable before reprogramming it.
+        self.phy_write(COMMON_CLOCK_CONFIG1, 0);
+        self.phy_write(COMMON_GLOBAL_CONTROL, 0x10);
+        self.phy_write(COMMON_VREG_CONTROL, 0x59);
+        // ChromeOS Linux programs the fixed logical-to-physical lane map while
+        // the lanes are still powered down.
         self.phy_write(COMMON_LANE_CONFIG0, 0x21);
         self.phy_write(COMMON_LANE_CONFIG1, 0x84);
-        self.phy_write(COMMON_CONTROL0, 0x7f);
-        self.phy_write(COMMON_LANE_CONTROL0, 0x1f);
 
-        for lane in 0..5 {
-            self.configure_lane(lane);
-        }
         Ok(())
     }
 
-    fn configure_lane(&self, lane: usize) {
-        let base = LANE_BASE + lane * LANE_STRIDE;
-        let is_clock = lane == 4;
-        let low_power_receiver = if lane == 0 { 3 } else { 0 };
+    fn enable_lanes(&self) {
+        // Match dsi_10nm_phy_enable(): timings are committed before removing
+        // power-down from the common block and lanes.
+        self.phy_write(COMMON_CONTROL0, 0x7f);
+        self.phy_write(COMMON_LANE_CONTROL0, 0x1f);
+        self.phy_write(COMMON_CONTROL2, 0x40);
 
-        self.phy_write(base + LANE_LP_TX_STRENGTH, 0x55);
-        self.phy_write(base + LANE_LP_RX_CONTROL, 0);
-        self.phy_write(base + LANE_LP_RX_CONTROL, low_power_receiver);
-        self.phy_write(base + LANE_PIN_SWAP, 0);
-        self.phy_write(base + LANE_HS_TX_STRENGTH, 0x88);
-        self.phy_write(base + LANE_CONFIG0, 0);
-        self.phy_write(base + LANE_CONFIG1, 0);
-        self.phy_write(base + LANE_CONFIG2, 0);
-        self.phy_write(base + LANE_OFFSET_TOP, 0);
-        self.phy_write(base + LANE_OFFSET_BOTTOM, 0);
-        self.phy_write(base + LANE_CONFIG3, if is_clock { 0x80 } else { 0 });
-        self.phy_write(base + LANE_TX_CONTROL, u32::from(is_clock));
+        self.configure_lanes();
+
+        // SC7180 uses the new 10 nm timing sequence. Release the lane-3 I/O
+        // freeze only after its normal drive-control value has been written.
+        let lane3_tx = LANE_BASE + 3 * LANE_STRIDE + LANE_TX_CONTROL;
+        self.phy_write(lane3_tx, 0x05);
+        self.phy_write(lane3_tx, 0x04);
+    }
+
+    fn configure_lanes(&self) {
+        // Keep the two-pass ordering used by the Linux 10 nm PHY driver:
+        // establish electrical strength and disable every LP receiver first,
+        // then enable only logical data lane 0 and program lane functions.
+        for lane in 0..5 {
+            let base = LANE_BASE + lane * LANE_STRIDE;
+            self.phy_write(base + LANE_LP_TX_STRENGTH, 0x55);
+            self.phy_write(base + LANE_LP_RX_CONTROL, 0);
+            self.phy_write(base + LANE_PIN_SWAP, 0);
+            self.phy_write(base + LANE_HS_TX_STRENGTH, 0x88);
+        }
+        self.phy_write(LANE_BASE + LANE_LP_RX_CONTROL, 3);
+
+        for lane in 0..5 {
+            let base = LANE_BASE + lane * LANE_STRIDE;
+            let is_clock = lane == 4;
+            self.phy_write(base + LANE_CONFIG0, 0);
+            self.phy_write(base + LANE_CONFIG1, 0);
+            self.phy_write(base + LANE_CONFIG2, 0);
+            self.phy_write(base + LANE_CONFIG3, if is_clock { 0x80 } else { 0 });
+            self.phy_write(base + LANE_OFFSET_TOP, 0);
+            self.phy_write(base + LANE_OFFSET_BOTTOM, 0);
+            let tx_control = if lane == 3 { 0x04 } else { u32::from(is_clock) };
+            self.phy_write(base + LANE_TX_CONTROL, tx_control);
+        }
     }
 
     fn calculate_dividers(&self, config: &mut PhyConfiguration) -> Result<u64, &'static str> {
@@ -331,11 +352,6 @@ impl DsiPhy {
         self.initialize_pll_registers();
         self.program_pll_rate(&Self::calculate_pll_rate(vco_hz));
 
-        let lane3_tx = LANE_BASE + 3 * LANE_STRIDE + LANE_TX_CONTROL;
-        let value = self.phy_read(lane3_tx) & !1;
-        self.phy_write(lane3_tx, value | 1);
-        self.phy_write(lane3_tx, 4);
-
         self.phy_write(COMMON_PLL_CONTROL, 1);
         self.wait_for_bit(PLL_BASE + PLL_COMMON_STATUS_ONE, 1, PLL_LOCK_TIMEOUT_US)?;
         self.phy_write(
@@ -429,9 +445,7 @@ impl DsiPhy {
         u32::try_from(value).map_err(|_| "qcom-sc7180-mdss: invalid DSI PHY timing")
     }
 
-    fn program_timings(&self, timings: &PhyTimings, dsi_base: usize) -> Result<(), &'static str> {
-        self.phy_write(COMMON_GLOBAL_CONTROL, 0x02 << 3);
-        self.phy_write(COMMON_VREG_CONTROL, 0x59);
+    fn program_timings(&self, timings: &PhyTimings) -> Result<(), &'static str> {
         let values = [
             timings.half_byte_clock,
             timings.clock_zero,
@@ -452,15 +466,6 @@ impl DsiPhy {
                 Self::timing_value(value)?,
             );
         }
-        self.mdss.write(
-            dsi_base + 0xc4,
-            (Self::timing_value(timings.clock_post)? << 8) | Self::timing_value(timings.clock_pre)?,
-        );
-        self.mdss.write(
-            dsi_base + DSI_CLOCK_PRE_EXTEND,
-            Self::timing_value(timings.clock_pre_double)?,
-        );
-        self.phy_write(COMMON_CONTROL2, 0x40);
         Ok(())
     }
 
@@ -469,12 +474,11 @@ impl DsiPhy {
         timing: DisplayTiming,
         data_lanes: u32,
         bits_per_pixel: u32,
-        dsi_base: usize,
-    ) -> Result<(), &'static str> {
+    ) -> Result<DsiHostClockTimings, &'static str> {
         if data_lanes == 0 || data_lanes > 4 || !matches!(bits_per_pixel, 16 | 18 | 24) {
             return Err("qcom-sc7180-mdss: unsupported DSI PHY configuration");
         }
-        self.reset_and_enable_lanes()?;
+        self.prepare_common_block()?;
 
         let desired_bit_clock_hz = u64::from(timing.pixel_clock_khz)
             .checked_mul(1_000)
@@ -491,8 +495,15 @@ impl DsiPhy {
             pll_post_divider: 0,
         };
         let vco_hz = self.calculate_dividers(&mut config)?;
-        self.start_pll(&config, vco_hz)?;
         let timings = Self::calculate_timings(desired_bit_clock_hz)?;
-        self.program_timings(&timings, dsi_base)
+        self.program_timings(&timings)?;
+        self.enable_lanes();
+        self.start_pll(&config, vco_hz)?;
+
+        Ok(DsiHostClockTimings {
+            clock_pre: Self::timing_value(timings.clock_pre)?,
+            clock_post: Self::timing_value(timings.clock_post)?,
+            clock_pre_double: Self::timing_value(timings.clock_pre_double)?,
+        })
     }
 }
