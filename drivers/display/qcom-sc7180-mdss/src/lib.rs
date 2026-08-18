@@ -38,9 +38,7 @@ use scarlet::{
         Device, DeviceType,
         graphics::{FramebufferConfig, GraphicsDevice, PixelFormat, output::DisplayRegion},
         manager::{DeviceManager, DriverPriority, probe_defer},
-        platform::{
-            PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
-        },
+        platform::{PlatformDeviceDriver, PlatformDeviceInfo},
     },
     environment::PAGE_SIZE,
     mem::page::ContiguousPages,
@@ -444,7 +442,7 @@ fn allocate_scanout(config: &FramebufferConfig) -> Result<ContiguousPages, &'sta
     Ok(scanout)
 }
 
-fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+fn probe_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     if DeviceManager::get_manager()
         .get_device_by_name("qcom-sc7180-mdss")
         .is_some()
@@ -492,12 +490,15 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     };
     let scanout = allocate_scanout(&config)?;
 
-    let mdss_resource = device
-        .get_resources()
-        .iter()
-        .find(|resource| matches!(resource.res_type, PlatformDeviceResourceType::MEM))
-        .ok_or("qcom-sc7180-mdss: missing MDSS memory resource")?;
-    let mdss_vaddr = vm::ioremap(mdss_resource.start, MDSS_MAP_SIZE)
+    // Bind this board-level pipeline to the panel node. The MDSS parent node
+    // carries an SMMU stream contract used by Linux, while this early native
+    // scanout deliberately uses a physical DMA32 buffer and does not require
+    // an IOMMU domain. Resolve the SoC register block independently so
+    // Scarlet's generic pre-probe dependency resolver does not wait for an
+    // unrelated SMMU driver.
+    let (mdss_paddr, _) = compatible_register("qcom,sc7180-mdss", 0)
+        .ok_or("qcom-sc7180-mdss: MDSS resource not found")?;
+    let mdss_vaddr = vm::ioremap(mdss_paddr, MDSS_MAP_SIZE)
         .map_err(|_| "qcom-sc7180-mdss: MDSS ioremap failed")?;
     let (dispcc_paddr, dispcc_size) = compatible_register("qcom,sc7180-dispcc", 0)
         .ok_or("qcom-sc7180-mdss: DISP_CC resource not found")?;
@@ -564,7 +565,7 @@ fn register_driver() {
         "qcom-sc7180-mdss",
         probe_fn,
         remove_fn,
-        vec!["qcom,sc7180-mdss"],
+        vec!["boe,nv110wtm-n61"],
     );
     DeviceManager::get_manager().register_driver(Box::new(driver), DriverPriority::Late);
 }
