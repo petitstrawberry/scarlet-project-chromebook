@@ -1,0 +1,12 @@
+[package]
+name = "scarlet-driver-qcom-sc7180-mdss"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false }
+scarlet-driver-ti-sn65dsi86 = { path = "../bridge/ti-sn65dsi86" }
+scarlet-driver-cros-ec-spi = { path = "../../platform/chromeos/cros-ec-spi" }
