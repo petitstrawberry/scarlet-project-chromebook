@@ -29,6 +29,7 @@ use scarlet::{
     },
     early_println,
     sync::IrqSpinLock,
+    time,
 };
 
 const MAX_7BIT_ADDRESS: usize = 0x7f;
@@ -44,12 +45,102 @@ const HPD_DISABLE: u8 = 0x5c;
 const SSC_CONFIG: u8 = 0x93;
 const DATA_RATE: u8 = 0x94;
 const MAIN_LINK_MODE: u8 = 0x96;
+const AUX_WRITE_DATA: u8 = 0x64;
+const AUX_ADDRESS_HIGH: u8 = 0x74;
+const AUX_LENGTH: u8 = 0x77;
+const AUX_COMMAND: u8 = 0x78;
+const AUX_READ_DATA: u8 = 0x79;
+const AUX_STATUS: u8 = 0xf4;
 
 const DEVICE_ID: [u8; 8] = *b"68ISD   ";
 const DP_PLL_LOCKED: u8 = 1 << 7;
 const VIDEO_STREAM_ENABLED: u8 = 1 << 3;
 const HPD_IS_DISABLED: u8 = 1 << 0;
 const HPD_DEBOUNCED_STATE: u8 = 1 << 4;
+const AUX_SEND: u8 = 1 << 0;
+const AUX_REPLY_TIMEOUT: u8 = 1 << 3;
+const AUX_DEFERRED: u8 = 1 << 4;
+const AUX_SHORT_REPLY: u8 = 1 << 5;
+const AUX_NATIVE_I2C_FAILURE: u8 = 1 << 6;
+const AUX_CLEAR_STATUS: u8 =
+    AUX_SEND | AUX_REPLY_TIMEOUT | AUX_DEFERRED | AUX_SHORT_REPLY | AUX_NATIVE_I2C_FAILURE;
+
+const AUX_MAX_PAYLOAD: usize = 16;
+const AUX_ADDRESS_MASK: u32 = 0x000f_ffff;
+const AUX_TIMEOUT_US: u64 = 50_000;
+const AUX_POLL_INTERVAL_US: u64 = 10;
+
+const EDID_I2C_ADDRESS: u32 = 0x50;
+const EDID_BLOCK_SIZE: usize = 128;
+const EDID_MAX_BLOCKS: usize = 2;
+const EDID_EXTENSION_COUNT: usize = 0x7e;
+const EDID_HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+
+/// One DisplayPort AUX request supported by the bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DpAuxRequest {
+    /// I2C-over-AUX write followed by STOP.
+    I2cWrite = 0x0,
+    /// I2C-over-AUX read followed by STOP.
+    I2cRead = 0x1,
+    /// I2C-over-AUX write retaining the bus for a following request.
+    I2cWriteMot = 0x4,
+    /// I2C-over-AUX read retaining the bus for a following request.
+    I2cReadMot = 0x5,
+    /// Native DisplayPort AUX write.
+    NativeWrite = 0x8,
+    /// Native DisplayPort AUX read.
+    NativeRead = 0x9,
+}
+
+impl DpAuxRequest {
+    const fn is_write(self) -> bool {
+        matches!(self, Self::I2cWrite | Self::I2cWriteMot | Self::NativeWrite)
+    }
+}
+
+/// Error returned by an SN65DSI86 AUX transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sn65dsi86AuxError {
+    /// The bridge's register I2C transaction failed.
+    I2c(I2cError),
+    /// Request address or payload length is unsupported.
+    InvalidArgument,
+    /// The bridge did not complete the request before the deadline.
+    Timeout,
+    /// The downstream native or I2C target rejected the request.
+    Nack,
+    /// The downstream target deferred the request.
+    Deferred,
+    /// The bridge returned fewer bytes than requested.
+    ShortReply,
+}
+
+impl From<I2cError> for Sn65dsi86AuxError {
+    fn from(error: I2cError) -> Self {
+        Self::I2c(error)
+    }
+}
+
+/// Up to two validated 128-byte EDID blocks read through DisplayPort AUX.
+#[derive(Clone)]
+pub struct Sn65dsi86Edid {
+    bytes: [u8; EDID_BLOCK_SIZE * EDID_MAX_BLOCKS],
+    blocks: usize,
+}
+
+impl Sn65dsi86Edid {
+    /// Return the validated EDID bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.blocks * EDID_BLOCK_SIZE]
+    }
+
+    /// Return the number of complete EDID blocks.
+    pub const fn block_count(&self) -> usize {
+        self.blocks
+    }
+}
 
 /// Read-only snapshot of the bridge state inherited from firmware.
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +195,7 @@ pub struct Sn65dsi86 {
     address: I2cAddress,
     phandle: u32,
     bus_phandle: u32,
+    aux_lock: IrqSpinLock<()>,
 }
 
 impl Sn65dsi86 {
@@ -113,19 +205,32 @@ impl Sn65dsi86 {
             address,
             phandle,
             bus_phandle,
+            aux_lock: IrqSpinLock::new(()),
         }
     }
 
-    fn read_exact<const N: usize>(&self, register: u8) -> Result<[u8; N], I2cError> {
+    fn read_into(&self, register: u8, value: &mut [u8]) -> Result<(), I2cError> {
         let mut messages = vec![
             I2cMessage::write(self.address, &[register], false),
-            I2cMessage::read(self.address, N, true),
+            I2cMessage::read(self.address, value.len(), true),
         ];
         self.bus.transfer(&mut messages)?;
-
-        let mut value = [0; N];
         value.copy_from_slice(&messages[1].data);
+        Ok(())
+    }
+
+    fn read_exact<const N: usize>(&self, register: u8) -> Result<[u8; N], I2cError> {
+        let mut value = [0; N];
+        self.read_into(register, &mut value)?;
         Ok(value)
+    }
+
+    fn write_bytes(&self, register: u8, value: &[u8]) -> Result<(), I2cError> {
+        let mut frame = Vec::with_capacity(value.len() + 1);
+        frame.push(register);
+        frame.extend_from_slice(value);
+        self.bus
+            .transfer(&mut [I2cMessage::write(self.address, &frame, true)])
     }
 
     fn read_u8(&self, register: u8) -> Result<u8, I2cError> {
@@ -156,10 +261,162 @@ impl Sn65dsi86 {
         })
     }
 
+    fn aux_transfer_locked(
+        &self,
+        request: DpAuxRequest,
+        address: u32,
+        payload: &mut [u8],
+    ) -> Result<usize, Sn65dsi86AuxError> {
+        if payload.is_empty() || payload.len() > AUX_MAX_PAYLOAD || address > AUX_ADDRESS_MASK {
+            return Err(Sn65dsi86AuxError::InvalidArgument);
+        }
+
+        let command = (request as u8) << 4;
+        self.write_bytes(AUX_COMMAND, &[command])?;
+        self.write_bytes(
+            AUX_ADDRESS_HIGH,
+            &[
+                ((address >> 16) & 0x0f) as u8,
+                (address >> 8) as u8,
+                address as u8,
+                payload.len() as u8,
+            ],
+        )?;
+        if request.is_write() {
+            self.write_bytes(AUX_WRITE_DATA, payload)?;
+        }
+
+        self.write_bytes(AUX_STATUS, &[AUX_CLEAR_STATUS])?;
+        self.write_bytes(AUX_COMMAND, &[command | AUX_SEND])?;
+
+        let start = time::current_time();
+        loop {
+            if self.read_u8(AUX_COMMAND)? & AUX_SEND == 0 {
+                break;
+            }
+            if time::current_time().saturating_sub(start) >= AUX_TIMEOUT_US {
+                return Err(Sn65dsi86AuxError::Timeout);
+            }
+            time::udelay(AUX_POLL_INTERVAL_US);
+        }
+
+        let status = self.read_u8(AUX_STATUS)?;
+        if status & AUX_REPLY_TIMEOUT != 0 {
+            return Err(Sn65dsi86AuxError::Timeout);
+        }
+        if status & AUX_DEFERRED != 0 {
+            return Err(Sn65dsi86AuxError::Deferred);
+        }
+        if status & AUX_NATIVE_I2C_FAILURE != 0 {
+            return Err(Sn65dsi86AuxError::Nack);
+        }
+
+        let received = if status & AUX_SHORT_REPLY != 0 {
+            usize::from(self.read_u8(AUX_LENGTH)?)
+        } else {
+            payload.len()
+        };
+        if received > payload.len() {
+            return Err(Sn65dsi86AuxError::InvalidArgument);
+        }
+        if !request.is_write() {
+            self.read_into(AUX_READ_DATA, &mut payload[..received])?;
+        }
+        Ok(received)
+    }
+
+    /// Execute one bridge AUX transaction of at most 16 bytes.
+    pub fn aux_transfer(
+        &self,
+        request: DpAuxRequest,
+        address: u32,
+        payload: &mut [u8],
+    ) -> Result<usize, Sn65dsi86AuxError> {
+        let _guard = self.aux_lock.lock();
+        self.aux_transfer_locked(request, address, payload)
+    }
+
+    /// Read an arbitrary DPCD range using native AUX requests.
+    pub fn read_dpcd(&self, mut address: u32, output: &mut [u8]) -> Result<(), Sn65dsi86AuxError> {
+        let _guard = self.aux_lock.lock();
+        for chunk in output.chunks_mut(AUX_MAX_PAYLOAD) {
+            let received = self.aux_transfer_locked(DpAuxRequest::NativeRead, address, chunk)?;
+            if received != chunk.len() {
+                return Err(Sn65dsi86AuxError::ShortReply);
+            }
+            address = address
+                .checked_add(chunk.len() as u32)
+                .ok_or(Sn65dsi86AuxError::InvalidArgument)?;
+        }
+        Ok(())
+    }
+
+    fn read_edid_block(
+        &self,
+        block: usize,
+        output: &mut [u8; EDID_BLOCK_SIZE],
+    ) -> Result<(), Sn65dsi86AuxError> {
+        let mut offset = [(block * EDID_BLOCK_SIZE) as u8];
+        let sent =
+            self.aux_transfer_locked(DpAuxRequest::I2cWriteMot, EDID_I2C_ADDRESS, &mut offset)?;
+        if sent != offset.len() {
+            return Err(Sn65dsi86AuxError::ShortReply);
+        }
+
+        let chunk_count = EDID_BLOCK_SIZE / AUX_MAX_PAYLOAD;
+        for (index, chunk) in output.chunks_mut(AUX_MAX_PAYLOAD).enumerate() {
+            let request = if index + 1 == chunk_count {
+                DpAuxRequest::I2cRead
+            } else {
+                DpAuxRequest::I2cReadMot
+            };
+            let received = self.aux_transfer_locked(request, EDID_I2C_ADDRESS, chunk)?;
+            if received != chunk.len() {
+                return Err(Sn65dsi86AuxError::ShortReply);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read and checksum the base EDID and its first extension block.
+    pub fn read_edid(&self) -> Result<Sn65dsi86Edid, Sn65dsi86AuxError> {
+        let _guard = self.aux_lock.lock();
+        let mut edid = Sn65dsi86Edid {
+            bytes: [0; EDID_BLOCK_SIZE * EDID_MAX_BLOCKS],
+            blocks: 0,
+        };
+
+        let mut base = [0; EDID_BLOCK_SIZE];
+        self.read_edid_block(0, &mut base)?;
+        if base[..EDID_HEADER.len()] != EDID_HEADER || !edid_checksum_valid(&base) {
+            return Err(Sn65dsi86AuxError::InvalidArgument);
+        }
+        edid.bytes[..EDID_BLOCK_SIZE].copy_from_slice(&base);
+        edid.blocks = 1;
+
+        if base[EDID_EXTENSION_COUNT] != 0 {
+            let mut extension = [0; EDID_BLOCK_SIZE];
+            self.read_edid_block(1, &mut extension)?;
+            if !edid_checksum_valid(&extension) {
+                return Err(Sn65dsi86AuxError::InvalidArgument);
+            }
+            edid.bytes[EDID_BLOCK_SIZE..].copy_from_slice(&extension);
+            edid.blocks = 2;
+        }
+        Ok(edid)
+    }
+
     /// Return the bridge's Device Tree phandle.
     pub const fn phandle(&self) -> u32 {
         self.phandle
     }
+}
+
+fn edid_checksum_valid(block: &[u8; EDID_BLOCK_SIZE]) -> bool {
+    block
+        .iter()
+        .fold(0u8, |checksum, byte| checksum.wrapping_add(*byte))
+        == 0
 }
 
 static BRIDGES: IrqSpinLock<Vec<Arc<Sn65dsi86>>> = IrqSpinLock::new(Vec::new());
@@ -255,6 +512,17 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         snapshot.data_rate,
         snapshot.main_link_mode,
     );
+
+    let mut dpcd = [0; 3];
+    match bridge.read_dpcd(0, &mut dpcd) {
+        Ok(()) => early_println!(
+            "[ti-sn65dsi86] sink DPCD revision={:#x} max-rate={:#x} max-lanes={:#x}",
+            dpcd[0],
+            dpcd[1],
+            dpcd[2],
+        ),
+        Err(error) => early_println!("[ti-sn65dsi86] sink DPCD probe unavailable: {:?}", error),
+    }
 
     BRIDGES.lock().push(bridge);
     Ok(())
