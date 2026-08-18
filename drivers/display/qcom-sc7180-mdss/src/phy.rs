@@ -43,6 +43,11 @@ const PLL_SYSTEM_MUXES: usize = 0x24;
 const PLL_OUTPUT_DIVIDER_RATE: usize = 0x140;
 const PLL_COMMON_STATUS_ONE: usize = 0x1a0;
 
+// DSI6G v2.4 host register, including the four-byte HW-version prefix used by
+// SC7180. The 10 nm PHY timing calculation can require a doubled T_CLK_PRE
+// unit; the host must be told when that encoding is in use.
+const DSI_CLOCK_PRE_EXTEND: usize = 0x180;
+
 const REFERENCE_GENERATOR_TIMEOUT_US: u64 = 15_000;
 const PLL_LOCK_TIMEOUT_US: u64 = 15_000;
 const MINIMUM_VCO_HZ: u64 = 1_000_000_000;
@@ -450,6 +455,10 @@ impl DsiPhy {
         self.mdss.write(
             dsi_base + 0xc4,
             (Self::timing_value(timings.clock_post)? << 8) | Self::timing_value(timings.clock_pre)?,
+        );
+        self.mdss.write(
+            dsi_base + DSI_CLOCK_PRE_EXTEND,
+            Self::timing_value(timings.clock_pre_double)?,
         );
         self.phy_write(COMMON_CONTROL2, 0x40);
         Ok(())

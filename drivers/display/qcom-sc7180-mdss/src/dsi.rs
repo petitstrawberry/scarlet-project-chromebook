@@ -36,6 +36,7 @@ const TEST_PATTERN_CONTROL: usize = 0x15c;
 const TEST_PATTERN_VIDEO_INITIAL_VALUE: usize = 0x164;
 const TEST_PATTERN_MAIN_CONTROL: usize = 0x19c;
 const TEST_PATTERN_VIDEO_CONFIG: usize = 0x1a4;
+const CLOCK_PRE_EXTEND: usize = 0x180;
 const TPG_DMA_FIFO_RESET: usize = 0x1ec;
 
 const PHY_BASE: usize = 0x94400;
@@ -78,6 +79,7 @@ pub(crate) struct DsiDiagnosticSnapshot {
     pub(crate) video_mode_control: u32,
     pub(crate) clock_control: u32,
     pub(crate) clock_status: u32,
+    pub(crate) clock_pre_extend: u32,
     pub(crate) lane_status: u32,
     pub(crate) lane_control: u32,
     pub(crate) ack_error_status: u32,
@@ -179,6 +181,16 @@ impl DsiHost {
         );
     }
 
+    /// Clear FIFO faults accumulated while the host is enabled but the DPU
+    /// stream is not running. The register is write-one-to-clear; the live
+    /// FIFO empty/full state remains readable after this write.
+    pub(crate) fn clear_fifo_status(&self) {
+        let status = self.read(FIFO_STATUS);
+        if status != 0 {
+            self.write(FIFO_STATUS, status);
+        }
+    }
+
     /// Enable the DSI6G video-mode test-pattern generator used by Linux.
     ///
     /// This substitutes a generated checkerboard at the DSI host boundary,
@@ -204,6 +216,7 @@ impl DsiHost {
             video_mode_control: self.read(VIDEO_MODE_CONTROL),
             clock_control: self.read(CLOCK_CONTROL),
             clock_status: self.read(CLOCK_STATUS),
+            clock_pre_extend: self.read(CLOCK_PRE_EXTEND),
             lane_status: self.read(LANE_STATUS),
             lane_control: self.read(LANE_CONTROL),
             ack_error_status: self.read(ACK_ERROR_STATUS),
