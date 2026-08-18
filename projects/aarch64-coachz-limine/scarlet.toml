@@ -14,6 +14,9 @@ package = "scarlet"
 source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet" }
 features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = true }
 
+[modules]
+"scarlet-driver-qcom-geni-i2c" = { path = "../../drivers/i2c/qcom-geni", enabled = true }
+
 [images]
 
 [images.initramfs]

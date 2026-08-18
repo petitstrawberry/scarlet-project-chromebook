@@ -79,10 +79,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-geni-i2c"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-modules"
 version = "0.1.0"
 dependencies = [
  "scarlet",
+ "scarlet-driver-qcom-geni-i2c",
 ]
 
 [[package]]
