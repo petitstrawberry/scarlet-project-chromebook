@@ -19,6 +19,7 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-geni-i2c" = { path = "../../drivers/i2c/qcom-geni", enabled = true }
 "scarlet-driver-qcom-geni-spi" = { path = "../../drivers/spi/qcom-geni", enabled = true }
 "scarlet-driver-cros-ec-spi" = { path = "../../drivers/platform/chromeos/cros-ec-spi", enabled = true }
+"scarlet-driver-qcom-sc7180-gcc-display" = { path = "../../drivers/clk/qcom-sc7180-gcc-display", enabled = true }
 "scarlet-driver-qcom-sc7180-dispcc" = { path = "../../drivers/clk/qcom-sc7180-dispcc", enabled = true }
 "scarlet-driver-ti-sn65dsi86" = { path = "../../drivers/display/bridge/ti-sn65dsi86", enabled = true }
 "scarlet-driver-qcom-sc7180-mdss" = { path = "../../drivers/display/qcom-sc7180-mdss", enabled = true }
