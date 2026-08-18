@@ -1,8 +1,8 @@
-# Scarlet on Google CoachZ
+# Scarlet on Chromebook
 
 This repository contains the board integration, build environment, and host
 tools used to boot [Scarlet](https://github.com/petitstrawberry/Scarlet) on a
-Google CoachZ Chromebook.
+Chromebook.
 
 The tested target is **Google CoachZ rev3**, a Qualcomm SC7180 device in the
 ChromeOS Trogdor family. The project is experimental, but the complete boot
