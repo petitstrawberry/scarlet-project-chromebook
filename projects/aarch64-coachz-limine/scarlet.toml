@@ -15,8 +15,12 @@ source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", p
 features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = true }
 
 [modules]
+"scarlet-driver-qcom-sc7180-tlmm" = { path = "../../drivers/gpio/qcom-sc7180-tlmm", enabled = true }
 "scarlet-driver-qcom-geni-i2c" = { path = "../../drivers/i2c/qcom-geni", enabled = true }
+"scarlet-driver-qcom-geni-spi" = { path = "../../drivers/spi/qcom-geni", enabled = true }
+"scarlet-driver-cros-ec-spi" = { path = "../../drivers/platform/chromeos/cros-ec-spi", enabled = true }
 "scarlet-driver-ti-sn65dsi86" = { path = "../../drivers/display/bridge/ti-sn65dsi86", enabled = true }
+"scarlet-driver-qcom-sc7180-mdss" = { path = "../../drivers/display/qcom-sc7180-mdss", enabled = true }
 
 [images]
 
