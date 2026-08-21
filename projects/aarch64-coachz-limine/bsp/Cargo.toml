@@ -9,3 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 scarlet_modules = { package = "scarlet-modules", path = "../.scarlet/scarlet-modules" }
+
+# Development override for the ARM SMMU v2 translated-DMA work. Keep every
+# module on the same local Scarlet crate so IOMMU trait objects and xHCI DMA
+# contexts cannot be split across git/path copies of the kernel package.
+[patch."https://github.com/petitstrawberry/Scarlet"]
+scarlet = { path = "../../../../Scarlet/kernel" }

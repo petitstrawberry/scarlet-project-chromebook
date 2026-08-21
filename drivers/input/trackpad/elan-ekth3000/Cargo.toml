@@ -1,0 +1,11 @@
+[package]
+name = "scarlet-driver-elan-ekth3000"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false, features = ["network"] }

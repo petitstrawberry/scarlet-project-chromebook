@@ -179,23 +179,56 @@ From the Nix development shell:
 ./scripts/build-coachz-limine-image.sh
 ```
 
-The release image is written to:
+The release images are written under:
+
+```text
+projects/aarch64-coachz-limine/.scarlet/images/
+```
+
+The image to deploy to a USB drive is:
+
+```text
+projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
+```
+
+It is a GPT disk image for a single USB drive with:
+
+- partition 1, `SCARLET_BOOT`: an EFI System Partition containing:
+  - `EFI/BOOT/BOOTAA64.EFI`
+  - the Scarlet AArch64 kernel
+  - the Scarlet initramfs built from the `base` and `cli-utils` bundles
+  - the generated Limine configuration
+- partition 2, `SCARLET_ROOT`: an ext2 filesystem containing the `full` bundle
+
+The kernel command line selects the second partition as the root filesystem:
+
+```text
+root=/dev/usbblk0p2 rootfstype=ext2 rootwait
+```
+
+The project-local PID 1 honors bare `rootwait`: it waits indefinitely for the
+configured root device to become mountable, sleeping one second between
+attempts and rate-limiting diagnostics to once every 30 seconds. Once mounted,
+it continues through Scarlet's existing root transition. Without bare
+`rootwait`, Scarlet retains its single mount attempt and tmpfs fallback.
+
+The standalone ESP image remains available as an intermediate/debug artifact:
 
 ```text
 projects/aarch64-coachz-limine/.scarlet/images/esp-aarch64-coachz.img
 ```
 
-This is a directly bootable FAT32 EFI System Partition image containing:
-
-- `EFI/BOOT/BOOTAA64.EFI`
-- the Scarlet AArch64 kernel
-- the Scarlet initramfs
-- the generated Limine configuration
+It is not the image to write to the whole USB drive for normal deployment.
 
 The project post-image hook automatically replaces the stock Limine loader
-with the pinned CoachZ-compatible build and verifies the injected file. The
-same hook runs when invoking `cargo scarlet image` directly, but the wrapper
-above is the canonical build command.
+with the pinned CoachZ-compatible build, adds the CoachZ Scarlet OS handoff
+DTB to the EFI partition, and verifies the injected files. U-Boot continues to
+use its USB2-only CoachZ control DTB; the external OS DTB supplied to Scarlet
+enables USB3 after handoff. The same hook runs when invoking `cargo scarlet
+image` directly, but the wrapper above is the canonical build command.
+
+The combined GPT image, persistent root filesystem, and USB3 OS-DT handoff
+have not yet been validated on hardware.
 
 For a debug kernel instead of the default release build:
 
@@ -209,12 +242,12 @@ The following operation destroys the contents of the selected drive. Verify
 the device name before writing.
 
 Using a graphical image writer such as balenaEtcher, select
-`esp-aarch64-coachz.img` and write it to the entire USB drive.
+`scarlet-aarch64-coachz-full.img` and write it to the entire USB drive.
 
 On Linux, the equivalent command is:
 
 ```sh
-image=projects/aarch64-coachz-limine/.scarlet/images/esp-aarch64-coachz.img
+image=projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
 lsblk
 sudo dd if="$image" of=/dev/sdX bs=4M conv=fsync status=progress
 ```
@@ -222,7 +255,7 @@ sudo dd if="$image" of=/dev/sdX bs=4M conv=fsync status=progress
 On macOS:
 
 ```sh
-image=projects/aarch64-coachz-limine/.scarlet/images/esp-aarch64-coachz.img
+image=projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
 diskutil list
 diskutil unmountDisk /dev/diskN
 sudo dd if="$image" of=/dev/rdiskN bs=4m
@@ -241,7 +274,12 @@ partitions and never the host's system disk.
 4. Select the alternate bootloader and choose U-Boot.
 5. U-Boot clears the visible terminal, scans boot media, and starts Limine.
 
-A successful boot ends with output similar to:
+U-Boot uses the USB2-only control DTB during its USB boot scan. Limine then
+passes the external OS handoff DTB from the EFI partition to Scarlet, where
+the USB3 controller is enabled for the operating system. The combined GPT
+image and this persistent-rootfs handoff are awaiting hardware validation.
+
+When the boot path is working, output is expected to look similar to:
 
 ```text
 limine: Loading executable `boot():/boot/kernel`...

@@ -1,0 +1,11 @@
+[package]
+name = "scarlet-rootwait-init"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+
+[dependencies]
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-std", features = ["alloc_debug"] }

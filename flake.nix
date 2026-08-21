@@ -185,6 +185,7 @@
               pkgs.clang
               pkgs.lld
               pkgs.dtc
+              pkgs.e2fsprogs
               pkgs.pkgsCross.aarch64-multiplatform.buildPackages.gcc
               cargo-scarlet
               cargo-scarlet-plugin-limine

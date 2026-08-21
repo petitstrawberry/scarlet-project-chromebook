@@ -1,0 +1,629 @@
+#![no_std]
+#![no_main]
+
+extern crate scarlet_std as std;
+
+use core::time::Duration;
+use std::{
+    env, format,
+    fs::{
+        File, create_directory, list_directory, mount, pivot_root, remove_directory, remove_file,
+    },
+    handle::Handle,
+    println,
+    task::{EXECVE_FORCE_ABI_REBUILD, execve_with_flags, getpid},
+};
+
+// Global variables for standard I/O handles to hold references
+static mut STDIN: Option<Handle> = None;
+static mut STDOUT: Option<Handle> = None;
+static mut STDERR: Option<Handle> = None;
+
+const FALLBACK_ROOT_TMPFS_OPTIONS: &str = "size=512M";
+const VOLATILE_TMPFS_OPTIONS: &str = "size=128M";
+const DEFAULT_ROOT_FSTYPE: &str = "ext2";
+const DEFAULT_ROOT_DEVICES: [&str; 2] = ["/dev/vblk0", "/dev/usbblk0"];
+const ROOTWAIT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const ROOTWAIT_DIAGNOSTIC_INTERVAL: u64 = 30;
+
+fn cmdline_value<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
+    for token in cmdline.split_whitespace() {
+        if let Some(value) = token.strip_prefix(key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn try_mount_block_root(device: &str, fstype: &str) -> bool {
+    let options = format!("device={},rw", device);
+    mount(device, "/mnt/newroot", fstype, 0, Some(&options)).is_ok()
+}
+
+fn try_mount_rootwait_block_root(device: &str, fstype: &str) -> bool {
+    File::open(device).is_ok() && try_mount_block_root(device, fstype)
+}
+
+fn mount_block_root(device: &str, fstype: &str) -> bool {
+    println!(
+        "init: Mounting {} root from {} at /mnt/newroot",
+        fstype, device
+    );
+    if try_mount_block_root(device, fstype) {
+        println!("init: {} root filesystem mounted from {}", fstype, device);
+        true
+    } else {
+        println!("init: Failed to mount {} root from {}", fstype, device);
+        false
+    }
+}
+
+fn mount_configured_root(cmdline: &str) -> bool {
+    let fstype = cmdline_value(cmdline, "rootfstype=").unwrap_or(DEFAULT_ROOT_FSTYPE);
+
+    if let Some(root_device) = cmdline_value(cmdline, "root=") {
+        return mount_block_root(root_device, fstype);
+    }
+
+    for device in DEFAULT_ROOT_DEVICES {
+        if mount_block_root(device, fstype) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_bare_rootwait(cmdline: &str) -> bool {
+    cmdline.split_whitespace().any(|token| token == "rootwait")
+}
+
+fn wait_for_configured_root(cmdline: &str) -> bool {
+    let fstype = cmdline_value(cmdline, "rootfstype=").unwrap_or(DEFAULT_ROOT_FSTYPE);
+    let configured_device = cmdline_value(cmdline, "root=");
+    let description = configured_device.unwrap_or("configured block device");
+    println!(
+        "init: rootwait: waiting for {} ({}) before root transition",
+        description, fstype
+    );
+
+    let mut attempts = 0u64;
+    loop {
+        attempts += 1;
+        let mounted = match configured_device {
+            Some(device) => try_mount_rootwait_block_root(device, fstype),
+            None => DEFAULT_ROOT_DEVICES
+                .iter()
+                .any(|device| try_mount_rootwait_block_root(device, fstype)),
+        };
+        if mounted {
+            println!(
+                "init: rootwait: {} mounted after {} attempt(s)",
+                description, attempts
+            );
+            return true;
+        }
+        if attempts == 1 || attempts % ROOTWAIT_DIAGNOSTIC_INTERVAL == 0 {
+            println!(
+                "init: rootwait: {} is not ready; retrying every {} second(s)",
+                description,
+                ROOTWAIT_RETRY_DELAY.as_secs()
+            );
+        }
+        std::thread::sleep(ROOTWAIT_RETRY_DELAY);
+    }
+}
+
+fn setup_new_root(cmdline: &str) -> bool {
+    println!("init: Setting up new root filesystem...");
+
+    let mut using_tmpfs_fallback = false;
+
+    // 1. Bare rootwait waits persistently; otherwise preserve the existing
+    // single mount attempt and tmpfs fallback.
+    let root_mounted = if has_bare_rootwait(cmdline) {
+        wait_for_configured_root(cmdline)
+    } else {
+        mount_configured_root(cmdline)
+    };
+    if !root_mounted {
+        println!("init: Failed to mount block root at /mnt/newroot, trying fallback...");
+        println!("init: Falling back to tmpfs for new root");
+        match mount(
+            "tmpfs",
+            "/mnt/newroot",
+            "tmpfs",
+            0,
+            Some(FALLBACK_ROOT_TMPFS_OPTIONS),
+        ) {
+            Ok(_) => {
+                println!("init: Fallback tmpfs mounted successfully");
+                using_tmpfs_fallback = true;
+            }
+            Err(_) => {
+                println!("init: Failed to mount fallback tmpfs at /mnt/newroot");
+                return false;
+            }
+        }
+    }
+
+    // 2. Create necessary directories in the new root
+    println!("init: Creating necessary directories in new root");
+
+    if using_tmpfs_fallback && !populate_tmpfs_root_from_initramfs() {
+        println!("init: Failed to populate tmpfs root from initramfs");
+        return false;
+    }
+
+    // Create old_root directory in the new root (where the old root will be moved)
+    match create_directory("/mnt/newroot/old_root") {
+        Ok(_) => {
+            println!("init: Created old_root directory in new root");
+        }
+        Err(_) => {
+            println!("init: Warning: Could not create old_root directory (may already exist)");
+            // Continue anyway as it might already exist
+        }
+    }
+
+    // Create /tmp in the new root and mount tmpfs there for volatile storage
+    match create_directory("/mnt/newroot/tmp") {
+        Ok(_) => println!("init: Created /tmp in new root"),
+        Err(_) => println!("init: Warning: /tmp may already exist in new root"),
+    }
+
+    // Try mounting tmpfs on the new /tmp. Non-fatal if it fails.
+    match mount(
+        "tmpfs",
+        "/mnt/newroot/tmp",
+        "tmpfs",
+        0,
+        Some(VOLATILE_TMPFS_OPTIONS),
+    ) {
+        Ok(_) => println!("init: tmpfs mounted at /mnt/newroot/tmp"),
+        Err(_) => println!("init: Warning: Failed to mount tmpfs at /mnt/newroot/tmp"),
+    }
+
+    true
+}
+
+fn ensure_directory(path: &str) -> bool {
+    match create_directory(path) {
+        Ok(_) => true,
+        Err(_) => match list_directory(path) {
+            Ok(_) => true,
+            Err(_) => {
+                println!("init: Failed to create directory: {}", path);
+                false
+            }
+        },
+    }
+}
+
+fn populate_tmpfs_root_from_initramfs() -> bool {
+    println!("init: Populating tmpfs root from initramfs");
+
+    for path in [
+        "/mnt/newroot/system",
+        "/mnt/newroot/data",
+        "/mnt/newroot/data/config",
+    ] {
+        if !ensure_directory(path) {
+            return false;
+        }
+    }
+
+    let system_ok = copy_dir("/system/scarlet", "/mnt/newroot/system/scarlet");
+    let config_ok = copy_dir("/data/config/scarlet", "/mnt/newroot/data/config/scarlet");
+
+    if system_ok && config_ok {
+        println!("init: tmpfs root populated from initramfs");
+        true
+    } else {
+        false
+    }
+}
+
+fn setup_devfs() -> Result<(), &'static str> {
+    let _ = create_directory("/dev"); // Create /dev directory if it doesn't exist
+
+    // Mount devfs at /dev
+    if mount("devfs", "/dev", "devfs", 0, None).is_ok() {
+        match mount("devpts", "/dev/pts", "devpts", 0, None) {
+            Ok(_) => println!("init: devpts mounted at /dev/pts"),
+            Err(error) => println!("init: Warning: failed to mount devpts: {}", error),
+        }
+        Ok(())
+    } else {
+        Err("Failed to mount devfs")
+    }
+}
+
+fn check_block_devices() -> bool {
+    println!("init: Checking for available block devices...");
+
+    // List devices in /dev to see what's available
+    match list_directory("/dev") {
+        Ok(entries) => {
+            println!("init: Available devices in /dev:");
+            let mut block_device_found = false;
+            for entry in entries {
+                println!("init:   - {}", entry.name);
+                // Check for common block device names
+                if entry.name.starts_with("vblk")
+                    || entry.name.starts_with("usbblk")
+                    || entry.name.starts_with("vda")
+                    || entry.name.starts_with("sda")
+                    || entry.name.starts_with("hda")
+                {
+                    block_device_found = true;
+                    println!("init:     ^ Block device detected!");
+                }
+            }
+            block_device_found
+        }
+        Err(_) => {
+            println!("init: Failed to list /dev directory");
+            false
+        }
+    }
+}
+
+fn setup_stdio() {
+    // Set up standard input, output, and error
+    let tty_file = File::open("/dev/tty0").expect("Failed to open /dev/tty0");
+
+    // Handle 0 - convert File to Handle
+    let stdin_handle = tty_file.into_handle();
+    // Handle 1 - duplicate stdin for stdout
+    let stdout_handle = stdin_handle
+        .duplicate()
+        .expect("Failed to duplicate stdin handle");
+    // Handle 2 - duplicate stdin for stderr
+    let stderr_handle = stdin_handle
+        .duplicate()
+        .expect("Failed to duplicate stdin handle");
+
+    // Store the handles in global variables
+    unsafe {
+        STDIN = Some(stdin_handle);
+        STDOUT = Some(stdout_handle);
+        STDERR = Some(stderr_handle);
+    }
+
+    println!("init: Standard I/O setup complete");
+}
+
+fn perform_pivot_root() -> bool {
+    println!("init: Performing pivot_root operation...");
+
+    // Pivot root: move current root to /mnt/newroot/old_root, make /mnt/newroot the new root
+    match pivot_root("/mnt/newroot", "/mnt/newroot/old_root") {
+        Ok(_) => {
+            println!("init: pivot_root successful!");
+            println!("init: New root is now active, old root accessible at /old_root");
+
+            // Optional: Clean up the old root (in a real system, you might want to keep it for a while)
+            // umount("/old_root", 0);
+
+            true
+        }
+        Err(_) => {
+            println!("init: pivot_root failed");
+            false
+        }
+    }
+}
+
+// Copy a directory from src to dest recursively
+// Recursively copy src directory to dest, completely replacing dest (dest is deleted first)
+fn copy_dir(src: &str, dest: &str) -> bool {
+    println!("init: Copying directory from {} to {}", src, dest);
+
+    // If destination directory exists, remove all its contents first, then remove the directory itself
+    match list_directory(dest) {
+        Ok(entries) => {
+            println!(
+                "init: Destination directory {} exists, removing all contents first",
+                dest
+            );
+            // Remove all entries in the destination directory
+            for entry in entries {
+                // Skip . and .. entries
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+
+                let dest_entry_path = format!("{}/{}", dest, entry.name);
+                if entry.is_directory() {
+                    // Recursively remove subdirectory (this will handle nested contents)
+                    copy_dir("/dev/null", &dest_entry_path); // Use dummy source to trigger cleanup
+                    match remove_directory(&dest_entry_path) {
+                        Ok(_) => (),
+                        Err(_) => println!("init: Failed to remove directory: {}", dest_entry_path),
+                    }
+                } else {
+                    match remove_file(&dest_entry_path) {
+                        Ok(_) => (),
+                        Err(_) => println!("init: Failed to remove file: {}", dest_entry_path),
+                    }
+                }
+            }
+
+            // Now remove the destination directory itself
+            match remove_directory(dest) {
+                Ok(_) => (),
+                Err(_) => println!("init: Failed to remove destination directory: {}", dest),
+            }
+        }
+        Err(_) => {
+            // Directory doesn't exist, which is fine
+            println!("init: Destination directory {} does not exist", dest);
+        }
+    }
+
+    // Create destination directory
+    match create_directory(dest) {
+        Ok(_) => (),
+        Err(_) => {
+            println!("init: Failed to create directory: {}", dest);
+            return false;
+        }
+    }
+
+    // Use the new API to read directory entries
+    match list_directory(src) {
+        Ok(entries) => {
+            println!("init: Successfully read directory entries from {}", src);
+            for entry in entries {
+                let src_path = format!("{}/{}", src, entry.name);
+                let dest_path = format!("{}/{}", dest, entry.name);
+
+                // Skip . and .. entries
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+
+                if entry.is_directory() {
+                    // Recursively copy subdirectory
+                    copy_dir(&src_path, &dest_path);
+                } else if entry.is_file() {
+                    // Copy file
+                    copy_file(&src_path, &dest_path);
+                } else if entry.is_symlink() {
+                    // Copy symbolic link
+                    copy_symlink(&src_path, &dest_path);
+                } else {
+                    println!("init: Skipping special file: {}", src_path);
+                }
+            }
+            true
+        }
+        Err(_) => {
+            println!("init: Failed to read directory entries from {}", src);
+            false
+        }
+    }
+}
+
+// Recursively merge src directory into dest, overwriting/adding files from src but keeping existing dest contents
+fn merge_dir(src: &str, dest: &str) -> bool {
+    println!("init: Merging directory from {} to {}", src, dest);
+
+    // Create dest directory if it does not exist
+    match create_directory(dest) {
+        Ok(_) => (),
+        Err(_) => {
+            println!("init: Failed to create directory: {}", dest);
+            return false;
+        }
+    }
+
+    // Iterate over entries in src
+    match list_directory(src) {
+        Ok(entries) => {
+            println!("init: Successfully read directory entries from {}", src);
+            for entry in entries {
+                let src_path = format!("{}/{}", src, entry.name);
+                let dest_path = format!("{}/{}", dest, entry.name);
+
+                // Skip . and .. entries
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+
+                if entry.is_directory() {
+                    // Recursively merge subdirectory
+                    merge_dir(&src_path, &dest_path);
+                } else if entry.is_file() {
+                    // Overwrite file in dest
+                    copy_file(&src_path, &dest_path);
+                } else if entry.is_symlink() {
+                    // Overwrite symlink in dest
+                    copy_symlink(&src_path, &dest_path);
+                } else {
+                    println!("init: Skipping special file: {}", src_path);
+                }
+            }
+            true
+        }
+        Err(_) => {
+            println!("init: Failed to read directory entries from {}", src);
+            false
+        }
+    }
+}
+
+fn copy_file(src: &str, dest: &str) -> bool {
+    // Read source file
+    match File::open(src) {
+        Ok(mut src_file) => {
+            // Remove existing destination file if it exists (for overwrite support)
+            let _ = remove_file(dest); // Ignore errors if file doesn't exist
+
+            // Create destination file
+            match File::create(dest) {
+                Ok(mut dest_file) => {
+                    println!("init: Copying file from {} to {}", src, dest);
+                    let mut buffer = [0u8; 4096]; // Buffer size of 4KB
+                    let mut total_bytes_copied = 0;
+
+                    loop {
+                        match src_file.read(&mut buffer) {
+                            Ok(0) => break, // EOF
+                            Ok(bytes_read) => {
+                                // Write to destination file
+                                match dest_file.write(&buffer[..bytes_read]) {
+                                    Ok(bytes_written) if bytes_written == bytes_read => {
+                                        total_bytes_copied += bytes_written;
+                                        // Success, continue
+                                    }
+                                    Ok(bytes_written) => {
+                                        println!(
+                                            "init: Partial write! Expected {}, wrote {} bytes to {}",
+                                            bytes_read, bytes_written, dest
+                                        );
+                                        return false;
+                                    }
+                                    Err(_) => {
+                                        println!(
+                                            "init: Failed to write to destination file: {}",
+                                            dest
+                                        );
+                                        return false;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                println!("init: Failed to read from source file: {}", src);
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                }
+                Err(e) => {
+                    println!("init: Failed to create destination file: {}: {}", dest, e);
+                    false
+                }
+            }
+        }
+        Err(_) => {
+            println!("init: Failed to open source file: {}", src);
+            false
+        }
+    }
+}
+
+fn copy_symlink(src: &str, dest: &str) -> bool {
+    use std::fs::{create_symlink, read_link};
+
+    println!("init: Copying symlink from {} to {}", src, dest);
+
+    // Read the target of the source symlink
+    match read_link(src) {
+        Ok(target) => {
+            // Create a new symlink at the destination pointing to the same target
+            match create_symlink(dest, &target) {
+                Ok(_) => {
+                    println!(
+                        "init: Successfully copied symlink {} -> {} (target: {})",
+                        src, dest, target
+                    );
+                    true
+                }
+                Err(e) => {
+                    println!("init: Failed to create symlink {}: {}", dest, e);
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            println!("init: Failed to read symlink target {}: {}", src, e);
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+fn main() -> i32 {
+    let args = env::args_vec();
+    let cmdline = args.get(1).map(|arg| arg.as_str()).unwrap_or("");
+
+    // Initialize the device filesystem
+    if setup_devfs().is_err() {
+        return -1;
+    }
+
+    // Set up standard input, output, and error
+    setup_stdio();
+
+    println!("init: I'm the init process: PID={}", getpid());
+    if !cmdline.is_empty() {
+        println!("init: boot cmdline: {}", cmdline);
+    }
+
+    // Bare rootwait deliberately covers late xHCI enumeration; it polls below
+    // instead of deciding now that the initramfs fallback is required.
+    if has_bare_rootwait(cmdline) {
+        println!("init: rootwait is set; waiting for the configured root device");
+    } else if check_block_devices() {
+        println!("init: Block devices found, proceeding with ext2 mount");
+    } else {
+        println!("init: No block devices found, will fallback to tmpfs");
+    }
+
+    println!("init: Starting root filesystem transition...");
+
+    // Demonstrate pivot_root functionality with ext2 support
+    if setup_new_root(cmdline) {
+        if perform_pivot_root() {
+            println!("init: Root filesystem transition completed successfully");
+
+            // Mount devfs at /dev to make devices accessible
+            println!("init: Setting up device filesystem...");
+            match setup_devfs() {
+                Ok(_) => println!("init: Device filesystem mounted at /dev"),
+                Err(e) => {
+                    println!("init: Failed to setup device filesystem: {}", e);
+                    // Continue anyway, but devices might not be accessible
+                }
+            }
+
+            // Verify the new root by trying to access files
+            println!("init: Current working directory after pivot_root");
+        } else {
+            println!("init: Failed to pivot root, continuing with current root");
+        }
+    } else {
+        println!("init: Failed to setup new root, continuing with current root");
+    }
+
+    // std::profiler::dump_profiler_stats();
+
+    println!("init: Transforming into stem daemon (stemd)...");
+
+    let stemd_paths = [
+        "/system/scarlet/bin/stemd",
+        "/scarlet/system/scarlet/bin/stemd",
+        "/old_root/system/scarlet/bin/stemd",
+    ];
+
+    for stemd_path in &stemd_paths {
+        println!("init: Trying to execute stemd at: {}", stemd_path);
+
+        match File::open(stemd_path) {
+            Ok(_) => println!("init: stemd binary exists at {}", stemd_path),
+            Err(_) => {
+                println!("init: stemd binary not found at {}", stemd_path);
+                continue;
+            }
+        }
+
+        let _ = execve_with_flags(stemd_path, &[stemd_path], &[], EXECVE_FORCE_ABI_REBUILD);
+        println!("init: Failed to execve {}", stemd_path);
+    }
+
+    println!("init: All stemd paths failed, halting system");
+    loop {}
+}

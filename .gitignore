@@ -34,3 +34,5 @@ __pycache__/
 !flake.lock
 !scarlet.lock
 !**/Cargo.lock
+
+.omo

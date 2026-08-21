@@ -68,7 +68,6 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c576e77989a99689adfc13f000b37dd99f25dae1"
 dependencies = [
  "fdt",
  "font8x8",
@@ -86,6 +85,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-goodix-gt7375p"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-dwc3"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-qcom-sc7180-gcc-display",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-geni-i2c"
 version = "0.1.0"
 dependencies = [
@@ -94,6 +108,30 @@ dependencies = [
 
 [[package]]
 name = "scarlet-driver-qcom-geni-spi"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-pm8941-rtc"
+version = "0.1.0"
+dependencies = [
+ "fdt",
+ "scarlet",
+ "scarlet-driver-cros-ec-spi",
+ "scarlet-driver-qcom-spmi-pmic-arb",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-qmp-usb3-dp"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-qusb2-v2"
 version = "0.1.0"
 dependencies = [
  "scarlet",
@@ -124,7 +162,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-sc7180-qfprom"
+version = "0.1.0"
+dependencies = [
+ "fdt",
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-sc7180-tlmm"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-spmi-pmic-arb"
 version = "0.1.0"
 dependencies = [
  "scarlet",
@@ -143,12 +196,19 @@ version = "0.1.0"
 dependencies = [
  "scarlet",
  "scarlet-driver-cros-ec-spi",
+ "scarlet-driver-goodix-gt7375p",
+ "scarlet-driver-qcom-dwc3",
  "scarlet-driver-qcom-geni-i2c",
  "scarlet-driver-qcom-geni-spi",
+ "scarlet-driver-qcom-pm8941-rtc",
+ "scarlet-driver-qcom-qmp-usb3-dp",
+ "scarlet-driver-qcom-qusb2-v2",
  "scarlet-driver-qcom-sc7180-dispcc",
  "scarlet-driver-qcom-sc7180-gcc-display",
  "scarlet-driver-qcom-sc7180-mdss",
+ "scarlet-driver-qcom-sc7180-qfprom",
  "scarlet-driver-qcom-sc7180-tlmm",
+ "scarlet-driver-qcom-spmi-pmic-arb",
  "scarlet-driver-ti-sn65dsi86",
 ]
 

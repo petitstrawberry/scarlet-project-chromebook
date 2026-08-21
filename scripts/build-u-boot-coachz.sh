@@ -76,6 +76,17 @@ artifact="$output_dir/u-boot.elf"
 	exit 1
 }
 
+# The built DTB is U-Boot's control plane and intentionally stays USB2/HS.
+# Build a separate OS handoff DTB for Scarlet rather than weakening that
+# limitation in U-Boot itself.
+control_dtb="$output_dir/dts/upstream/src/arm64/qcom/sc7180-trogdor-coachz-r3.dtb"
+handoff_builder="$project_root/projects/aarch64-coachz-limine/tools/build-os-handoff-dtb.sh"
+[ -x "$handoff_builder" ] || {
+	echo "error: CoachZ OS handoff DTB builder is not executable: $handoff_builder" >&2
+	exit 1
+}
+"$handoff_builder" --source "$control_dtb" --output "$output_dir/scarlet-os-handoff.dtb"
+
 printf 'U-Boot CoachZ payload: %s\n' "$artifact"
 if command -v sha256sum >/dev/null 2>&1; then
 	sha256sum "$artifact"

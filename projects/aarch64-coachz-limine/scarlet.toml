@@ -19,8 +19,15 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-geni-i2c" = { path = "../../drivers/i2c/qcom-geni", enabled = true }
 "scarlet-driver-qcom-geni-spi" = { path = "../../drivers/spi/qcom-geni", enabled = true }
 "scarlet-driver-cros-ec-spi" = { path = "../../drivers/platform/chromeos/cros-ec-spi", enabled = true }
+"scarlet-driver-qcom-spmi-pmic-arb" = { path = "../../drivers/spmi/qcom-spmi-pmic-arb", enabled = true }
+"scarlet-driver-qcom-pm8941-rtc" = { path = "../../drivers/rtc/qcom-pm8941-rtc", enabled = true }
 "scarlet-driver-qcom-sc7180-gcc-display" = { path = "../../drivers/clk/qcom-sc7180-gcc-display", enabled = true }
 "scarlet-driver-qcom-sc7180-dispcc" = { path = "../../drivers/clk/qcom-sc7180-dispcc", enabled = true }
+"scarlet-driver-qcom-sc7180-qfprom" = { path = "../../drivers/nvmem/qcom-sc7180-qfprom", enabled = true }
+"scarlet-driver-qcom-qusb2-v2" = { path = "../../drivers/phy/qcom-qusb2-v2", enabled = true }
+"scarlet-driver-qcom-qmp-usb3-dp" = { path = "../../drivers/phy/qcom-qmp-usb3-dp", enabled = true }
+"scarlet-driver-qcom-dwc3" = { path = "../../drivers/usb/dwc3/qcom-dwc3", enabled = true }
+"scarlet-driver-goodix-gt7375p" = { path = "../../drivers/input/touchscreen/goodix-gt7375p", enabled = true }
 "scarlet-driver-ti-sn65dsi86" = { path = "../../drivers/display/bridge/ti-sn65dsi86", enabled = true }
 "scarlet-driver-qcom-sc7180-mdss" = { path = "../../drivers/display/qcom-sc7180-mdss", enabled = true }
 
@@ -42,13 +49,48 @@ source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev" }
 subdir = "bundles/cli-utils"
 bundle = "bundle.toml"
 
+# The project-local PID 1 patches the resolved Scarlet init with rootwait
+# semantics while retaining its root transition and non-rootwait fallback.
+[[images.initramfs.layers]]
+kind = "cargo"
+source = { path = "rootwait-init" }
+package = "scarlet-rootwait-init"
+bin = "init"
+replace = true
+to = "/system/scarlet/bin/init"
+
+[images.rootfs]
+format = "ext2"
+output = ".scarlet/images/rootfs-aarch64-coachz-full.ext2"
+
+[[images.rootfs.layers]]
+kind = "bundle"
+source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev" }
+subdir = "bundles/full"
+bundle = "bundle.toml"
+
 [images.boot]
 format = "limine-uefi"
 output = ".scarlet/images/esp-aarch64-coachz.img"
-cmdline = "rootwait"
+cmdline = "root=/dev/usbblk0p2 rootfstype=ext2 rootwait"
 deps = ["initramfs"]
 
 [[images.boot.layers]]
 kind = "image"
 source = "initramfs"
 to = "/boot/initramfs"
+
+[images.disk]
+format = "gpt"
+output = ".scarlet/images/scarlet-aarch64-coachz-full.img"
+deps = ["boot", "rootfs"]
+
+[[images.disk.partitions]]
+source = "boot"
+name = "SCARLET_BOOT"
+type = "efi-system"
+
+[[images.disk.partitions]]
+source = "rootfs"
+name = "SCARLET_ROOT"
+type = "linux-filesystem"
