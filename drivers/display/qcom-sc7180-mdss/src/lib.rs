@@ -31,7 +31,11 @@ mod phy;
 mod registers;
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::{any::Any, ptr};
+use core::{
+    any::Any,
+    ptr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use dpu::Dpu;
 use dsi::DsiHost;
@@ -55,7 +59,7 @@ use scarlet::{
         selectable::{ReadyInterest, SelectWaitOutcome, Selectable},
     },
     println,
-    sync::IrqSpinLock,
+    sync::Mutex,
     time,
     vm::{self, vmem::MemoryAttribute},
 };
@@ -69,6 +73,8 @@ const MDSS_MAP_SIZE: usize = 0x0c_0000;
 const DSI_LANES: u8 = 4;
 const DSI_BITS_PER_PIXEL: u8 = 24;
 const MAXIMUM_SCANOUT_ADDRESS: usize = u32::MAX as usize;
+const SCANOUT_BUFFER_COUNT: usize = 2;
+const PRESENT_TIMEOUT_US: u64 = 50_000;
 
 #[derive(Clone, Copy)]
 struct GpioSpecifier {
@@ -79,14 +85,12 @@ struct GpioSpecifier {
 
 struct Sc7180DisplayEngine {
     dpu: Dpu,
-    present_lock: IrqSpinLock<()>,
 }
 
 impl Sc7180DisplayEngine {
     fn new(mdss: RegisterWindow) -> Self {
         Self {
             dpu: Dpu::new(mdss),
-            present_lock: IrqSpinLock::new(()),
         }
     }
 
@@ -335,28 +339,45 @@ impl Sc7180DisplayEngine {
     }
 
     fn present(&self, scanout_dma_addr: usize) -> Result<(), &'static str> {
-        let _guard = self.present_lock.lock();
-        self.dpu.present(scanout_dma_addr)
+        self.dpu.present(scanout_dma_addr)?;
+
+        // SC7180 video-mode commits clear CTL_FLUSH at the vblank where the
+        // new source address becomes active. Do not release the previous
+        // front buffer back to the compositor before that boundary.
+        let start = time::current_time();
+        while self.dpu.pending_flush() != 0 {
+            if time::current_time().saturating_sub(start) >= PRESENT_TIMEOUT_US {
+                return Err("qcom-sc7180-mdss: timeout waiting for page flip");
+            }
+            core::hint::spin_loop();
+        }
+        Ok(())
     }
 }
 
 pub struct Sc7180GraphicsDevice {
     config: FramebufferConfig,
     timing: DisplayTiming,
-    scanout: ContiguousPages,
-    scanout_dma: DmaMapping,
+    scanout: [ContiguousPages; SCANOUT_BUFFER_COUNT],
+    scanout_dma: [DmaMapping; SCANOUT_BUFFER_COUNT],
+    front: AtomicUsize,
+    present_lock: Mutex<()>,
     engine: Sc7180DisplayEngine,
 }
 
 impl Sc7180GraphicsDevice {
-    fn clean_regions(&self, regions: &[DisplayRegion]) -> Result<(), &'static str> {
-        if self.scanout.memory_attribute() != MemoryAttribute::Normal {
+    fn clean_regions(
+        &self,
+        scanout: &ContiguousPages,
+        regions: &[DisplayRegion],
+    ) -> Result<(), &'static str> {
+        if scanout.memory_attribute() != MemoryAttribute::Normal {
             arch::io_wmb();
             return Ok(());
         }
 
         if regions.is_empty() {
-            arch::clean_dcache_to_poc_range(self.scanout.as_vaddr(), self.config.size());
+            arch::clean_dcache_to_poc_range(scanout.as_vaddr(), self.config.size());
             return Ok(());
         }
 
@@ -383,18 +404,13 @@ impl Sc7180GraphicsDevice {
             if end > self.config.size() {
                 return Err("qcom-sc7180-mdss: damage range exceeds scanout");
             }
-            arch::clean_dcache_to_poc_range(self.scanout.as_vaddr() + start, end - start);
+            arch::clean_dcache_to_poc_range(scanout.as_vaddr() + start, end - start);
         }
         Ok(())
     }
 
-    fn validate_scanout(
-        &self,
-        config: &FramebufferConfig,
-        physical_addr: usize,
-    ) -> Result<(), &'static str> {
-        if physical_addr != self.scanout.as_paddr()
-            || config.width != self.config.width
+    fn validate_config(&self, config: &FramebufferConfig) -> Result<(), &'static str> {
+        if config.width != self.config.width
             || config.height != self.config.height
             || config.stride != self.config.stride
             || config.format != self.config.format
@@ -437,7 +453,8 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
     }
 
     fn get_framebuffer_address(&self) -> Result<usize, &'static str> {
-        Ok(self.scanout.as_paddr())
+        let back = self.front.load(Ordering::Acquire) ^ 1;
+        Ok(self.scanout[back].as_paddr())
     }
 
     fn present_framebuffer_region(
@@ -446,27 +463,36 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         physical_addr: usize,
         region: DisplayRegion,
     ) -> Result<(), &'static str> {
-        self.validate_scanout(config, physical_addr)?;
-        self.clean_regions(&[region])?;
-        self.engine.present(self.scanout_dma.dma_addr() as usize)
+        self.validate_config(config)?;
+        let _present = self.present_lock.lock();
+        let back = self.front.load(Ordering::Acquire) ^ 1;
+        if physical_addr != self.scanout[back].as_paddr() {
+            return Err("qcom-sc7180-mdss: framebuffer does not match back scanout");
+        }
+        self.clean_regions(&self.scanout[back], &[region])?;
+        self.engine
+            .present(self.scanout_dma[back].dma_addr() as usize)?;
+        self.front.store(back, Ordering::Release);
+        Ok(())
     }
 
     fn scanout_buffer_count(&self) -> usize {
-        1
+        self.scanout.len()
     }
 
     fn front_scanout_buffer(&self) -> Option<usize> {
-        Some(0)
+        Some(self.front.load(Ordering::Acquire))
     }
 
     fn get_scanout_buffer_info(
         &self,
         index: usize,
     ) -> Result<(FramebufferConfig, usize), &'static str> {
-        if index != 0 {
-            return Err("qcom-sc7180-mdss: invalid scanout index");
-        }
-        Ok((self.config.clone(), self.scanout.as_paddr()))
+        let scanout = self
+            .scanout
+            .get(index)
+            .ok_or("qcom-sc7180-mdss: invalid scanout index")?;
+        Ok((self.config.clone(), scanout.as_paddr()))
     }
 
     fn present_scanout_buffer(&self, index: usize) -> Result<(), &'static str> {
@@ -478,11 +504,23 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         index: usize,
         regions: &[DisplayRegion],
     ) -> Result<(), &'static str> {
-        if index != 0 {
-            return Err("qcom-sc7180-mdss: invalid scanout index");
+        let scanout = self
+            .scanout
+            .get(index)
+            .ok_or("qcom-sc7180-mdss: invalid scanout index")?;
+        let scanout_dma = self
+            .scanout_dma
+            .get(index)
+            .ok_or("qcom-sc7180-mdss: invalid scanout DMA index")?;
+        let _present = self.present_lock.lock();
+        if index == self.front.load(Ordering::Acquire) {
+            return Err("qcom-sc7180-mdss: scanout buffer is already front-most");
         }
-        self.clean_regions(regions)?;
-        self.engine.present(self.scanout_dma.dma_addr() as usize)
+
+        self.clean_regions(scanout, regions)?;
+        self.engine.present(scanout_dma.dma_addr() as usize)?;
+        self.front.store(index, Ordering::Release);
+        Ok(())
     }
 
     fn init_graphics(&self) -> Result<(), &'static str> {
@@ -658,6 +696,22 @@ fn allocate_scanout(config: &FramebufferConfig) -> Result<ContiguousPages, &'sta
     Ok(scanout)
 }
 
+fn map_scanout(
+    dma_context: &scarlet::device::iommu::DmaContext,
+    scanout: &ContiguousPages,
+) -> Result<DmaMapping, &'static str> {
+    dma_context
+        .map_phys_owned(
+            scanout.as_paddr(),
+            scanout
+                .len()
+                .checked_mul(PAGE_SIZE)
+                .ok_or("qcom-sc7180-mdss: scanout DMA length overflow")?,
+            IommuMapFlags::READ | IommuMapFlags::COHERENT,
+        )
+        .map_err(|_| "qcom-sc7180-mdss: failed to map scanout for DPU DMA")
+}
+
 fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     if DeviceManager::get_manager()
         .get_device_by_name("qcom-sc7180-mdss")
@@ -719,7 +773,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         format: PixelFormat::BGRA8888,
         stride: u32::from(timing.hactive) * 4,
     };
-    let scanout = allocate_scanout(&config)?;
+    let scanout = [allocate_scanout(&config)?, allocate_scanout(&config)?];
 
     let dma_context = DeviceManager::get_manager().resolve_platform_dma_context(
         device,
@@ -729,17 +783,11 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             iova_size: 0,
         },
     )?;
-    let scanout_dma = dma_context
-        .map_phys_owned(
-            scanout.as_paddr(),
-            scanout
-                .len()
-                .checked_mul(PAGE_SIZE)
-                .ok_or("qcom-sc7180-mdss: scanout DMA length overflow")?,
-            IommuMapFlags::READ | IommuMapFlags::COHERENT,
-        )
-        .map_err(|_| "qcom-sc7180-mdss: failed to map scanout for DPU DMA")?;
-    let scanout_dma_addr = usize::try_from(scanout_dma.dma_addr())
+    let scanout_dma = [
+        map_scanout(&dma_context, &scanout[0])?,
+        map_scanout(&dma_context, &scanout[1])?,
+    ];
+    let scanout_dma_addr = usize::try_from(scanout_dma[0].dma_addr())
         .map_err(|_| "qcom-sc7180-mdss: DPU DMA address exceeds usize")?;
 
     let mdss_resource = device
@@ -753,8 +801,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let engine = Sc7180DisplayEngine::new(mdss);
 
     println!("[qcom-sc7180-mdss] phase 3/5: programming DSI PHY, bridge link, and DPU");
-    if scanout.memory_attribute() == MemoryAttribute::Normal {
-        arch::clean_dcache_to_poc_range(scanout.as_vaddr(), config.size());
+    if scanout[0].memory_attribute() == MemoryAttribute::Normal {
+        arch::clean_dcache_to_poc_range(scanout[0].as_vaddr(), config.size());
     } else {
         arch::io_wmb();
     }
@@ -790,6 +838,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         timing,
         scanout,
         scanout_dma,
+        front: AtomicUsize::new(0),
+        present_lock: Mutex::new(()),
         engine,
     });
     let device_id = DeviceManager::get_manager()
@@ -805,12 +855,14 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         scarlet::earlyfb::deactivate();
     }
     println!(
-        "[qcom-sc7180-mdss] native panel {}x{} pixel-clock={} kHz scanout-paddr={:#x} scanout-dma={:#x} bytes={} refresh={} mHz",
+        "[qcom-sc7180-mdss] native panel {}x{} pixel-clock={} kHz scanout-paddr=[{:#x}, {:#x}] scanout-dma=[{:#x}, {:#x}] bytes={} refresh={} mHz",
         graphics.timing.hactive,
         graphics.timing.vactive,
         graphics.timing.pixel_clock_khz,
-        graphics.scanout.as_paddr(),
-        graphics.scanout_dma.dma_addr(),
+        graphics.scanout[0].as_paddr(),
+        graphics.scanout[1].as_paddr(),
+        graphics.scanout_dma[0].dma_addr(),
+        graphics.scanout_dma[1].dma_addr(),
         graphics.config.size(),
         u64::from(graphics.timing.pixel_clock_khz) * 1_000_000
             / u64::from(graphics.timing.horizontal_total())

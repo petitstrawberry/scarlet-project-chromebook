@@ -360,4 +360,9 @@ impl Dpu {
         self.flush();
         Ok(())
     }
+
+    pub(crate) fn pending_flush(&self) -> u32 {
+        arch::io_rmb();
+        self.read(CONTROL_BASE, CONTROL_FLUSH)
+    }
 }
