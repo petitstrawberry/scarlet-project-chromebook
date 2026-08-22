@@ -69,6 +69,13 @@ const ETP_MAX_FINGERS: usize = 5;
 const POINTER_SCALE: i32 = 12;
 const RESET_DELAY_US: u64 = 100_000;
 
+#[derive(Default)]
+struct PointerState {
+    last_contact: Option<(u16, u16)>,
+    remainder_x: i32,
+    remainder_y: i32,
+}
+
 struct ElanEkth3000 {
     bus: Arc<dyn I2cBus>,
     address: I2cAddress,
@@ -76,8 +83,9 @@ struct ElanEkth3000 {
     irq_pin: u32,
     event_device: Arc<EventDevice>,
     report_len: usize,
+    max_x: u16,
     max_y: u16,
-    last_contact: IrqSpinLock<Option<(u16, u16)>>,
+    pointer_state: IrqSpinLock<PointerState>,
     button_pressed: IrqSpinLock<bool>,
     work_pending: AtomicBool,
 }
@@ -160,6 +168,9 @@ impl ElanEkth3000 {
                 (u16::from(finger[0] & 0x0f) << 8) | u16::from(finger[2]),
             )
         };
+        if x > self.max_x || raw_y > self.max_y {
+            return None;
+        }
         Some((x, self.max_y.saturating_sub(raw_y)))
     }
 
@@ -174,28 +185,46 @@ impl ElanEkth3000 {
 
         let touch_info = report[ETP_TOUCH_INFO_OFFSET];
         let pressed = touch_info & 1 != 0;
-        let mut previous_button = self.button_pressed.lock();
-        if *previous_button != pressed {
+        let button_changed = {
+            let mut previous_button = self.button_pressed.lock();
+            if *previous_button == pressed {
+                false
+            } else {
+                *previous_button = pressed;
+                true
+            }
+        };
+        if button_changed {
             self.event_device
                 .push_event(EV_KEY, BTN_LEFT, i32::from(pressed));
-            *previous_button = pressed;
         }
-        drop(previous_button);
 
         let contact = self.contact_from_report(report);
-        let mut previous_contact = self.last_contact.lock();
-        if let (Some((x, y)), Some((last_x, last_y))) = (contact, *previous_contact) {
-            let dx = (i32::from(x) - i32::from(last_x)) / POINTER_SCALE;
-            let dy = (i32::from(y) - i32::from(last_y)) / POINTER_SCALE;
-            if dx != 0 {
-                self.event_device.push_event(EV_REL, REL_X, dx);
-            }
-            if dy != 0 {
-                self.event_device.push_event(EV_REL, REL_Y, dy);
-            }
+        let (dx, dy) = {
+            let mut pointer = self.pointer_state.lock();
+            let movement =
+                if let (Some((x, y)), Some((last_x, last_y))) = (contact, pointer.last_contact) {
+                    let scaled_x = i32::from(x) - i32::from(last_x) + pointer.remainder_x;
+                    let scaled_y = i32::from(y) - i32::from(last_y) + pointer.remainder_y;
+                    let dx = scaled_x / POINTER_SCALE;
+                    let dy = scaled_y / POINTER_SCALE;
+                    pointer.remainder_x = scaled_x % POINTER_SCALE;
+                    pointer.remainder_y = scaled_y % POINTER_SCALE;
+                    (dx, dy)
+                } else {
+                    pointer.remainder_x = 0;
+                    pointer.remainder_y = 0;
+                    (0, 0)
+                };
+            pointer.last_contact = contact;
+            movement
+        };
+        if dx != 0 {
+            self.event_device.push_event(EV_REL, REL_X, dx);
         }
-        *previous_contact = contact;
-        drop(previous_contact);
+        if dy != 0 {
+            self.event_device.push_event(EV_REL, REL_Y, dy);
+        }
 
         self.event_device.push_event(EV_SYN, SYN_REPORT, 0);
     }
@@ -307,7 +336,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     // Scarlet has no regulator-consumer API yet. CoachZ firmware leaves
     // pp3300_fp_tp enabled, so retain that rail while taking over the device.
-    let event_device = Arc::new(EventDevice::new("mouse"));
+    let event_device = Arc::new(EventDevice::new("touchpad"));
     let trackpad = Arc::new(ElanEkth3000 {
         bus,
         address,
@@ -315,8 +344,9 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         irq_pin,
         event_device: event_device.clone(),
         report_len: ETP_REPORT_LEN,
+        max_x: 0,
         max_y: 0,
-        last_contact: IrqSpinLock::new(None),
+        pointer_state: IrqSpinLock::new(PointerState::default()),
         button_pressed: IrqSpinLock::new(false),
         work_pending: AtomicBool::new(false),
     });
@@ -336,7 +366,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let max_x = trackpad.read_command(ETP_MAX_X_CMD)?;
     let max_y = trackpad.read_command(ETP_MAX_Y_CMD)?;
 
-    // Rebuild after querying geometry so the IRQ path has an immutable max_y.
+    // Rebuild after querying geometry so the IRQ path has immutable bounds.
     let trackpad = Arc::new(ElanEkth3000 {
         bus: trackpad.bus.clone(),
         address,
@@ -344,8 +374,9 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         irq_pin,
         event_device: event_device.clone(),
         report_len,
+        max_x,
         max_y,
-        last_contact: IrqSpinLock::new(None),
+        pointer_state: IrqSpinLock::new(PointerState::default()),
         button_pressed: IrqSpinLock::new(false),
         work_pending: AtomicBool::new(false),
     });

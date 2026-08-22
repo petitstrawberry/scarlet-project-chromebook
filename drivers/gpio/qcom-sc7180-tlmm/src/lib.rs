@@ -6,8 +6,9 @@
 //!
 //! SC7180 distributes GPIO register windows across west, north, and south
 //! tiles. Each logical GPIO keeps its global pin number as the register index
-//! within the owning tile. This module exposes the controller through
-//! Scarlet's generic [`GpioController`] interface.
+//! within the owning tile. This module exposes GPIO operations through
+//! [`GpioController`] and keeps SC7180-specific pin/function decoding behind
+//! [`PinctrlController`].
 //!
 //! # Provenance
 //!
@@ -27,6 +28,7 @@ use scarlet::{
         events::InterruptCapableDevice,
         gpio::{GpioController, GpioIrqTrigger, GpioPull},
         manager::{DeviceManager, DriverPriority},
+        pinctrl::{PinctrlBias, PinctrlController, PinctrlError, PinctrlState},
         platform::{
             PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
         },
@@ -47,6 +49,7 @@ const INTERRUPT_STATUS: usize = 0xc;
 
 const CONFIG_PULL_MASK: u32 = 0x3;
 const CONFIG_FUNCTION_MASK: u32 = 0xf << 2;
+const CONFIG_DRIVE_STRENGTH_MASK: u32 = 0x7 << 6;
 const CONFIG_OUTPUT_ENABLE: u32 = 1 << 9;
 const INPUT_VALUE: u32 = 1;
 const OUTPUT_VALUE: u32 = 1 << 1;
@@ -166,6 +169,38 @@ impl Sc7180Tlmm {
             CONFIG_FUNCTION_MASK | CONFIG_OUTPUT_ENABLE,
             output_enable,
         );
+    }
+
+    fn named_function(pin: u32, function: &str) -> Option<u8> {
+        match function {
+            "gpio" if pin < PIN_COUNT as u32 => Some(0),
+            // Linux's SC7180 PINGROUP table places qup11_i2c in mux slot 1
+            // for GPIO6 (SDA) and GPIO7 (SCL).
+            "qup11_i2c" if matches!(pin, 6 | 7) => Some(1),
+            _ => None,
+        }
+    }
+
+    fn named_pin(pin: &str) -> Option<u32> {
+        let pin: u32 = pin.strip_prefix("gpio")?.parse().ok()?;
+        (pin < PIN_COUNT as u32).then_some(pin)
+    }
+
+    fn drive_strength_selector(milliamps: u32) -> Option<u32> {
+        ((2..=16).contains(&milliamps) && milliamps.is_multiple_of(2)).then_some(milliamps / 2 - 1)
+    }
+
+    fn configure_drive_strength(&self, pin: u32, selector: u32) {
+        self.update(pin, CONFIG, CONFIG_DRIVE_STRENGTH_MASK, selector << 6);
+    }
+
+    fn configure_input(&self, pin: u32) {
+        self.update(pin, CONFIG, CONFIG_OUTPUT_ENABLE, 0);
+    }
+
+    fn configure_output(&self, pin: u32, value: bool) {
+        self.set_value(pin, value);
+        self.update(pin, CONFIG, CONFIG_OUTPUT_ENABLE, CONFIG_OUTPUT_ENABLE);
     }
 
     fn configure_irq(&self, pin: u32, trigger: GpioIrqTrigger, enabled: bool) {
@@ -441,6 +476,7 @@ impl GpioController for Sc7180Tlmm {
             return false;
         }
 
+        self.configure_gpio(pin, false);
         self.update(
             pin,
             INTERRUPT_CONFIG,
@@ -473,6 +509,61 @@ impl GpioController for Sc7180Tlmm {
             slot.enabled = false;
             slot.handler = None;
         }
+    }
+}
+
+impl PinctrlController for Sc7180Tlmm {
+    fn apply_state(&self, state: &PinctrlState<'_>) -> Result<usize, PinctrlError> {
+        if state.input_enable && state.output.is_some() {
+            return Err(PinctrlError::Invalid);
+        }
+
+        let drive_strength = match state.drive_strength_ma {
+            Some(milliamps) => {
+                Some(Self::drive_strength_selector(milliamps).ok_or(PinctrlError::Invalid)?)
+            }
+            None => None,
+        };
+
+        // Resolve and validate the complete state before touching hardware so
+        // an unsupported function never leaves a partially programmed group.
+        let mut pins = Vec::with_capacity(state.pins.len());
+        for pin_name in &state.pins {
+            let pin = Self::named_pin(pin_name).ok_or(PinctrlError::Invalid)?;
+            let function = match state.function {
+                Some(function) => {
+                    Some(Self::named_function(pin, function).ok_or(PinctrlError::Unsupported)?)
+                }
+                None => None,
+            };
+            pins.push((pin, function));
+        }
+
+        for (pin, function) in pins {
+            if let Some(function) = function {
+                self.set_function(pin, function);
+            }
+            if let Some(bias) = state.bias {
+                self.set_pull(
+                    pin,
+                    match bias {
+                        PinctrlBias::Disable => GpioPull::None,
+                        PinctrlBias::PullDown => GpioPull::Down,
+                        PinctrlBias::PullUp => GpioPull::Up,
+                    },
+                );
+            }
+            if let Some(selector) = drive_strength {
+                self.configure_drive_strength(pin, selector);
+            }
+            if let Some(value) = state.output {
+                self.configure_output(pin, value);
+            } else if state.input_enable {
+                self.configure_input(pin);
+            }
+        }
+
+        Ok(state.pins.len())
     }
 }
 
@@ -532,7 +623,15 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         arch::get_cpu().get_cpuid() as u32,
     )
     .map_err(|_| "qcom-sc7180-tlmm: failed to register parent summary interrupt")?;
-    DeviceManager::get_manager().register_gpio_controller(phandle, controller);
+    let manager = DeviceManager::get_manager();
+    manager.register_gpio_controller(phandle, controller.clone());
+    manager.register_pinctrl_controller(phandle, controller);
+    if let Err(error) = manager.apply_registered_pinctrl_default(device) {
+        println!(
+            "[qcom-sc7180-tlmm] failed to apply provider default state: {}",
+            error
+        );
+    }
     println!(
         "[qcom-sc7180-tlmm] registered {} GPIOs (phandle={:#x}, summary IRQ={})",
         PIN_COUNT, phandle, summary_irq

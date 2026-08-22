@@ -2,12 +2,13 @@
 
 #![no_std]
 
-//! SC7180 GCC bootstrap and the clock/reset subset used by display and USB.
+//! SC7180 GCC bootstrap and the clock/reset subset used by display, USB, and
+//! the CoachZ trackpad I2C serial engine.
 //!
 //! The driver deliberately covers only the GCC resources consumed by Scarlet's
-//! SC7180 display and primary USB path.  Firmware may leave these resources in
-//! an arbitrary enabled state, so all enabling operations preserve unrelated
-//! register bits and are safe to repeat during the firmware handoff.
+//! SC7180 display, primary USB path, and CoachZ trackpad. Firmware may leave
+//! these resources in an arbitrary enabled state, so all enabling operations
+//! preserve unrelated register bits and are safe to repeat during handoff.
 
 extern crate alloc;
 
@@ -27,7 +28,7 @@ use scarlet::{
     early_println, time, vm,
 };
 
-// The highest register used by the USB clock subset is USB3_PRIM_CLKREF_CBCR.
+// The highest register used by this subset is USB3_PRIM_CLKREF_CBCR.
 const REGISTER_WINDOW_SIZE: usize = 0x8d000;
 
 // Register layout and DT IDs follow Linux 6.6 gcc-sc7180.c and
@@ -52,6 +53,12 @@ const GCC_USB3_PRIM_PHY_AUX_CLK: u32 = 115;
 const GCC_USB3_PRIM_PHY_COM_AUX_CLK: u32 = 117;
 const GCC_USB3_PRIM_PHY_PIPE_CLK: u32 = 118;
 const GCC_USB_PHY_CFG_AHB2PHY_CLK: u32 = 119;
+const GCC_QUPV3_WRAP1_S1_CLK: u32 = 74;
+
+const GCC_QUPV3_WRAP1_S1_CMD_RCGR: usize = 0x18148;
+const GCC_QUPV3_WRAP1_S1_HALT: usize = 0x18144;
+const GCC_APSS_CLOCK_BRANCH_ENA_VOTE: usize = 0x52008;
+const GCC_QUPV3_WRAP1_S1_VOTE: u32 = 1 << 23;
 
 const GCC_QUSB2PHY_PRIM_BCR: u32 = 0;
 const GCC_USB30_PRIM_BCR: u32 = 3;
@@ -75,6 +82,7 @@ const RCG_TIMEOUT_US: u64 = 500;
 const USB_MASTER_ASSIGNED_RATE: u64 = 150_000_000;
 const USB_MASTER_RATE: u64 = 200_000_000;
 const USB_MOCK_UTMI_RATE: u64 = 19_200_000;
+const QUP_SERIAL_RATE: u64 = 19_200_000;
 
 static GCC_BASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -400,6 +408,7 @@ impl Clk for Sc7180UsbClock {
 
 struct Sc7180GccProvider {
     clocks: [ClkHandle; USB_CLOCKS.len()],
+    trackpad_i2c_clock: ClkHandle,
 }
 
 impl Sc7180GccProvider {
@@ -414,7 +423,77 @@ impl Sc7180GccProvider {
                 mock_utmi_rate: Arc::clone(&mock_utmi_rate),
             }))
         });
-        Self { clocks }
+        let trackpad_i2c_clock = ClkHandle::new(Arc::new(Sc7180QupSerialClock { registers }));
+        Self {
+            clocks,
+            trackpad_i2c_clock,
+        }
+    }
+}
+
+struct Sc7180QupSerialClock {
+    registers: RegisterWindow,
+}
+
+impl Clk for Sc7180QupSerialClock {
+    fn name(&self) -> &'static str {
+        "gcc_qupv3_wrap1_s1_clk"
+    }
+
+    fn enable(&self) -> Result<(), ClkError> {
+        // SE1 runs from BI_TCXO at 19.2 MHz. Program the source while taking
+        // ownership because U-Boot deliberately leaves the trackpad bus off.
+        configure_rcg(self.registers, GCC_QUPV3_WRAP1_S1_CMD_RCGR, 0, 1)?;
+        self.registers
+            .set_bits(GCC_APSS_CLOCK_BRANCH_ENA_VOTE, GCC_QUPV3_WRAP1_S1_VOTE);
+        arch::io_wmb();
+        wait_for(
+            self.registers,
+            GCC_QUPV3_WRAP1_S1_HALT,
+            BRANCH_OFF,
+            0,
+            BRANCH_TIMEOUT_US,
+        )
+        .map_err(|_| ClkError::HardwareError)?;
+        early_println!(
+            "[qcom-sc7180-gcc] QUPv3 wrap1 SE1 ready: rate={} cmd={:#010x} vote={:#010x} halt={:#010x}",
+            QUP_SERIAL_RATE,
+            self.registers.read(GCC_QUPV3_WRAP1_S1_CMD_RCGR),
+            self.registers.read(GCC_APSS_CLOCK_BRANCH_ENA_VOTE),
+            self.registers.read(GCC_QUPV3_WRAP1_S1_HALT),
+        );
+        Ok(())
+    }
+
+    fn disable(&self) {
+        self.registers
+            .clear_bits(GCC_APSS_CLOCK_BRANCH_ENA_VOTE, GCC_QUPV3_WRAP1_S1_VOTE);
+        arch::io_wmb();
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.registers.read(GCC_APSS_CLOCK_BRANCH_ENA_VOTE) & GCC_QUPV3_WRAP1_S1_VOTE != 0
+            && self.registers.read(GCC_QUPV3_WRAP1_S1_HALT) & BRANCH_OFF == 0
+    }
+
+    fn recalc_rate(&self, _parent_rate: u64) -> u64 {
+        QUP_SERIAL_RATE
+    }
+
+    fn round_rate(&self, rate: u64, _parent_rate: u64) -> Result<u64, ClkError> {
+        if rate == QUP_SERIAL_RATE {
+            Ok(rate)
+        } else {
+            Err(ClkError::InvalidRate)
+        }
+    }
+
+    fn set_rate(&self, rate: u64, _parent_rate: u64) -> Result<u64, ClkError> {
+        if rate != QUP_SERIAL_RATE {
+            return Err(ClkError::InvalidRate);
+        }
+        configure_rcg(self.registers, GCC_QUPV3_WRAP1_S1_CMD_RCGR, 0, 1)?;
+        Ok(rate)
     }
 }
 
@@ -431,6 +510,9 @@ impl ClkProvider for Sc7180GccProvider {
         let [id] = spec else {
             return Err(ClkError::InvalidSpecifier);
         };
+        if *id == GCC_QUPV3_WRAP1_S1_CLK {
+            return Ok(self.trackpad_i2c_clock.clone());
+        }
         USB_CLOCKS
             .iter()
             .position(|clock| clock.id == *id)
@@ -543,7 +625,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     GCC_BASE.store(base, Ordering::Release);
 
     early_println!(
-        "[qcom-sc7180-gcc] registered USB clocks/resets for phandle {:#x}",
+        "[qcom-sc7180-gcc] registered display/USB/QUP clocks and USB resets for phandle {:#x}",
         phandle
     );
     Ok(())
@@ -580,6 +662,14 @@ mod tests {
     fn usb_clock_ids_match_sc7180_bindings() {
         let ids = USB_CLOCKS.map(|clock| clock.id);
         assert_eq!(ids, [17, 109, 8, 113, 111, 119, 115, 114, 117, 118]);
+    }
+
+    #[test]
+    fn trackpad_i2c_clock_id_matches_sc7180_binding() {
+        assert_eq!(GCC_QUPV3_WRAP1_S1_CLK, 74);
+        assert_eq!(GCC_QUPV3_WRAP1_S1_CMD_RCGR, 0x18148);
+        assert_eq!(GCC_QUPV3_WRAP1_S1_HALT, 0x18144);
+        assert_eq!(GCC_QUPV3_WRAP1_S1_VOTE, 1 << 23);
     }
 
     #[test]

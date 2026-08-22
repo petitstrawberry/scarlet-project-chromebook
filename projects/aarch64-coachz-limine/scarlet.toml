@@ -11,7 +11,7 @@ path = "bsp"
 package = "scarlet"
 
 [bsp.kernel]
-source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet" }
+source = { path = "../../../Scarlet/kernel" }
 features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = true }
 
 [modules]
@@ -27,6 +27,7 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-qusb2-v2" = { path = "../../drivers/phy/qcom-qusb2-v2", enabled = true }
 "scarlet-driver-qcom-qmp-usb3-dp" = { path = "../../drivers/phy/qcom-qmp-usb3-dp", enabled = true }
 "scarlet-driver-qcom-dwc3" = { path = "../../drivers/usb/dwc3/qcom-dwc3", enabled = true }
+"scarlet-driver-elan-ekth3000" = { path = "../../drivers/input/trackpad/elan-ekth3000", enabled = true }
 "scarlet-driver-goodix-gt7375p" = { path = "../../drivers/input/touchscreen/goodix-gt7375p", enabled = true }
 "scarlet-driver-ti-sn65dsi86" = { path = "../../drivers/display/bridge/ti-sn65dsi86", enabled = true }
 "scarlet-driver-qcom-sc7180-mdss" = { path = "../../drivers/display/qcom-sc7180-mdss", enabled = true }
@@ -39,15 +40,11 @@ output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev" }
-subdir = "bundles/base"
-bundle = "bundle.toml"
+path = "../../../Scarlet/bundles/base/bundle.toml"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev" }
-subdir = "bundles/cli-utils"
-bundle = "bundle.toml"
+path = "../../../Scarlet/bundles/cli-utils/bundle.toml"
 
 # The project-local PID 1 patches the resolved Scarlet init with rootwait
 # semantics while retaining its root transition and non-rootwait fallback.
@@ -65,9 +62,7 @@ output = ".scarlet/images/rootfs-aarch64-coachz-full.ext2"
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev" }
-subdir = "bundles/full"
-bundle = "bundle.toml"
+path = "../../../Scarlet/bundles/full/bundle.toml"
 
 [images.boot]
 format = "limine-uefi"
