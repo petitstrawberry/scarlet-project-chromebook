@@ -139,8 +139,6 @@ inject_and_verify_esp() {
   [[ "$(fdtget -t x "$verified_dtb" /soc@0/usb@a6f8800/usb@a600000 phys)" == "$(fdtget -t x "$handoff_dtb" /soc@0/usb@a6f8800/usb@a600000 phys)" ]]
   [[ "$(fdtget -t s "$verified_dtb" /soc@0/usb@a6f8800/usb@a600000 phy-names)" == 'usb2-phy usb3-phy' ]]
   [[ "$(fdtget -t s "$verified_dtb" /soc@0/usb@a6f8800/usb@a600000 maximum-speed)" == 'super-speed' ]]
-  [[ "$(fdtget -t s "$verified_dtb" /soc@0/geniqup@ac0000/i2c@a84000 status)" == 'okay' ]]
-  [[ "$(fdtget -t s "$verified_dtb" /soc@0/geniqup@ac0000/i2c@a84000/trackpad@15 compatible)" == 'elan,ekth3000' ]]
   echo "Installed CoachZ Scarlet OS handoff DTB in $label: $esp_dtb_path"
 }
 

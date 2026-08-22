@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the DTB passed from U-Boot to Scarlet without changing U-Boot's
-# deliberately high-speed-only control DTB or its disabled trackpad bus.
+# deliberately high-speed-only control DTB.
 set -euo pipefail
 
 project_dir="${SCARLET_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -13,10 +13,9 @@ usage() {
   cat <<'EOF'
 Usage: build-os-handoff-dtb.sh [--source CONTROL_DTB] [--output OS_DTB]
 
-Copy U-Boot's CoachZ control DTB, restore the USB3 handoff description, and
-enable the Elan trackpad I2C bus for Scarlet. The source must remain the
-U-Boot-only QUSB2/high-speed DTB with the trackpad bus disabled; this script
-never modifies it.
+Copy U-Boot's CoachZ control DTB and restore the USB3 handoff description
+required by Scarlet. The source must remain the U-Boot-only QUSB2/high-speed
+DTB; this script never modifies it.
 
 Environment overrides: SCARLET_PROJECT_DIR, UBOOT_BUILD_DIR,
 UBOOT_COACHZ_CONTROL_DTB, SCARLET_COACHZ_OS_DTB.
@@ -60,8 +59,6 @@ done
 qmp_node='/soc@0/phy@88e8000'
 dwc3_node='/soc@0/usb@a6f8800/usb@a600000'
 hsphy_node='/soc@0/phy@88e3000'
-trackpad_i2c_node='/soc@0/geniqup@ac0000/i2c@a84000'
-trackpad_node="$trackpad_i2c_node/trackpad@15"
 
 # Guard the boundary explicitly: the build input is U-Boot's HS-only control
 # DTB, while only the copied output receives Scarlet's USB3 description.
@@ -99,19 +96,6 @@ read -r hsphy_cfg_clock_phandle hsphy_cfg_clock_id hsphy_ref_clock_phandle hsphy
   echo 'error: control DTB DWC3 USB2 PHY binding is unexpected' >&2
   exit 1
 }
-[[ "$(fdtget -t s "$source_dtb" "$trackpad_i2c_node" status)" == 'disabled' ]] || {
-  echo 'error: control DTB Elan trackpad I2C bus must remain disabled for U-Boot' >&2
-  exit 1
-}
-[[ "$(fdtget -t s "$source_dtb" "$trackpad_node" compatible)" == 'elan,ekth3000' ]] || {
-  echo 'error: CoachZ Elan trackpad binding is missing or unexpected' >&2
-  exit 1
-}
-[[ "$(fdtget -t x "$source_dtb" "$trackpad_node" reg)" == '15' ]] || {
-  echo 'error: CoachZ Elan trackpad address is unexpected' >&2
-  exit 1
-}
-
 mkdir -p "$(dirname "$output_dtb")"
 temporary_output="$(mktemp "${output_dtb}.tmp.XXXXXX")"
 trap 'rm -f -- "$temporary_output"' EXIT
@@ -123,7 +107,6 @@ fdtput -t s "$temporary_output" "$qmp_node" status okay
 fdtput -t x "$temporary_output" "$dwc3_node" phys "$hsphy_phandle" "$qmp_phandle" 0
 fdtput -t s "$temporary_output" "$dwc3_node" phy-names usb2-phy usb3-phy
 fdtput -t s "$temporary_output" "$dwc3_node" maximum-speed super-speed
-fdtput -t s "$temporary_output" "$trackpad_i2c_node" status okay
 
 # Scarlet has the SC7180 GCC provider for the AHB programming clock, but not
 # an RPMh CXO provider.  Depthcharge/U-Boot leaves CXO running, and the QUSB2
@@ -139,8 +122,6 @@ fdtput -t s "$temporary_output" "$hsphy_node" clock-names cfg_ahb
 [[ "$(fdtget -t s "$temporary_output" "$dwc3_node" maximum-speed)" == 'super-speed' ]]
 [[ "$(fdtget -t x "$temporary_output" "$hsphy_node" clocks)" == "$hsphy_cfg_clock_phandle $hsphy_cfg_clock_id" ]]
 [[ "$(fdtget -t s "$temporary_output" "$hsphy_node" clock-names)" == 'cfg_ahb' ]]
-[[ "$(fdtget -t s "$temporary_output" "$trackpad_i2c_node" status)" == 'okay' ]]
-[[ "$(fdtget -t s "$temporary_output" "$trackpad_node" compatible)" == 'elan,ekth3000' ]]
 
 mv -f "$temporary_output" "$output_dtb"
 trap - EXIT

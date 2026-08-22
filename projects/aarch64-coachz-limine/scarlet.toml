@@ -27,7 +27,7 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-qusb2-v2" = { path = "../../drivers/phy/qcom-qusb2-v2", enabled = true }
 "scarlet-driver-qcom-qmp-usb3-dp" = { path = "../../drivers/phy/qcom-qmp-usb3-dp", enabled = true }
 "scarlet-driver-qcom-dwc3" = { path = "../../drivers/usb/dwc3/qcom-dwc3", enabled = true }
-"scarlet-driver-elan-ekth3000" = { path = "../../drivers/input/trackpad/elan-ekth3000", enabled = true }
+"scarlet-driver-chrome-ec-usb-touchpad" = { path = "../../drivers/input/trackpad/chrome-ec-usb-touchpad", enabled = true }
 "scarlet-driver-goodix-gt7375p" = { path = "../../drivers/input/touchscreen/goodix-gt7375p", enabled = true }
 "scarlet-driver-ti-sn65dsi86" = { path = "../../drivers/display/bridge/ti-sn65dsi86", enabled = true }
 "scarlet-driver-qcom-sc7180-mdss" = { path = "../../drivers/display/qcom-sc7180-mdss", enabled = true }

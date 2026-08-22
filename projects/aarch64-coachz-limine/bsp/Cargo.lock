@@ -78,14 +78,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "scarlet-driver-cros-ec-spi"
+name = "scarlet-driver-chrome-ec-usb-touchpad"
 version = "0.1.0"
 dependencies = [
  "scarlet",
 ]
 
 [[package]]
-name = "scarlet-driver-elan-ekth3000"
+name = "scarlet-driver-cros-ec-spi"
 version = "0.1.0"
 dependencies = [
  "scarlet",
@@ -202,8 +202,8 @@ name = "scarlet-modules"
 version = "0.1.0"
 dependencies = [
  "scarlet",
+ "scarlet-driver-chrome-ec-usb-touchpad",
  "scarlet-driver-cros-ec-spi",
- "scarlet-driver-elan-ekth3000",
  "scarlet-driver-goodix-gt7375p",
  "scarlet-driver-qcom-dwc3",
  "scarlet-driver-qcom-geni-i2c",
