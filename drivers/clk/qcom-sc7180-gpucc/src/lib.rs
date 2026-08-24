@@ -496,6 +496,15 @@ fn enable_parent_clocks(
     for name in names {
         let clock = match manager.resolve_clk(device, name) {
             Ok(clock) => clock,
+            // CoachZ firmware hands the always-on BI_TCXO reference to the
+            // kernel, while Scarlet does not yet expose the parent RPMh clock
+            // controller.  This is the same handoff contract used by the GCC
+            // driver.  Keep every programmable GCC parent strict below; only
+            // the immutable XO reference may be inherited.
+            Err("clk: provider not found" | "clk: clock not found") if name == "bi_tcxo" => {
+                early_println!("[qcom-sc7180-gpucc] inheriting firmware-enabled bi_tcxo parent");
+                continue;
+            }
             Err("clk: provider not found") | Err("clk: clock not found") => {
                 return scarlet::device::manager::probe_defer();
             }
