@@ -49,6 +49,14 @@ path = "../../../Scarlet/bundles/base/bundle.toml"
 kind = "bundle"
 path = "../../../Scarlet/bundles/cli-utils/bundle.toml"
 
+# Kernel drivers use the global VFS, whose root remains the initramfs after
+# userspace pivots to the block root. Keep firmware available in that trusted
+# namespace as well as in the persistent rootfs below.
+[[images.initramfs.layers]]
+kind = "copy"
+source = "firmware/rootfs"
+to = "/system/scarlet"
+
 # The project-local PID 1 patches the resolved Scarlet init with rootwait
 # semantics while retaining its root transition and non-rootwait fallback.
 [[images.initramfs.layers]]
@@ -70,7 +78,7 @@ path = "../../../Scarlet/bundles/full/bundle.toml"
 [[images.rootfs.layers]]
 kind = "copy"
 source = "firmware/rootfs"
-to = "/"
+to = "/system/scarlet"
 
 [images.boot]
 format = "limine-uefi"
