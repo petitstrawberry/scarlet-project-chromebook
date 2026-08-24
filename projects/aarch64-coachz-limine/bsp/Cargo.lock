@@ -10,6 +10,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "adreno-a6xx-pm4"
+version = "0.1.0"
+
+[[package]]
+name = "adreno-a6xx-shader-pack"
+version = "0.1.0"
+
+[[package]]
+name = "adreno-a6xx-submit-wire"
+version = "0.1.0"
+dependencies = [
+ "adreno-a6xx-shader-pack",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -99,6 +114,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-adreno-a618"
+version = "0.1.0"
+dependencies = [
+ "adreno-a6xx-pm4",
+ "adreno-a6xx-shader-pack",
+ "adreno-a6xx-submit-wire",
+ "scarlet",
+ "scarlet-driver-qcom-cmd-db",
+ "scarlet-driver-qcom-sc7180-gpucc",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-cmd-db"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-dwc3"
 version = "0.1.0"
 dependencies = [
@@ -159,6 +193,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-sc7180-gpucc"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-sc7180-mdss"
 version = "0.1.0"
 dependencies = [
@@ -205,6 +246,8 @@ dependencies = [
  "scarlet-driver-chrome-ec-usb-touchpad",
  "scarlet-driver-cros-ec-spi",
  "scarlet-driver-goodix-gt7375p",
+ "scarlet-driver-qcom-adreno-a618",
+ "scarlet-driver-qcom-cmd-db",
  "scarlet-driver-qcom-dwc3",
  "scarlet-driver-qcom-geni-i2c",
  "scarlet-driver-qcom-geni-spi",
@@ -213,6 +256,7 @@ dependencies = [
  "scarlet-driver-qcom-qusb2-v2",
  "scarlet-driver-qcom-sc7180-dispcc",
  "scarlet-driver-qcom-sc7180-gcc-display",
+ "scarlet-driver-qcom-sc7180-gpucc",
  "scarlet-driver-qcom-sc7180-mdss",
  "scarlet-driver-qcom-sc7180-qfprom",
  "scarlet-driver-qcom-sc7180-tlmm",

@@ -55,6 +55,57 @@ const GCC_USB3_PRIM_PHY_PIPE_CLK: u32 = 118;
 const GCC_USB_PHY_CFG_AHB2PHY_CLK: u32 = 119;
 const GCC_QUPV3_WRAP1_S1_CLK: u32 = 74;
 
+const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
+    SimpleClockDescriptor {
+        id: 22,
+        name: "gcc_ddrss_gpu_axi_clk",
+        register: 0x4452c,
+        enable_mask: 1,
+        rate: 200_000_000,
+        halt_check: false,
+    },
+    SimpleClockDescriptor {
+        id: 35,
+        name: "gcc_gpu_cfg_ahb_clk",
+        register: 0x71004,
+        enable_mask: 1,
+        rate: 19_200_000,
+        halt_check: true,
+    },
+    SimpleClockDescriptor {
+        id: 36,
+        name: "gcc_gpu_gpll0_clk_src",
+        register: 0x52000,
+        enable_mask: 1 << 15,
+        rate: 600_000_000,
+        halt_check: false,
+    },
+    SimpleClockDescriptor {
+        id: 37,
+        name: "gcc_gpu_gpll0_div_clk_src",
+        register: 0x52000,
+        enable_mask: 1 << 16,
+        rate: 300_000_000,
+        halt_check: false,
+    },
+    SimpleClockDescriptor {
+        id: 38,
+        name: "gcc_gpu_memnoc_gfx_clk",
+        register: 0x7100c,
+        enable_mask: 1,
+        rate: 200_000_000,
+        halt_check: false,
+    },
+    SimpleClockDescriptor {
+        id: 39,
+        name: "gcc_gpu_snoc_dvm_gfx_clk",
+        register: 0x71018,
+        enable_mask: 1,
+        rate: 200_000_000,
+        halt_check: true,
+    },
+];
+
 const GCC_QUPV3_WRAP1_S1_CMD_RCGR: usize = 0x18148;
 const GCC_QUPV3_WRAP1_S1_HALT: usize = 0x18144;
 const GCC_APSS_CLOCK_BRANCH_ENA_VOTE: usize = 0x52008;
@@ -409,6 +460,7 @@ impl Clk for Sc7180UsbClock {
 struct Sc7180GccProvider {
     clocks: [ClkHandle; USB_CLOCKS.len()],
     trackpad_i2c_clock: ClkHandle,
+    gpu_clocks: [ClkHandle; GPU_CLOCKS.len()],
 }
 
 impl Sc7180GccProvider {
@@ -424,10 +476,81 @@ impl Sc7180GccProvider {
             }))
         });
         let trackpad_i2c_clock = ClkHandle::new(Arc::new(Sc7180QupSerialClock { registers }));
+        let gpu_clocks = core::array::from_fn(|index| {
+            ClkHandle::new(Arc::new(Sc7180GccSimpleClock {
+                registers,
+                descriptor: GPU_CLOCKS[index],
+            }))
+        });
         Self {
             clocks,
             trackpad_i2c_clock,
+            gpu_clocks,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SimpleClockDescriptor {
+    id: u32,
+    name: &'static str,
+    register: usize,
+    enable_mask: u32,
+    rate: u64,
+    halt_check: bool,
+}
+
+struct Sc7180GccSimpleClock {
+    registers: RegisterWindow,
+    descriptor: SimpleClockDescriptor,
+}
+
+impl Clk for Sc7180GccSimpleClock {
+    fn name(&self) -> &'static str {
+        self.descriptor.name
+    }
+
+    fn enable(&self) -> Result<(), ClkError> {
+        self.registers
+            .set_bits(self.descriptor.register, self.descriptor.enable_mask);
+        arch::io_wmb();
+        if self.descriptor.halt_check {
+            wait_for(
+                self.registers,
+                self.descriptor.register,
+                BRANCH_OFF,
+                0,
+                BRANCH_TIMEOUT_US,
+            )
+            .map_err(|_| ClkError::HardwareError)?;
+        }
+        Ok(())
+    }
+
+    fn disable(&self) {
+        self.registers
+            .clear_bits(self.descriptor.register, self.descriptor.enable_mask);
+        arch::io_wmb();
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.registers.read(self.descriptor.register) & self.descriptor.enable_mask != 0
+    }
+
+    fn recalc_rate(&self, _parent_rate: u64) -> u64 {
+        self.descriptor.rate
+    }
+
+    fn round_rate(&self, rate: u64, _parent_rate: u64) -> Result<u64, ClkError> {
+        if rate == self.descriptor.rate {
+            Ok(rate)
+        } else {
+            Err(ClkError::InvalidRate)
+        }
+    }
+
+    fn set_rate(&self, rate: u64, parent_rate: u64) -> Result<u64, ClkError> {
+        self.round_rate(rate, parent_rate)
     }
 }
 
@@ -512,6 +635,9 @@ impl ClkProvider for Sc7180GccProvider {
         };
         if *id == GCC_QUPV3_WRAP1_S1_CLK {
             return Ok(self.trackpad_i2c_clock.clone());
+        }
+        if let Some(index) = GPU_CLOCKS.iter().position(|clock| clock.id == *id) {
+            return Ok(self.gpu_clocks[index].clone());
         }
         USB_CLOCKS
             .iter()

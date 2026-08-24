@@ -1,0 +1,16 @@
+diff --git a/src/freedreno/ir3/meson.build b/src/freedreno/ir3/meson.build
+index c6258e5..61c148a 100644
+--- a/src/freedreno/ir3/meson.build
++++ b/src/freedreno/ir3/meson.build
+@@ -173,3 +173,11 @@ test('ir3_delay_test',
+   ),
+   suite: ['freedreno'],
+ )
++
++executable(
++  'sgfx_compile',
++  'tests/sgfx_compile.c',
++  link_with: libfreedreno_ir3,
++  dependencies: [idep_mesautil, idep_nir],
++  include_directories: [inc_freedreno, inc_include, inc_src],
++)

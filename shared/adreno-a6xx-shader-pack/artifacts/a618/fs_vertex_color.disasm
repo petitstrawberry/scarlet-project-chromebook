@@ -1,0 +1,7 @@
+(rpt3)bary.f (ei)r0.z, (r)0, r0.x
+(rpt3)mul.f r1.z, (r)r0.z, (r)c4.x
+end
+nop
+nop
+nop
+nop

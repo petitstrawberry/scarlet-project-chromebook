@@ -1,0 +1,29 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+A618 SGFX IR3 shader-pack provenance
+=====================================
+
+This directory's locally authored producer and helper programs are project
+source code, licensed GPL-2.0-only:
+
+* sgfx_compile.c
+* pack_state.py
+* verify_pack.py
+* verify_packed_state.py
+
+The producer is compiled against Mesa's IR3 compiler and uses metadata/state
+semantics from the Mesa source tree pinned below. No Mesa source file is
+copied into this directory. Mesa is obtained from:
+
+  https://gitlab.freedesktop.org/mesa/mesa.git
+  commit 3f1b217baffffa00cb8f53e158713a33e1bd4632
+
+The relevant Mesa files, including the IR3 compiler, A6xx XML descriptors,
+and Turnip state emission, are MIT-licensed. Their individual copyright and
+license notices remain in the Mesa checkout and are not replaced by this
+notice.
+
+The *.bin, *.disasm, mesa-metadata.json, and packed-state.json files are
+deterministic generated data produced from the above Mesa revision by the
+GPL-2.0-only local producer/helpers. They are distributed as project artifacts
+under GPL-2.0-only; this does not change the license of Mesa source.

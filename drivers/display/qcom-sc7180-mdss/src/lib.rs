@@ -45,8 +45,11 @@ use scarlet::{
     arch,
     device::{
         Device, DeviceType,
-        graphics::{FramebufferConfig, GraphicsDevice, PixelFormat, output::DisplayRegion},
-        iommu::{DmaMapping, IommuDomainConfig, IommuDomainType, IommuMapFlags},
+        graphics::{
+            FramebufferConfig, GpuDisplayResource, GpuLinearDisplayBacking, GraphicsDevice,
+            PixelFormat, output::DisplayRegion,
+        },
+        iommu::{DmaContext, DmaMapping, IommuDomainConfig, IommuDomainType, IommuMapFlags},
         manager::{DeviceManager, DriverPriority, probe_defer},
         platform::{
             PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
@@ -360,9 +363,16 @@ pub struct Sc7180GraphicsDevice {
     timing: DisplayTiming,
     scanout: [ContiguousPages; SCANOUT_BUFFER_COUNT],
     scanout_dma: [DmaMapping; SCANOUT_BUFFER_COUNT],
+    dma_context: DmaContext,
+    gpu_scanout: Mutex<Option<GpuScanout>>,
     front: AtomicUsize,
     present_lock: Mutex<()>,
     engine: Sc7180DisplayEngine,
+}
+
+struct GpuScanout {
+    backing: GpuLinearDisplayBacking,
+    mapping: DmaMapping,
 }
 
 impl Sc7180GraphicsDevice {
@@ -419,6 +429,47 @@ impl Sc7180GraphicsDevice {
         }
         Ok(())
     }
+
+    fn validate_gpu_backing(
+        &self,
+        resource: GpuDisplayResource,
+    ) -> Result<GpuLinearDisplayBacking, &'static str> {
+        let backing = resource
+            .linear_backing()
+            .ok_or("qcom-sc7180-mdss: GPU image is not a linear framebuffer")?;
+        if resource.width() != self.config.width
+            || resource.height() != self.config.height
+            || backing.stride() != self.config.stride
+            || backing.format() != self.config.format
+        {
+            return Err("qcom-sc7180-mdss: GPU image does not match native scanout");
+        }
+        let required = u64::from(backing.stride())
+            .checked_mul(u64::from(resource.height()))
+            .ok_or("qcom-sc7180-mdss: GPU scanout size overflow")?;
+        if backing.allocation_size() < required {
+            return Err("qcom-sc7180-mdss: GPU scanout backing is undersized");
+        }
+        Ok(backing)
+    }
+
+    fn map_gpu_scanout(
+        &self,
+        backing: &GpuLinearDisplayBacking,
+    ) -> Result<DmaMapping, &'static str> {
+        let length = usize::try_from(backing.allocation_size())
+            .map_err(|_| "qcom-sc7180-mdss: GPU scanout length exceeds usize")?;
+        let mapping = self
+            .dma_context
+            .map_phys_owned(
+                backing.physical_addr(),
+                length,
+                IommuMapFlags::READ | IommuMapFlags::COHERENT,
+            )
+            .map_err(|_| "qcom-sc7180-mdss: failed to map GPU scanout for DPU DMA")?;
+        dpu_dma_address(&mapping)?;
+        Ok(mapping)
+    }
 }
 
 impl Device for Sc7180GraphicsDevice {
@@ -471,7 +522,8 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         }
         self.clean_regions(&self.scanout[back], &[region])?;
         self.engine
-            .present(self.scanout_dma[back].dma_addr() as usize)?;
+            .present(dpu_dma_address(&self.scanout_dma[back])?)?;
+        self.gpu_scanout.lock().take();
         self.front.store(back, Ordering::Release);
         Ok(())
     }
@@ -518,8 +570,35 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         }
 
         self.clean_regions(scanout, regions)?;
-        self.engine.present(scanout_dma.dma_addr() as usize)?;
+        self.engine.present(dpu_dma_address(scanout_dma)?)?;
+        self.gpu_scanout.lock().take();
         self.front.store(index, Ordering::Release);
+        Ok(())
+    }
+
+    fn present_gpu_resource_region(
+        &self,
+        resource: GpuDisplayResource,
+        _region: DisplayRegion,
+    ) -> Result<(), &'static str> {
+        let backing = self.validate_gpu_backing(resource)?;
+        let _present = self.present_lock.lock();
+        let mut gpu_scanout = self.gpu_scanout.lock();
+        if let Some(active) = gpu_scanout.as_mut()
+            && active.backing == backing
+        {
+            // Refresh the opaque producer owner even when the physical layout
+            // and existing DPU mapping can be reused.
+            active.backing = backing;
+            arch::io_wmb();
+            self.engine.present(dpu_dma_address(&active.mapping)?)?;
+            return Ok(());
+        }
+
+        let mapping = self.map_gpu_scanout(&backing)?;
+        arch::io_wmb();
+        self.engine.present(dpu_dma_address(&mapping)?)?;
+        *gpu_scanout = Some(GpuScanout { backing, mapping });
         Ok(())
     }
 
@@ -700,7 +779,7 @@ fn map_scanout(
     dma_context: &scarlet::device::iommu::DmaContext,
     scanout: &ContiguousPages,
 ) -> Result<DmaMapping, &'static str> {
-    dma_context
+    let mapping = dma_context
         .map_phys_owned(
             scanout.as_paddr(),
             scanout
@@ -709,7 +788,33 @@ fn map_scanout(
                 .ok_or("qcom-sc7180-mdss: scanout DMA length overflow")?,
             IommuMapFlags::READ | IommuMapFlags::COHERENT,
         )
-        .map_err(|_| "qcom-sc7180-mdss: failed to map scanout for DPU DMA")
+        .map_err(|_| "qcom-sc7180-mdss: failed to map scanout for DPU DMA")?;
+    dpu_dma_address(&mapping)?;
+    Ok(mapping)
+}
+
+/// Return a DPU-programmable DMA address after validating the whole mapping.
+///
+/// The DPU address register is only 32 bits wide.  Checking the final mapped
+/// byte prevents a page-rounded IOMMU mapping from silently crossing that
+/// limit even when its first DMA address happens to fit.
+fn dpu_dma_address(mapping: &DmaMapping) -> Result<usize, &'static str> {
+    let mapped_length = mapping.len();
+    let last_byte = u64::try_from(
+        mapped_length
+            .checked_sub(1)
+            .ok_or("qcom-sc7180-mdss: DPU DMA mapping is empty")?,
+    )
+    .map_err(|_| "qcom-sc7180-mdss: DPU DMA mapping length exceeds u64")?;
+    let dma_end = mapping
+        .dma_addr()
+        .checked_add(last_byte)
+        .ok_or("qcom-sc7180-mdss: DPU DMA range overflows")?;
+    if dma_end > u64::from(u32::MAX) {
+        return Err("qcom-sc7180-mdss: DPU DMA range exceeds 32-bit address space");
+    }
+    usize::try_from(mapping.dma_addr())
+        .map_err(|_| "qcom-sc7180-mdss: DPU DMA address exceeds usize")
 }
 
 fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
@@ -787,8 +892,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         map_scanout(&dma_context, &scanout[0])?,
         map_scanout(&dma_context, &scanout[1])?,
     ];
-    let scanout_dma_addr = usize::try_from(scanout_dma[0].dma_addr())
-        .map_err(|_| "qcom-sc7180-mdss: DPU DMA address exceeds usize")?;
+    let scanout_dma_addr = dpu_dma_address(&scanout_dma[0])?;
 
     let mdss_resource = device
         .get_resources()
@@ -838,6 +942,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         timing,
         scanout,
         scanout_dma,
+        dma_context,
+        gpu_scanout: Mutex::new(None),
         front: AtomicUsize::new(0),
         present_lock: Mutex::new(()),
         engine,

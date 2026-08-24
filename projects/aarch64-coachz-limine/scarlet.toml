@@ -22,6 +22,9 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-spmi-pmic-arb" = { path = "../../drivers/spmi/qcom-spmi-pmic-arb", enabled = true }
 "scarlet-driver-qcom-pm8941-rtc" = { path = "../../drivers/rtc/qcom-pm8941-rtc", enabled = true }
 "scarlet-driver-qcom-sc7180-gcc-display" = { path = "../../drivers/clk/qcom-sc7180-gcc-display", enabled = true }
+"scarlet-driver-qcom-cmd-db" = { path = "../../drivers/soc/qcom-cmd-db", enabled = true }
+"scarlet-driver-qcom-sc7180-gpucc" = { path = "../../drivers/clk/qcom-sc7180-gpucc", enabled = true }
+"scarlet-driver-qcom-adreno-a618" = { path = "../../drivers/gpu/qcom-adreno-a618", enabled = true }
 "scarlet-driver-qcom-sc7180-dispcc" = { path = "../../drivers/clk/qcom-sc7180-dispcc", enabled = true }
 "scarlet-driver-qcom-sc7180-qfprom" = { path = "../../drivers/nvmem/qcom-sc7180-qfprom", enabled = true }
 "scarlet-driver-qcom-qusb2-v2" = { path = "../../drivers/phy/qcom-qusb2-v2", enabled = true }
@@ -63,6 +66,11 @@ output = ".scarlet/images/rootfs-aarch64-coachz-full.ext2"
 [[images.rootfs.layers]]
 kind = "bundle"
 path = "../../../Scarlet/bundles/full/bundle.toml"
+
+[[images.rootfs.layers]]
+kind = "copy"
+source = "firmware/rootfs"
+to = "/"
 
 [images.boot]
 format = "limine-uefi"

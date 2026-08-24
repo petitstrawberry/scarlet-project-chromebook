@@ -1,0 +1,20 @@
+[package]
+name = "scarlet-driver-qcom-adreno-a618"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false }
+scarlet-driver-qcom-sc7180-gpucc = { path = "../../clk/qcom-sc7180-gpucc" }
+scarlet-driver-qcom-cmd-db = { path = "../../soc/qcom-cmd-db" }
+adreno-a6xx-pm4 = { path = "../../../shared/adreno-a6xx-pm4" }
+adreno-a6xx-shader-pack = { path = "../../../shared/adreno-a6xx-shader-pack" }
+adreno-a6xx-submit-wire = { path = "../../../shared/adreno-a6xx-submit-wire" }
+
+[dev-dependencies]
+sgfx-codegen-adreno-a6xx = { path = "../../../userspace/sgfx-codegen-adreno-a6xx" }
+sgfx-core = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "sgfx-core", default-features = false }

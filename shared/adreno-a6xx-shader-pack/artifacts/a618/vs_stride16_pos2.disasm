@@ -1,0 +1,7 @@
+(rpt3)mad.f32 r0.z, (r)c1.x, r0.y, (r)c3.x
+(rpt3)mad.f32 r1.z, (r)c0.x, r0.x, (r)r0.z
+end
+nop
+nop
+nop
+nop

@@ -1,0 +1,8 @@
+bary.f (ei)r63.x, 0, r0.x
+mov.u32u32 r2.x, c4.w
+(sy)(rpt2)mul.f r1.y, (r)r0.z, (r)c4.x
+end
+nop
+nop
+nop
+nop

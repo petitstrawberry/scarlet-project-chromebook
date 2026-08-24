@@ -1,0 +1,9 @@
+mov.u32u32 r0.x, c4.x
+mov.u32u32 r0.y, c4.y
+mov.u32u32 r0.z, c4.z
+mov.u32u32 r0.w, c4.w
+end
+nop
+nop
+nop
+nop

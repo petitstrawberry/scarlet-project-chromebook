@@ -1,0 +1,7 @@
+bary.f (ei)r63.x, 0, r0.x
+(sy)(rpt3)mul.f r1.z, (r)r0.z, (r)c4.x
+end
+nop
+nop
+nop
+nop

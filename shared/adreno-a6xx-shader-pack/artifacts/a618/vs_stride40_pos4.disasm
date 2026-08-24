@@ -1,0 +1,9 @@
+(rpt3)mul.f r1.x, (r)c0.x, r0.x
+(rpt3)mad.f32 r1.x, (r)c1.x, r0.y, (r)r1.x
+(rpt3)mad.f32 r1.x, (r)c2.x, r0.z, (r)r1.x
+(rpt3)mad.f32 r2.x, (r)c3.x, r0.w, (r)r1.x
+end
+nop
+nop
+nop
+nop

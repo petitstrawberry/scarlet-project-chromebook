@@ -1,0 +1,759 @@
+//! A6xx PM4 emission with symbolic address placeholders.
+
+use alloc::vec::Vec;
+
+use adreno_a6xx_pm4::{opcode, type4, type7};
+use adreno_a6xx_shader_pack::{
+    FragmentMeta, LinkMeta, PipelineVariant, SHADER_SIZE, ShaderMeta, VertexMeta, link_meta,
+    shader_meta,
+};
+use sgfx_core::ir::{Color, PixelRect};
+
+use crate::model::{
+    Access, AddressEncoding, CompileError, GeneratedObject, GeneratedObjectId, GeneratedObjectKind,
+    ObjectId, ObjectRef, RelocatablePm4, ResourceAccess, SymbolicAddress,
+};
+
+const CP_MEMCPY: u8 = 0x75;
+const CP_DRAW_INDX_OFFSET: u8 = 0x38;
+const CP_LOAD_STATE6_GEOM: u8 = 0x32;
+const CP_LOAD_STATE6_FRAG: u8 = 0x34;
+
+const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
+const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
+const EVENT_CACHE_INVALIDATE: u32 = 0x31;
+
+const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
+// Mesa fd6_format_table maps PIPE_FORMAT_B8G8R8A8_UNORM to WXYZ (1).
+const BGRA_COLOR_SWAP: u32 = 1 << 10;
+const BLIT_CHANNEL_MASK: u32 = 0xf << 20;
+const BLIT_SOLID_COLOR: u32 = 1 << 7;
+const BLIT_SCISSOR: u32 = 1 << 16;
+const SOURCE_TEXTURE_REQUIRED: u32 = (1 << 20) | (1 << 22);
+const SP_OUTPUT_INFO: u32 = (FORMAT_8_8_8_8_UNORM << 3) | (0xf << 12);
+
+const RB_A2D_BLT_CNTL: u32 = 0x8c00;
+const RB_A2D_PIXEL_CNTL: u32 = 0x8c01;
+const RB_A2D_DEST_BUFFER_INFO: u32 = 0x8c17;
+const RB_A2D_DEST_BUFFER_BASE: u32 = 0x8c18;
+const RB_A2D_DEST_BUFFER_PITCH: u32 = 0x8c1a;
+const RB_A2D_CLEAR_COLOR_DW0: u32 = 0x8c2c;
+const GRAS_A2D_BLT_CNTL: u32 = 0x8400;
+const GRAS_A2D_SRC_XMIN: u32 = 0x8401;
+const GRAS_A2D_DEST_TL: u32 = 0x8405;
+const GRAS_A2D_SCISSOR_TL: u32 = 0x840a;
+const RB_DBG_ECO_CNTL: u32 = 0x8e04;
+const RB_CCU_CNTL: u32 = 0x8e07;
+const SP_A2D_OUTPUT_INFO: u32 = 0xacc0;
+const TPL1_A2D_SRC_TEXTURE_INFO: u32 = 0xb4c0;
+const TPL1_A2D_SRC_TEXTURE_SIZE: u32 = 0xb4c1;
+const TPL1_A2D_SRC_TEXTURE_BASE: u32 = 0xb4c2;
+const TPL1_A2D_SRC_TEXTURE_PITCH: u32 = 0xb4c4;
+
+const GRAS_CL_VIEWPORT_XOFFSET: u32 = 0x8010;
+const GRAS_SC_SCREEN_SCISSOR_TL: u32 = 0x80b0;
+const GRAS_SC_VIEWPORT_SCISSOR_TL: u32 = 0x80d0;
+const GRAS_SC_WINDOW_SCISSOR_TL: u32 = 0x80f0;
+const GRAS_SU_CNTL: u32 = 0x8090;
+const RB_RENDER_CNTL: u32 = 0x8801;
+const RB_PS_OUTPUT_CNTL: u32 = 0x880b;
+const RB_PS_MRT_CNTL: u32 = 0x880c;
+const RB_PS_OUTPUT_MASK: u32 = 0x880d;
+const RB_MRT_CONTROL: u32 = 0x8820;
+const RB_MRT_BUF_INFO: u32 = 0x8822;
+const RB_MRT_PITCH: u32 = 0x8823;
+const RB_MRT_BASE: u32 = 0x8825;
+const RB_BLEND_CNTL: u32 = 0x8865;
+const VPC_VARYING_LM_TRANSFER_CNTL_DISABLE: u32 = 0x9212;
+const VPC_VS_CNTL: u32 = 0x9301;
+const VPC_PS_CNTL: u32 = 0x9304;
+const PC_DGEN_RAST_CNTL: u32 = 0x9981;
+const PC_VS_CNTL: u32 = 0x9b01;
+const VFD_CNTL_0: u32 = 0xa000;
+const VFD_INDEX_OFFSET: u32 = 0xa00e;
+const VFD_VERTEX_BUFFER_BASE: u32 = 0xa010;
+const VFD_VERTEX_BUFFER_SIZE: u32 = 0xa012;
+const VFD_FETCH_INSTR: u32 = 0xa090;
+const VFD_DEST_CNTL: u32 = 0xa0d0;
+const SP_VS_CNTL_0: u32 = 0xa800;
+const SP_VS_OUTPUT_CNTL: u32 = 0xa802;
+const SP_VS_OUTPUT_REG: u32 = 0xa803;
+const SP_VS_VPC_DEST_REG: u32 = 0xa813;
+const SP_VS_BASE: u32 = 0xa81c;
+const SP_VS_CONFIG: u32 = 0xa823;
+const SP_VS_INSTR_SIZE: u32 = 0xa824;
+const SP_PS_CNTL_0: u32 = 0xa980;
+const SP_PS_BASE: u32 = 0xa983;
+const SP_BLEND_CNTL: u32 = 0xa989;
+const SP_PS_OUTPUT_MASK: u32 = 0xa98b;
+const SP_PS_OUTPUT_CNTL: u32 = 0xa98c;
+const SP_PS_MRT_CNTL: u32 = 0xa98d;
+const SP_PS_OUTPUT_REG: u32 = 0xa98e;
+const SP_PS_MRT_REG: u32 = 0xa996;
+const SP_PS_INITIAL_TEX_LOAD_CNTL: u32 = 0xa99e;
+const SP_PS_CONFIG: u32 = 0xab04;
+const SP_PS_INSTR_SIZE: u32 = 0xab05;
+const SP_REG_PROG_ID_0: u32 = 0xb983;
+
+pub(crate) struct DrawState {
+    pub(crate) variant: PipelineVariant,
+    pub(crate) target: Surface,
+    pub(crate) area: PixelRect,
+    pub(crate) scissor: PixelRect,
+    pub(crate) vertex: ObjectId,
+    pub(crate) vertex_offset: u64,
+    pub(crate) vertex_size: u64,
+    pub(crate) stride: u32,
+    pub(crate) attributes: &'static [(u32, u32)],
+    pub(crate) uniforms: [u32; 20],
+    pub(crate) texture: Option<Surface>,
+    pub(crate) linear_sampler: bool,
+    pub(crate) source_over: bool,
+    pub(crate) cull: u32,
+    pub(crate) first_vertex: u32,
+    pub(crate) vertex_count: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Surface {
+    pub(crate) object: ObjectId,
+    pub(crate) plane_offset: u64,
+    pub(crate) plane_size: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) stride: u32,
+}
+
+pub(crate) struct Emitter {
+    words: Vec<u32>,
+    fixups: Vec<SymbolicAddress>,
+    accesses: Vec<ResourceAccess>,
+    generated_objects: Vec<GeneratedObject>,
+    max_words: usize,
+}
+
+impl Emitter {
+    pub(crate) fn new(max_words: u32) -> Self {
+        Self {
+            words: Vec::new(),
+            fixups: Vec::new(),
+            accesses: Vec::new(),
+            generated_objects: Vec::new(),
+            max_words: max_words as usize,
+        }
+    }
+
+    fn reserve_words(&mut self, additional: usize) -> Result<(), CompileError> {
+        if self
+            .words
+            .len()
+            .checked_add(additional)
+            .is_none_or(|length| length > self.max_words)
+        {
+            return Err(CompileError::CommandBudgetExceeded);
+        }
+        self.words
+            .try_reserve(additional)
+            .map_err(|_| CompileError::OutOfMemory)
+    }
+
+    fn push_word(&mut self, word: u32) -> Result<(), CompileError> {
+        self.reserve_words(1)?;
+        self.words.push(word);
+        Ok(())
+    }
+
+    fn extend_words(&mut self, words: &[u32]) -> Result<(), CompileError> {
+        self.reserve_words(words.len())?;
+        self.words.extend_from_slice(words);
+        Ok(())
+    }
+
+    fn packet4(&mut self, register: u32, values: &[u32]) -> Result<(), CompileError> {
+        let count = u16::try_from(values.len()).map_err(|_| CompileError::InvalidPm4)?;
+        self.push_word(type4(register, count).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.extend_words(values)
+    }
+
+    fn packet7(&mut self, opcode: u8, values: &[u32]) -> Result<(), CompileError> {
+        let count = u16::try_from(values.len()).map_err(|_| CompileError::InvalidPm4)?;
+        self.push_word(type7(opcode, count).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.extend_words(values)
+    }
+
+    fn wait_for_idle(&mut self) -> Result<(), CompileError> {
+        self.packet7(opcode::WAIT_FOR_IDLE, &[])
+    }
+
+    fn record_access(
+        &mut self,
+        object: ObjectRef,
+        offset: u64,
+        size: u64,
+        access: Access,
+    ) -> Result<(), CompileError> {
+        if matches!(object, ObjectRef::CanonicalShader(_)) {
+            return Ok(());
+        }
+        if let Some(existing) = self
+            .accesses
+            .iter_mut()
+            .find(|entry| entry.object == object && entry.offset == offset && entry.size == size)
+        {
+            existing.access = existing.access | access;
+            return Ok(());
+        }
+        self.accesses
+            .try_reserve(1)
+            .map_err(|_| CompileError::OutOfMemory)?;
+        self.accesses.push(ResourceAccess {
+            object,
+            offset,
+            size,
+            access,
+        });
+        Ok(())
+    }
+
+    fn address_words(
+        &mut self,
+        object: ObjectRef,
+        object_offset: u64,
+        required_size: u64,
+        access: Access,
+    ) -> Result<(), CompileError> {
+        let word_offset = u32::try_from(self.words.len()).map_err(|_| CompileError::Overflow)?;
+        self.extend_words(&[0, 0])?;
+        self.fixups
+            .try_reserve(1)
+            .map_err(|_| CompileError::OutOfMemory)?;
+        self.fixups.push(SymbolicAddress {
+            word_offset,
+            object,
+            object_offset,
+            required_size,
+            access,
+            encoding: AddressEncoding::GpuVa64,
+        });
+        self.record_access(object, object_offset, required_size, access)
+    }
+
+    fn address_register(
+        &mut self,
+        register: u32,
+        object: ObjectRef,
+        object_offset: u64,
+        required_size: u64,
+        access: Access,
+    ) -> Result<(), CompileError> {
+        self.push_word(type4(register, 2).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.address_words(object, object_offset, required_size, access)
+    }
+
+    fn canonical_shader(
+        &mut self,
+        register: u32,
+        variant: adreno_a6xx_shader_pack::ShaderVariant,
+    ) -> Result<(), CompileError> {
+        self.address_register(
+            register,
+            ObjectRef::CanonicalShader(variant),
+            0,
+            SHADER_SIZE as u64,
+            Access::READ,
+        )
+    }
+
+    fn load_direct(
+        &mut self,
+        opcode: u8,
+        block: u32,
+        state_type: u32,
+        units: u32,
+        values: &[u32],
+    ) -> Result<(), CompileError> {
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(3 + values.len())
+            .map_err(|_| CompileError::OutOfMemory)?;
+        payload.push((state_type << 14) | (block << 18) | (units << 22));
+        payload.extend_from_slice(&[0, 0]);
+        payload.extend_from_slice(values);
+        self.packet7(opcode, &payload)
+    }
+
+    fn texture_descriptor(&mut self, texture: Surface) -> Result<(), CompileError> {
+        // A6XX_TEX_MEMOBJ, single-level linear 2D BGRA8, identity view swizzle.
+        let pitch_align = texture.stride.trailing_zeros().saturating_sub(6).min(15);
+        let descriptor = [
+            0x4c00_6880,
+            texture.width | (texture.height << 15),
+            pitch_align | (texture.stride << 7) | (1 << 29),
+            u32::try_from(texture.plane_size >> 12).map_err(|_| CompileError::Overflow)?,
+        ];
+        self.push_word(type7(CP_LOAD_STATE6_FRAG, 19).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.extend_words(&[(1 << 14) | (4 << 18) | (1 << 22), 0, 0])?;
+        self.extend_words(&descriptor)?;
+        let word_offset = u32::try_from(self.words.len()).map_err(|_| CompileError::Overflow)?;
+        self.extend_words(&[0, 1 << 17])?; // BASE placeholder + DEPTH=1.
+        self.fixups
+            .try_reserve(1)
+            .map_err(|_| CompileError::OutOfMemory)?;
+        self.fixups.push(SymbolicAddress {
+            word_offset,
+            object: ObjectRef::External(texture.object),
+            object_offset: texture.plane_offset,
+            required_size: texture.plane_size,
+            access: Access::READ,
+            encoding: AddressEncoding::GpuVa49TexDescriptor,
+        });
+        self.record_access(
+            ObjectRef::External(texture.object),
+            texture.plane_offset,
+            texture.plane_size,
+            Access::READ,
+        )?;
+        self.extend_words(&[0; 10])
+    }
+
+    pub(crate) fn draw(&mut self, draw: DrawState) -> Result<(), CompileError> {
+        let link = link_meta(draw.variant);
+        let ShaderMeta::Vertex(vs) = shader_meta(link.vs) else {
+            return Err(CompileError::InvalidPm4);
+        };
+        let ShaderMeta::Fragment(fs) = shader_meta(link.fs) else {
+            return Err(CompileError::InvalidPm4);
+        };
+
+        self.submission_begin()?;
+        self.packet4(RB_RENDER_CNTL, &[0x10])?; // direct/sysmem, LR_TB, CCU cache line size 2
+        self.packet4(
+            RB_MRT_CONTROL,
+            &[
+                if draw.source_over { 0x783 } else { 0x780 },
+                if draw.source_over {
+                    0x0701_0706
+                } else {
+                    0x0001_0001
+                },
+            ],
+        )?;
+        self.packet4(RB_MRT_BUF_INFO, &[FORMAT_8_8_8_8_UNORM | BGRA_COLOR_SWAP])?;
+        self.packet4(
+            RB_MRT_PITCH,
+            &[
+                draw.target.stride >> 6,
+                u32::try_from(draw.target.plane_size >> 12).map_err(|_| CompileError::Overflow)?,
+            ],
+        )?;
+        self.address_register(
+            RB_MRT_BASE,
+            ObjectRef::External(draw.target.object),
+            draw.target.plane_offset,
+            draw.target.plane_size,
+            Access::WRITE,
+        )?;
+        self.packet4(
+            RB_BLEND_CNTL,
+            &[if draw.source_over {
+                0x0001_0101
+            } else {
+                0x0001_0100
+            }],
+        )?;
+        self.packet4(
+            SP_BLEND_CNTL,
+            &[if draw.source_over { 0x101 } else { 0x100 }],
+        )?;
+        self.packet4(SP_PS_MRT_CNTL, &[1])?;
+        self.packet4(RB_PS_MRT_CNTL, &[1])?;
+        self.packet4(SP_PS_MRT_REG, &[FORMAT_8_8_8_8_UNORM])?;
+
+        let area_br = pack_xy(
+            draw.area.x() + draw.area.width() - 1,
+            draw.area.y() + draw.area.height() - 1,
+        );
+        let scissor_br = pack_xy(
+            draw.scissor.x() + draw.scissor.width() - 1,
+            draw.scissor.y() + draw.scissor.height() - 1,
+        );
+        self.packet4(
+            GRAS_CL_VIEWPORT_XOFFSET,
+            &[
+                f32_bits(draw.area.x() as f32 + draw.area.width() as f32 * 0.5),
+                f32_bits(draw.area.width() as f32 * 0.5),
+                f32_bits(draw.area.y() as f32 + draw.area.height() as f32 * 0.5),
+                f32_bits(draw.area.height() as f32 * 0.5),
+                0,
+                f32_bits(1.0),
+            ],
+        )?;
+        self.packet4(
+            GRAS_SC_SCREEN_SCISSOR_TL,
+            &[pack_xy(draw.area.x(), draw.area.y()), area_br],
+        )?;
+        self.packet4(
+            GRAS_SC_VIEWPORT_SCISSOR_TL,
+            &[pack_xy(draw.area.x(), draw.area.y()), area_br],
+        )?;
+        self.packet4(
+            GRAS_SC_WINDOW_SCISSOR_TL,
+            &[pack_xy(draw.scissor.x(), draw.scissor.y()), scissor_br],
+        )?;
+        self.packet4(GRAS_SU_CNTL, &[0x2010 | draw.cull])?;
+        self.packet4(PC_DGEN_RAST_CNTL, &[3])?;
+
+        self.packet4(
+            VFD_CNTL_0,
+            &[(draw.attributes.len() as u32) | ((draw.attributes.len() as u32) << 8)],
+        )?;
+        self.packet4(VFD_INDEX_OFFSET, &[draw.first_vertex, 0])?;
+        self.address_register(
+            VFD_VERTEX_BUFFER_BASE,
+            ObjectRef::External(draw.vertex),
+            draw.vertex_offset,
+            draw.vertex_size,
+            Access::READ,
+        )?;
+        self.packet4(
+            VFD_VERTEX_BUFFER_SIZE,
+            &[
+                u32::try_from(draw.vertex_size).map_err(|_| CompileError::Overflow)?,
+                draw.stride,
+            ],
+        )?;
+        let mut fetch = Vec::new();
+        for &(format, offset) in draw.attributes {
+            fetch.push(0xc000_0000 | (format << 20) | (offset << 5));
+            fetch.push(1);
+        }
+        self.packet4(VFD_FETCH_INSTR, &fetch)?;
+        self.packet4(VFD_DEST_CNTL, vs.vfd_dest_cntl)?;
+
+        self.emit_vs(vs, link)?;
+        self.emit_fs(fs)?;
+        self.canonical_shader(SP_VS_BASE, link.vs)?;
+        self.canonical_shader(SP_PS_BASE, link.fs)?;
+        self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms)?;
+        self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
+        if let Some(texture) = draw.texture {
+            self.texture_descriptor(texture)?;
+            let mut sampler = [0_u32; 16];
+            sampler[0] = if draw.linear_sampler { 0x92a } else { 0x920 };
+            self.load_direct(CP_LOAD_STATE6_FRAG, 4, 0, 1, &sampler)?;
+        }
+        self.wait_for_idle()?;
+        self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, draw.vertex_count])?;
+        self.submission_end()
+    }
+
+    fn emit_vs(&mut self, vs: VertexMeta, link: LinkMeta) -> Result<(), CompileError> {
+        self.packet4(SP_VS_CNTL_0, &[vs.sp_vs_cntl_0])?;
+        self.packet4(SP_VS_OUTPUT_CNTL, &[link.sp_vs_output_cntl])?;
+        self.packet4(SP_VS_OUTPUT_REG, link.sp_vs_output_reg)?;
+        self.packet4(SP_VS_VPC_DEST_REG, link.sp_vs_vpc_dest_reg)?;
+        self.packet4(SP_VS_CONFIG, &[0x100])?;
+        self.packet4(SP_VS_INSTR_SIZE, &[vs.sp_vs_instr_size])?;
+        self.packet4(
+            VPC_VARYING_LM_TRANSFER_CNTL_DISABLE,
+            &link.lm_transfer_disable,
+        )?;
+        self.packet4(VPC_VS_CNTL, &[link.vpc_vs_cntl])?;
+        self.packet4(VPC_PS_CNTL, &[link.vpc_ps_cntl])?;
+        self.packet4(PC_VS_CNTL, &[link.pc_vs_cntl])
+    }
+
+    fn emit_fs(&mut self, fs: FragmentMeta) -> Result<(), CompileError> {
+        self.packet4(SP_PS_CNTL_0, &[fs.sp_ps_cntl_0])?;
+        self.packet4(
+            SP_PS_INITIAL_TEX_LOAD_CNTL,
+            &[&[fs.initial_tex_load_cntl], fs.initial_tex_load_cmd].concat(),
+        )?;
+        self.packet4(SP_REG_PROG_ID_0, &fs.sp_reg_prog_id)?;
+        self.packet4(SP_PS_OUTPUT_CNTL, &[fs.sp_ps_output_cntl])?;
+        self.packet4(SP_PS_OUTPUT_REG, fs.sp_ps_output_reg)?;
+        self.packet4(SP_PS_OUTPUT_MASK, &[fs.sp_ps_output_mask])?;
+        self.packet4(RB_PS_OUTPUT_CNTL, &[fs.rb_ps_output_cntl])?;
+        self.packet4(RB_PS_OUTPUT_MASK, &[fs.rb_ps_output_mask])?;
+        self.packet4(
+            SP_PS_CONFIG,
+            &[if fs.initial_tex_load_cmd.is_empty() {
+                0x100
+            } else {
+                0x10101
+            }],
+        )?;
+        self.packet4(SP_PS_INSTR_SIZE, &[fs.sp_ps_instr_size])
+    }
+
+    fn submission_begin(&mut self) -> Result<(), CompileError> {
+        self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_COLOR])?;
+        self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])?;
+        self.wait_for_idle()?;
+        self.packet4(RB_CCU_CNTL, &[0x0800_0000])?;
+        self.packet4(RB_DBG_ECO_CNTL, &[0x0410_0000])?;
+        self.packet7(opcode::SET_MARKER, &[12])
+    }
+
+    fn submission_end(&mut self) -> Result<(), CompileError> {
+        self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_FLUSH_COLOR_TS])?;
+        self.wait_for_idle()
+    }
+
+    fn emit_coordinates(
+        &mut self,
+        destination: PixelRect,
+        scissor: Option<PixelRect>,
+    ) -> Result<(), CompileError> {
+        self.packet4(
+            GRAS_A2D_DEST_TL,
+            &[
+                pack_xy(destination.x(), destination.y()),
+                pack_xy(
+                    destination.x() + destination.width() - 1,
+                    destination.y() + destination.height() - 1,
+                ),
+            ],
+        )?;
+        let scissor = scissor.unwrap_or(destination);
+        self.packet4(
+            GRAS_A2D_SCISSOR_TL,
+            &[
+                pack_xy(scissor.x(), scissor.y()),
+                pack_xy(
+                    scissor.x() + scissor.width() - 1,
+                    scissor.y() + scissor.height() - 1,
+                ),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn emit_a2d_common(&mut self, solid: bool, scissor: bool) -> Result<(), CompileError> {
+        let control = (FORMAT_8_8_8_8_UNORM << 8)
+            | BLIT_CHANNEL_MASK
+            | if solid { BLIT_SOLID_COLOR } else { 0 }
+            | if scissor { BLIT_SCISSOR } else { 0 };
+        self.packet4(RB_A2D_BLT_CNTL, &[control])?;
+        self.packet4(GRAS_A2D_BLT_CNTL, &[control])?;
+        self.packet4(SP_A2D_OUTPUT_INFO, &[SP_OUTPUT_INFO])?;
+        self.packet4(RB_A2D_PIXEL_CNTL, &[0])
+    }
+
+    fn emit_destination(&mut self, target: Surface) -> Result<(), CompileError> {
+        self.packet4(
+            RB_A2D_DEST_BUFFER_INFO,
+            &[FORMAT_8_8_8_8_UNORM | BGRA_COLOR_SWAP],
+        )?;
+        self.address_register(
+            RB_A2D_DEST_BUFFER_BASE,
+            ObjectRef::External(target.object),
+            target.plane_offset,
+            target.plane_size,
+            Access::WRITE,
+        )?;
+        self.packet4(RB_A2D_DEST_BUFFER_PITCH, &[target.stride >> 6])
+    }
+
+    fn emit_blit(&mut self) -> Result<(), CompileError> {
+        self.wait_for_idle()?;
+        self.packet7(opcode::BLIT, &[3])?;
+        self.wait_for_idle()
+    }
+
+    pub(crate) fn clear(
+        &mut self,
+        target: Surface,
+        area: PixelRect,
+        color: Color,
+    ) -> Result<(), CompileError> {
+        self.submission_begin()?;
+        self.wait_for_idle()?;
+        self.emit_coordinates(area, None)?;
+        let [red, green, blue, alpha] = color.components();
+        self.packet4(
+            RB_A2D_CLEAR_COLOR_DW0,
+            &[unorm8(red), unorm8(green), unorm8(blue), unorm8(alpha)],
+        )?;
+        self.emit_a2d_common(true, true)?;
+        self.emit_destination(target)?;
+        self.emit_blit()?;
+        self.submission_end()
+    }
+
+    pub(crate) fn copy(
+        &mut self,
+        source: Surface,
+        source_rect: PixelRect,
+        destination: Surface,
+        destination_rect: PixelRect,
+    ) -> Result<(), CompileError> {
+        self.submission_begin()?;
+        self.wait_for_idle()?;
+        self.packet4(
+            GRAS_A2D_SRC_XMIN,
+            &[
+                source_rect.x() << 8,
+                (source_rect.x() + source_rect.width() - 1) << 8,
+                source_rect.y() << 8,
+                (source_rect.y() + source_rect.height() - 1) << 8,
+            ],
+        )?;
+        self.emit_coordinates(destination_rect, None)?;
+        self.emit_a2d_common(false, true)?;
+        self.packet4(
+            TPL1_A2D_SRC_TEXTURE_INFO,
+            &[FORMAT_8_8_8_8_UNORM | BGRA_COLOR_SWAP | SOURCE_TEXTURE_REQUIRED],
+        )?;
+        self.packet4(
+            TPL1_A2D_SRC_TEXTURE_SIZE,
+            &[source.width | (source.height << 15)],
+        )?;
+        self.address_register(
+            TPL1_A2D_SRC_TEXTURE_BASE,
+            ObjectRef::External(source.object),
+            source.plane_offset,
+            source.plane_size,
+            Access::READ,
+        )?;
+        self.packet4(TPL1_A2D_SRC_TEXTURE_PITCH, &[(source.stride >> 6) << 9])?;
+        self.emit_destination(destination)?;
+        self.emit_blit()?;
+        self.submission_end()
+    }
+
+    pub(crate) fn upload_buffer(
+        &mut self,
+        destination: ObjectId,
+        destination_offset: u64,
+        destination_required_size: u64,
+        bytes: &[u8],
+    ) -> Result<(), CompileError> {
+        if bytes.is_empty() || bytes.len() & 3 != 0 || destination_offset & 3 != 0 {
+            return Err(CompileError::UnsupportedFeature);
+        }
+        let generated = self.add_generated(bytes, 64, Access::READ, GeneratedObjectKind::Upload)?;
+        let dwords = u32::try_from(bytes.len() / 4).map_err(|_| CompileError::Overflow)?;
+        self.push_word(type7(CP_MEMCPY, 5).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.push_word(dwords)?;
+        self.address_words(
+            ObjectRef::Generated(generated),
+            0,
+            bytes.len() as u64,
+            Access::READ,
+        )?;
+        self.address_words(
+            ObjectRef::External(destination),
+            destination_offset,
+            destination_required_size,
+            Access::WRITE,
+        )
+    }
+
+    fn add_generated(
+        &mut self,
+        bytes: &[u8],
+        alignment: u64,
+        access: Access,
+        kind: GeneratedObjectKind,
+    ) -> Result<GeneratedObjectId, CompileError> {
+        let raw =
+            u32::try_from(self.generated_objects.len()).map_err(|_| CompileError::Overflow)?;
+        let id = GeneratedObjectId::new(raw);
+        let mut contents = Vec::new();
+        contents
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| CompileError::OutOfMemory)?;
+        contents.extend_from_slice(bytes);
+        self.generated_objects
+            .try_reserve(1)
+            .map_err(|_| CompileError::OutOfMemory)?;
+        self.generated_objects.push(GeneratedObject {
+            id,
+            alignment,
+            bytes: contents,
+            access,
+            kind,
+        });
+        Ok(id)
+    }
+
+    pub(crate) fn finish(self) -> Result<RelocatablePm4, CompileError> {
+        let mut previous_end = None;
+        for fixup in &self.fixups {
+            let end = fixup
+                .word_offset
+                .checked_add(fixup.encoding.word_count())
+                .ok_or(CompileError::Overflow)? as usize;
+            let start = fixup.word_offset as usize;
+            if previous_end.is_some_and(|offset| offset > start) {
+                return Err(CompileError::InvalidPm4);
+            }
+            if end > self.words.len()
+                || !fixup.encoding.placeholder_is_valid(&self.words[start..end])
+            {
+                return Err(CompileError::InvalidPm4);
+            }
+            previous_end = Some(end);
+        }
+        Ok(RelocatablePm4 {
+            words: self.words,
+            fixups: self.fixups,
+            accesses: self.accesses,
+            generated_objects: self.generated_objects,
+        })
+    }
+}
+
+fn pack_xy(x: u32, y: u32) -> u32 {
+    x | (y << 16)
+}
+
+fn f32_bits(value: f32) -> u32 {
+    value.to_bits()
+}
+
+fn unorm8(value: f32) -> u32 {
+    let value = value.clamp(0.0, 1.0);
+    (value * 255.0 + 0.5) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::Emitter;
+    use crate::model::{
+        Access, AddressEncoding, CompileError, ObjectId, ObjectRef, SymbolicAddress,
+    };
+
+    #[test]
+    fn finish_rejects_overlapping_64_bit_fixups() {
+        let emitter = Emitter {
+            words: vec![0, 0, 0],
+            fixups: vec![
+                SymbolicAddress {
+                    word_offset: 0,
+                    object: ObjectRef::External(ObjectId::new(1)),
+                    object_offset: 0,
+                    required_size: 8,
+                    access: Access::READ,
+                    encoding: AddressEncoding::GpuVa64,
+                },
+                SymbolicAddress {
+                    word_offset: 1,
+                    object: ObjectRef::External(ObjectId::new(2)),
+                    object_offset: 0,
+                    required_size: 8,
+                    access: Access::READ,
+                    encoding: AddressEncoding::GpuVa64,
+                },
+            ],
+            accesses: vec![],
+            generated_objects: vec![],
+            max_words: 3,
+        };
+
+        assert_eq!(emitter.finish(), Err(CompileError::InvalidPm4));
+    }
+}

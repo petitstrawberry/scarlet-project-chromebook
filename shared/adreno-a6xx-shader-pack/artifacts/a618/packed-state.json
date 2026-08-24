@@ -1,0 +1,376 @@
+{
+  "gpu_id": 618,
+  "links": {
+    "stride16_solid": {
+      "pc_vs_cntl": 4,
+      "sp_vs_output_cntl": 1,
+      "sp_vs_output_reg": [
+        3846
+      ],
+      "sp_vs_vpc_dest_reg": [
+        0
+      ],
+      "vpc_ps_cntl": 4278255360,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967295,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16711684
+    },
+    "stride16_texture_alpha_mask": {
+      "pc_vs_cntl": 6,
+      "sp_vs_output_cntl": 2,
+      "sp_vs_output_reg": [
+        252183298
+      ],
+      "sp_vs_vpc_dest_reg": [
+        512
+      ],
+      "vpc_ps_cntl": 4278320898,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967292,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16712198
+    },
+    "stride16_texture_rgba": {
+      "pc_vs_cntl": 6,
+      "sp_vs_output_cntl": 2,
+      "sp_vs_output_reg": [
+        252183298
+      ],
+      "sp_vs_vpc_dest_reg": [
+        512
+      ],
+      "vpc_ps_cntl": 4278320898,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967292,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16712198
+    },
+    "stride24_solid": {
+      "pc_vs_cntl": 4,
+      "sp_vs_output_cntl": 1,
+      "sp_vs_output_reg": [
+        3848
+      ],
+      "sp_vs_vpc_dest_reg": [
+        0
+      ],
+      "vpc_ps_cntl": 4278255360,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967295,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16711684
+    },
+    "stride24_texture_rgb_ignore_alpha": {
+      "pc_vs_cntl": 6,
+      "sp_vs_output_cntl": 2,
+      "sp_vs_output_reg": [
+        252314372
+      ],
+      "sp_vs_vpc_dest_reg": [
+        512
+      ],
+      "vpc_ps_cntl": 4278320898,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967292,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16712198
+    },
+    "stride24_texture_rgba": {
+      "pc_vs_cntl": 6,
+      "sp_vs_output_cntl": 2,
+      "sp_vs_output_reg": [
+        252314372
+      ],
+      "sp_vs_vpc_dest_reg": [
+        512
+      ],
+      "vpc_ps_cntl": 4278320898,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967292,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16712198
+    },
+    "stride28_vertex_color": {
+      "pc_vs_cntl": 8,
+      "sp_vs_output_cntl": 2,
+      "sp_vs_output_reg": [
+        252448516
+      ],
+      "sp_vs_vpc_dest_reg": [
+        1024
+      ],
+      "vpc_ps_cntl": 4278320900,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967280,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16712712
+    },
+    "stride40_solid": {
+      "pc_vs_cntl": 4,
+      "sp_vs_output_cntl": 1,
+      "sp_vs_output_reg": [
+        3848
+      ],
+      "sp_vs_vpc_dest_reg": [
+        0
+      ],
+      "vpc_ps_cntl": 4278255360,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967295,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16711684
+    },
+    "stride40_texture_vertex_color_rgba": {
+      "pc_vs_cntl": 10,
+      "sp_vs_output_cntl": 3,
+      "sp_vs_output_reg": [
+        50859780,
+        3854
+      ],
+      "sp_vs_vpc_dest_reg": [
+        394240
+      ],
+      "vpc_ps_cntl": 4278320902,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967232,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16713226
+    },
+    "stride40_vertex_color": {
+      "pc_vs_cntl": 8,
+      "sp_vs_output_cntl": 2,
+      "sp_vs_output_reg": [
+        252448516
+      ],
+      "sp_vs_vpc_dest_reg": [
+        1024
+      ],
+      "vpc_ps_cntl": 4278320900,
+      "vpc_varying_lm_transfer_cntl_disable": [
+        4294967280,
+        4294967295,
+        4294967295,
+        4294967295
+      ],
+      "vpc_vs_cntl": 16712712
+    }
+  },
+  "mesa_metadata_sha256": "84a727b282d051a97cc9a3d43c5921dbe3751845db7c2de39d8f241727e701b9",
+  "mesa_sha": "3f1b217baffffa00cb8f53e158713a33e1bd4632",
+  "provenance": {
+    "driver": [
+      "src/freedreno/vulkan/tu_shader.cc",
+      "src/freedreno/vulkan/tu_pipeline.cc"
+    ],
+    "note": "Values are register payload dwords, not register addresses or packet headers.",
+    "xml": "src/freedreno/registers/adreno/a6xx.xml"
+  },
+  "schema_version": 2,
+  "variants": {
+    "fs_solid": {
+      "rb_ps_output_cntl": 0,
+      "rb_ps_output_mask": 15,
+      "sp_ps_cntl_0": 2165309568,
+      "sp_ps_initial_tex_load_cmd": [],
+      "sp_ps_initial_tex_load_cntl": 8,
+      "sp_ps_instr_size": 1,
+      "sp_ps_output_cntl": 4244438016,
+      "sp_ps_output_mask": 15,
+      "sp_ps_output_reg": [
+        0
+      ],
+      "sp_reg_prog_id": [
+        4244438268,
+        4244438268,
+        4244438268,
+        64764
+      ]
+    },
+    "fs_texture_alpha_mask": {
+      "rb_ps_output_cntl": 0,
+      "rb_ps_output_mask": 15,
+      "sp_ps_cntl_0": 2169504128,
+      "sp_ps_initial_tex_load_cmd": [
+        2181169152
+      ],
+      "sp_ps_initial_tex_load_cntl": 1,
+      "sp_ps_instr_size": 1,
+      "sp_ps_output_cntl": 4244438016,
+      "sp_ps_output_mask": 15,
+      "sp_ps_output_reg": [
+        6
+      ],
+      "sp_reg_prog_id": [
+        4244438268,
+        4244438016,
+        4244438268,
+        64764
+      ]
+    },
+    "fs_texture_rgb_ignore_alpha": {
+      "rb_ps_output_cntl": 0,
+      "rb_ps_output_mask": 15,
+      "sp_ps_cntl_0": 2169504128,
+      "sp_ps_initial_tex_load_cmd": [
+        2176974848
+      ],
+      "sp_ps_initial_tex_load_cntl": 1,
+      "sp_ps_instr_size": 1,
+      "sp_ps_output_cntl": 4244438016,
+      "sp_ps_output_mask": 15,
+      "sp_ps_output_reg": [
+        5
+      ],
+      "sp_reg_prog_id": [
+        4244438268,
+        4244438016,
+        4244438268,
+        64764
+      ]
+    },
+    "fs_texture_rgba": {
+      "rb_ps_output_cntl": 0,
+      "rb_ps_output_mask": 15,
+      "sp_ps_cntl_0": 2169504128,
+      "sp_ps_initial_tex_load_cmd": [
+        2210529280
+      ],
+      "sp_ps_initial_tex_load_cntl": 1,
+      "sp_ps_instr_size": 1,
+      "sp_ps_output_cntl": 4244438016,
+      "sp_ps_output_mask": 15,
+      "sp_ps_output_reg": [
+        6
+      ],
+      "sp_reg_prog_id": [
+        4244438268,
+        4244438016,
+        4244438268,
+        64764
+      ]
+    },
+    "fs_texture_vertex_color_rgba": {
+      "rb_ps_output_cntl": 0,
+      "rb_ps_output_mask": 15,
+      "sp_ps_cntl_0": 2169504256,
+      "sp_ps_initial_tex_load_cmd": [
+        2210529284
+      ],
+      "sp_ps_initial_tex_load_cntl": 1,
+      "sp_ps_instr_size": 1,
+      "sp_ps_output_cntl": 4244438016,
+      "sp_ps_output_mask": 15,
+      "sp_ps_output_reg": [
+        10
+      ],
+      "sp_reg_prog_id": [
+        4244438268,
+        4244438016,
+        4244438268,
+        64764
+      ]
+    },
+    "fs_vertex_color": {
+      "rb_ps_output_cntl": 0,
+      "rb_ps_output_mask": 15,
+      "sp_ps_cntl_0": 2169504128,
+      "sp_ps_initial_tex_load_cmd": [],
+      "sp_ps_initial_tex_load_cntl": 0,
+      "sp_ps_instr_size": 1,
+      "sp_ps_output_cntl": 4244438016,
+      "sp_ps_output_mask": 15,
+      "sp_ps_output_reg": [
+        6
+      ],
+      "sp_reg_prog_id": [
+        4244438268,
+        4244438016,
+        4244438268,
+        64764
+      ]
+    },
+    "vs_stride16_pos2": {
+      "sp_vs_cntl_0": 1048960,
+      "sp_vs_instr_size": 1,
+      "vfd_dest_cntl": [
+        3
+      ]
+    },
+    "vs_stride16_pos2_uv2": {
+      "sp_vs_cntl_0": 1048960,
+      "sp_vs_instr_size": 1,
+      "vfd_dest_cntl": [
+        3,
+        35
+      ]
+    },
+    "vs_stride24_pos4_uv2": {
+      "sp_vs_cntl_0": 1049088,
+      "sp_vs_instr_size": 1,
+      "vfd_dest_cntl": [
+        15,
+        67
+      ]
+    },
+    "vs_stride28_pos4_color3": {
+      "sp_vs_cntl_0": 1049088,
+      "sp_vs_instr_size": 1,
+      "vfd_dest_cntl": [
+        15,
+        71
+      ]
+    },
+    "vs_stride40_pos4": {
+      "sp_vs_cntl_0": 1048960,
+      "sp_vs_instr_size": 1,
+      "vfd_dest_cntl": [
+        15
+      ]
+    },
+    "vs_stride40_pos4_color4": {
+      "sp_vs_cntl_0": 1049088,
+      "sp_vs_instr_size": 1,
+      "vfd_dest_cntl": [
+        15,
+        79
+      ]
+    },
+    "vs_stride40_pos4_color4_uv2": {
+      "sp_vs_cntl_0": 1049216,
+      "sp_vs_instr_size": 1,
+      "vfd_dest_cntl": [
+        15,
+        79,
+        131
+      ]
+    }
+  }
+}
