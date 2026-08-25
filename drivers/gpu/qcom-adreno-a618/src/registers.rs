@@ -42,6 +42,10 @@ impl DwordRegisters {
         self.write(register + 1, (value >> 32) as u32);
     }
 
+    pub(crate) fn read64(self, register: usize) -> u64 {
+        u64::from(self.read(register)) | (u64::from(self.read(register + 1)) << 32)
+    }
+
     pub(crate) fn update(self, register: usize, clear: u32, set: u32) {
         self.write(register, (self.read(register) & !clear) | set);
     }
@@ -60,15 +64,12 @@ impl GmuRegisters {
     }
 
     pub(crate) fn read(self, absolute_register: usize) -> u32 {
-        debug_assert!(absolute_register >= GMU_GPU_DWORD_BASE);
-        self.resource
-            .read(absolute_register.saturating_sub(GMU_GPU_DWORD_BASE))
+        self.resource.read(gmu_resource_register(absolute_register))
     }
 
     pub(crate) fn write(self, absolute_register: usize, value: u32) {
-        debug_assert!(absolute_register >= GMU_GPU_DWORD_BASE);
         self.resource
-            .write(absolute_register.saturating_sub(GMU_GPU_DWORD_BASE), value);
+            .write(gmu_resource_register(absolute_register), value);
     }
 
     pub(crate) fn update(self, absolute_register: usize, clear: u32, set: u32) {
@@ -85,6 +86,17 @@ impl GmuRegisters {
             self.write(absolute_register + index, u32::from_le_bytes(word));
         }
     }
+}
+
+fn gmu_resource_register(absolute_register: usize) -> usize {
+    let register = absolute_register
+        .checked_sub(GMU_GPU_DWORD_BASE)
+        .expect("GMU register precedes the mapped GMU resource");
+    assert!(
+        register < GMU_RESOURCE_SIZE / core::mem::size_of::<u32>(),
+        "GMU register exceeds the mapped GMU resource"
+    );
+    register
 }
 
 // GMU register dword offsets, from current Mesa/Linux A6xx XML.
@@ -113,7 +125,7 @@ pub(crate) const GMU_SPTPRAC_PWR_CLK_STATUS: usize = 0x1f8d0;
 pub(crate) const GMU_RPMH_CTRL: usize = 0x1f8e8;
 pub(crate) const GMU_PWR_COL_CP_MSG: usize = 0x1f900;
 pub(crate) const GMU_PWR_COL_CP_RESP: usize = 0x1f901;
-pub(crate) const GMU_PWR_COL_KEEPALIVE: usize = 0x050c3;
+pub(crate) const GMU_PWR_COL_KEEPALIVE: usize = 0x1f8c3;
 pub(crate) const GMU_HFI_CTRL_STATUS: usize = 0x1f980;
 pub(crate) const GMU_HFI_SFR_ADDR: usize = 0x1f982;
 pub(crate) const GMU_HFI_QTBL_INFO: usize = 0x1f984;
@@ -130,9 +142,9 @@ pub(crate) const GMU_RSCC_CONTROL_REQ: usize = 0x23b07;
 pub(crate) const GMU_RSCC_CONTROL_ACK: usize = 0x23b08;
 pub(crate) const GMU_AO_GPU_CX_BUSY_MASK: usize = 0x23b0e;
 pub(crate) const GMU_AHB_FENCE_RANGE_0: usize = 0x23b11;
-pub(crate) const GMU_AO_AHB_FENCE_CTRL: usize = 0x09310;
-pub(crate) const GMU_AHB_FENCE_STATUS_CLR: usize = 0x09314;
-pub(crate) const GPU_CC_GX_GDSCR: usize = 0x09c03;
+pub(crate) const GMU_AO_AHB_FENCE_CTRL: usize = 0x23b10;
+pub(crate) const GMU_AHB_FENCE_STATUS_CLR: usize = 0x23b14;
+pub(crate) const GPU_CC_GX_GDSCR: usize = 0x24403;
 
 // RSCC offsets relative to the RSCC sub-window, in dwords.
 pub(crate) const RSCC_RSC_STATUS0_DRV0: usize = 0x004;
@@ -171,6 +183,31 @@ pub(crate) const PDC_GPU_TCS3_CMD0_DATA: usize = 0x15db;
 pub(crate) const RBBM_INT_0_STATUS: usize = 0x0201;
 pub(crate) const RBBM_INT_CLEAR_CMD: usize = 0x0037;
 pub(crate) const RBBM_INT_0_MASK: usize = 0x0038;
+// A6xx RBBM interrupt bits.  Timestamp/cache events share this status
+// register with genuine execution faults, so callers must never treat every
+// non-zero bit as a device loss.
+pub(crate) const RBBM_INT_CP_AHB_ERROR: u32 = 1 << 1;
+pub(crate) const RBBM_INT_CP_HW_ERROR: u32 = 1 << 9;
+pub(crate) const RBBM_INT_CP_CCU_FLUSH_DEPTH_TS: u32 = 1 << 10;
+pub(crate) const RBBM_INT_CP_CCU_FLUSH_COLOR_TS: u32 = 1 << 11;
+pub(crate) const RBBM_INT_CP_CCU_RESOLVE_TS: u32 = 1 << 12;
+pub(crate) const RBBM_INT_CP_RB_DONE_TS: u32 = 1 << 17;
+pub(crate) const RBBM_INT_CP_WT_DONE_TS: u32 = 1 << 18;
+pub(crate) const RBBM_INT_CP_CACHE_FLUSH_TS: u32 = 1 << 20;
+pub(crate) const RBBM_INT_RBBM_HANG_DETECT: u32 = 1 << 23;
+pub(crate) const RBBM_INT_UCHE_OOB_ACCESS: u32 = 1 << 24;
+pub(crate) const RBBM_INT_UCHE_TRAP_INTR: u32 = 1 << 25;
+pub(crate) const RBBM_INT_COMPLETION_MASK: u32 = RBBM_INT_CP_CCU_FLUSH_DEPTH_TS
+    | RBBM_INT_CP_CCU_FLUSH_COLOR_TS
+    | RBBM_INT_CP_CCU_RESOLVE_TS
+    | RBBM_INT_CP_RB_DONE_TS
+    | RBBM_INT_CP_WT_DONE_TS
+    | RBBM_INT_CP_CACHE_FLUSH_TS;
+pub(crate) const RBBM_INT_FATAL_MASK: u32 = RBBM_INT_CP_AHB_ERROR
+    | RBBM_INT_CP_HW_ERROR
+    | RBBM_INT_RBBM_HANG_DETECT
+    | RBBM_INT_UCHE_OOB_ACCESS
+    | RBBM_INT_UCHE_TRAP_INTR;
 pub(crate) const RBBM_STATUS: usize = 0x0210;
 /// Bit 0 in the upstream A6XX XML; it may remain set while CP queues are idle.
 pub(crate) const RBBM_STATUS_CP_AHB_BUSY_CX_MASTER: u32 = 0x0000_0001;
@@ -188,6 +225,9 @@ pub(crate) const CP_RB_CNTL: usize = 0x0802;
 pub(crate) const CP_RB_RPTR: usize = 0x0806;
 pub(crate) const CP_RB_WPTR: usize = 0x0807;
 pub(crate) const CP_SQE_CNTL: usize = 0x0808;
+pub(crate) const CP_HW_FAULT: usize = 0x0821;
+pub(crate) const CP_INTERRUPT_STATUS: usize = 0x0823;
+pub(crate) const CP_PROTECT_STATUS: usize = 0x0824;
 pub(crate) const CP_SQE_INSTR_BASE: usize = 0x0830;
 pub(crate) const CP_ADDR_MODE_CNTL: usize = 0x0842;
 pub(crate) const CP_ROQ_THRESHOLDS_1: usize = 0x08c1;
@@ -197,6 +237,10 @@ pub(crate) const CP_PERFCTR_CP_SEL_0: usize = 0x08d0;
 pub(crate) const CP_AHB_CNTL: usize = 0x098d;
 pub(crate) const CP_PROTECT_CNTL: usize = 0x084f;
 pub(crate) const CP_PROTECT_BASE: usize = 0x0850;
+pub(crate) const CP_IB1_BASE: usize = 0x0928;
+pub(crate) const CP_IB1_REM_SIZE: usize = 0x092a;
+pub(crate) const CP_IB2_BASE: usize = 0x092b;
+pub(crate) const CP_IB2_REM_SIZE: usize = 0x092d;
 
 pub(crate) const UCHE_ADDR_MODE_CNTL: usize = 0x0e00;
 pub(crate) const UCHE_WRITE_RANGE_MAX: usize = 0x0e05;
@@ -247,3 +291,36 @@ pub(crate) const TPL1_A2D_SRC_TEXTURE_INFO: usize = 0xb4c0;
 pub(crate) const TPL1_A2D_SRC_TEXTURE_SIZE: usize = 0xb4c1;
 pub(crate) const TPL1_A2D_SRC_TEXTURE_BASE: usize = 0xb4c2;
 pub(crate) const TPL1_A2D_SRC_TEXTURE_PITCH: usize = 0xb4c4;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_registers_resolve_inside_the_gmu_resource() {
+        for register in [
+            GMU_PWR_COL_KEEPALIVE,
+            GMU_AO_AHB_FENCE_CTRL,
+            GMU_AHB_FENCE_STATUS_CLR,
+            GPU_CC_GX_GDSCR,
+        ] {
+            assert!(gmu_resource_register(register) < GMU_RESOURCE_SIZE / 4);
+        }
+        assert_eq!(gmu_resource_register(GPU_CC_GX_GDSCR) * 4, 0x2700c);
+    }
+
+    #[test]
+    #[should_panic(expected = "GMU register precedes the mapped GMU resource")]
+    fn rejects_gpu_relative_offsets_as_gmu_absolute_offsets() {
+        let _ = gmu_resource_register(0x09c03);
+    }
+
+    #[test]
+    fn timestamp_completion_interrupts_are_not_device_loss() {
+        assert_ne!(RBBM_INT_COMPLETION_MASK & RBBM_INT_CP_CACHE_FLUSH_TS, 0);
+        assert_ne!(RBBM_INT_COMPLETION_MASK & RBBM_INT_CP_CCU_FLUSH_COLOR_TS, 0);
+        assert_eq!(RBBM_INT_COMPLETION_MASK & RBBM_INT_FATAL_MASK, 0);
+        assert_ne!(RBBM_INT_FATAL_MASK & RBBM_INT_CP_HW_ERROR, 0);
+        assert_ne!(RBBM_INT_FATAL_MASK & RBBM_INT_RBBM_HANG_DETECT, 0);
+    }
+}

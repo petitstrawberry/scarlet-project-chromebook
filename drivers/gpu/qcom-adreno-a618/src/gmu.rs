@@ -85,6 +85,7 @@ pub(crate) struct A618Gmu {
     phandle: u32,
     ready: bool,
     active: bool,
+    rsc_asleep: bool,
     _gmu_mapping: MmioMapping,
     _pdc_mapping: MmioMapping,
     _pdc_sequence_mapping: MmioMapping,
@@ -125,6 +126,7 @@ impl A618Gmu {
             phandle,
             ready: false,
             active: false,
+            rsc_asleep: false,
             _gmu_mapping: gmu_mapping,
             _pdc_mapping: pdc_mapping,
             _pdc_sequence_mapping: pdc_sequence_mapping,
@@ -145,11 +147,24 @@ impl A618Gmu {
         if self.ready {
             return Ok(());
         }
+        if self.active {
+            return Err("qcom-adreno-a618: GMU is not quiesced after a prior failure");
+        }
+        early_println!("[qcom-adreno-a618] GMU bring-up begin");
+        self.wake_rsc()?;
         self.dma_context
             .restore_iommu()
             .map_err(|_| "qcom-adreno-a618: failed to restore GMU IOMMU")?;
         let power = build_power_table()?;
         let firmware = firmware::load(firmware::GMU_FIRMWARE_PATH, GMU_FIRMWARE_MAX_SIZE)?;
+        early_println!(
+            "[qcom-adreno-a618] GMU inputs firmware={} gx=[{:#x},{:#x}] cx=[{:#x},{:#x}]",
+            firmware.len(),
+            power.gx_votes[0],
+            power.gx_votes[1],
+            power.cx_votes[0],
+            power.cx_votes[1],
+        );
 
         self.active = true;
         let boot = (|| {
@@ -175,9 +190,22 @@ impl A618Gmu {
             );
             self.configure_power();
             self.start_cm3()?;
+            early_println!(
+                "[qcom-adreno-a618] GMU CM3 ready init={:#010x}",
+                self.registers.read(GMU_CM3_FW_INIT_RESULT),
+            );
             self.enable_gfx_rail(power.gx_votes[1])?;
+            early_println!("[qcom-adreno-a618] GMU GX rail acknowledged");
             self.enable_sptprac()?;
+            early_println!(
+                "[qcom-adreno-a618] GMU SPTPRAC ready status={:#010x}",
+                self.registers.read(GMU_SPTPRAC_PWR_CLK_STATUS),
+            );
             self.start_hfi_transport()?;
+            early_println!(
+                "[qcom-adreno-a618] GMU HFI transport ready status={:#010x}",
+                self.registers.read(GMU_HFI_CTRL_STATUS),
+            );
             // Publish HFI CTRL status and queue-table contents before the
             // first host-to-GMU interrupt.
             arch::io_wmb();
@@ -194,7 +222,20 @@ impl A618Gmu {
             Ok::<(), &'static str>(())
         })();
         if let Err(error) = boot {
-            let _ = self.force_shutdown();
+            early_println!("[a618] {}", error);
+            early_println!(
+                "[a618] GMU state init={:#010x} hfi={:#010x}",
+                self.registers.read(GMU_CM3_FW_INIT_RESULT),
+                self.registers.read(GMU_HFI_CTRL_STATUS),
+            );
+            early_println!(
+                "[a618] GMU intr={:#010x} sptprac={:#010x}",
+                self.registers.read(GMU_GMU2HOST_INTR_INFO),
+                self.registers.read(GMU_SPTPRAC_PWR_CLK_STATUS),
+            );
+            if self.force_shutdown().is_err() {
+                return Err("qcom-adreno-a618: failed to quiesce GMU after bring-up error");
+            }
             return Err(error);
         }
         self.ready = true;
@@ -266,14 +307,16 @@ impl A618Gmu {
         arch::io_wmb();
         self.registers.write(GMU_CM3_SYSRESET, 1);
         self.registers.write(GMU_RSCC_CONTROL_REQ, 1);
-        quiesced &= poll_dword_register(self.rscc, RSCC_RSC_STATUS0_DRV0, |value| {
+        let rsc_asleep = poll_dword_register(self.rscc, RSCC_RSC_STATUS0_DRV0, |value| {
             value & (1 << 16) != 0
         })
         .is_ok();
+        quiesced &= rsc_asleep;
         self.registers.write(GMU_RSCC_CONTROL_REQ, 0);
         arch::io_wmb();
         self.ready = false;
         if quiesced {
+            self.rsc_asleep = rsc_asleep;
             self.active = false;
             Ok(())
         } else {
@@ -387,6 +430,29 @@ impl A618Gmu {
         self.pdc.write(PDC_GPU_SEQ_START_ADDR, 0);
         self.pdc.write(PDC_GPU_ENABLE_PDC, 0x8000_0001);
         arch::io_wmb();
+    }
+
+    fn wake_rsc(&mut self) -> Result<(), &'static str> {
+        if !self.rsc_asleep {
+            return Ok(());
+        }
+        self.registers.write(GMU_RSCC_CONTROL_REQ, 1 << 1);
+        let result = (|| {
+            poll_register(
+                self.registers,
+                GMU_RSCC_CONTROL_ACK,
+                |value| value & (1 << 1) != 0,
+                "qcom-adreno-a618: GMU RSC wake acknowledgement timed out",
+            )?;
+            poll_dword_register(self.rscc, RSCC_SEQ_BUSY_DRV0, |value| value == 0)
+                .map_err(|_| "qcom-adreno-a618: GMU RSC wake sequence timed out")
+        })();
+        self.registers.write(GMU_RSCC_CONTROL_REQ, 0);
+        arch::io_wmb();
+        result?;
+        self.rsc_asleep = false;
+        early_println!("[qcom-adreno-a618] GMU RSC wake complete");
+        Ok(())
     }
 
     fn configure_power(&self) {

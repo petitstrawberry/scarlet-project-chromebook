@@ -106,17 +106,26 @@ impl RegisterWindow {
 pub struct Sc7180GpuCc {
     registers: RegisterWindow,
     phandle: u32,
-    _parents: EnabledClocks,
+    parents: ParentClocks,
+    _enabled_bi_tcxo: EnabledClock,
+    enabled_gmu_parent: EnabledParentClock,
     _mmio: MmioMapping,
     lock: IrqSpinLock<()>,
 }
 
 impl Sc7180GpuCc {
-    fn new(mapping: MmioMapping, phandle: u32, parents: EnabledClocks) -> Self {
+    fn new(
+        mapping: MmioMapping,
+        phandle: u32,
+        parents: ParentClocks,
+        enabled_bi_tcxo: EnabledClock,
+    ) -> Self {
         Self {
             registers: RegisterWindow::new(mapping.base),
             phandle,
-            _parents: parents,
+            parents,
+            _enabled_bi_tcxo: enabled_bi_tcxo,
+            enabled_gmu_parent: EnabledParentClock::new(),
             _mmio: mapping,
             lock: IrqSpinLock::new(()),
         }
@@ -133,15 +142,38 @@ impl Sc7180GpuCc {
 
     fn configure_pll1(&self) {
         let base = PLL1_BASE;
+        early_println!("[qcom-sc7180-gpucc] PLL1 write L");
         self.registers.write(base + PLL_L_VAL, 0x12);
+        early_println!("[qcom-sc7180-gpucc] PLL1 write FRAC");
         self.registers.write(base + PLL_FRAC, 0xc000);
+        early_println!("[qcom-sc7180-gpucc] PLL1 write CONFIG");
         self.registers.write(base + PLL_CONFIG_CTL, 0x2048_5699);
+        early_println!("[qcom-sc7180-gpucc] PLL1 write CONFIG_U");
         self.registers.write(base + PLL_CONFIG_CTL_U, 0x0000_2067);
+        early_println!("[qcom-sc7180-gpucc] PLL1 write USER");
         self.registers.write(base + PLL_USER_CTL, 0x0000_0001);
+        early_println!("[qcom-sc7180-gpucc] PLL1 write USER_U");
         self.registers.write(base + PLL_USER_CTL_U, 0x0000_4805);
+        early_println!("[qcom-sc7180-gpucc] PLL1 write TEST_U");
         self.registers.write(base + PLL_TEST_CTL_U, 0x4000_0000);
+        arch::io_wmb();
+
+        // Fabia requires these as two distinct read/modify/write operations.
+        // Keeping the reads visible in the log also distinguishes an
+        // inaccessible PLL sub-block from a later programming failure.
+        early_println!("[qcom-sc7180-gpucc] PLL1 read MODE for UPDATE_BYPASS");
+        let mode = self.registers.read(base + PLL_MODE);
+        early_println!("[qcom-sc7180-gpucc] PLL1 MODE={:#010x}", mode);
         self.registers
-            .update(base + PLL_MODE, 0, PLL_UPDATE_BYPASS | PLL_RESET_N);
+            .write(base + PLL_MODE, mode | PLL_UPDATE_BYPASS);
+        arch::io_wmb();
+
+        early_println!("[qcom-sc7180-gpucc] PLL1 read MODE for RESET_N");
+        let mode = self.registers.read(base + PLL_MODE);
+        early_println!("[qcom-sc7180-gpucc] PLL1 MODE={:#010x}", mode);
+        self.registers.write(base + PLL_MODE, mode | PLL_RESET_N);
+        arch::io_wmb();
+        early_println!("[qcom-sc7180-gpucc] PLL1 configured");
     }
 
     fn configure_gmu_root(&self) -> Result<(), &'static str> {
@@ -157,6 +189,20 @@ impl Sc7180GpuCc {
             }
             time::udelay(1);
         }
+        Ok(())
+    }
+
+    fn enable_gmu_parent(&self) -> Result<(), &'static str> {
+        let mut enabled = self.enabled_gmu_parent.clock.lock();
+        if enabled.is_some() {
+            return Ok(());
+        }
+
+        let clock = self.parents.gpll0_div.clone();
+        clock
+            .prepare_enable()
+            .map_err(|_| "qcom-sc7180-gpucc: failed to enable GMU parent clock")?;
+        *enabled = Some(clock);
         Ok(())
     }
 
@@ -197,6 +243,7 @@ impl Sc7180GpuCc {
     pub fn prepare_for_gmu(&self) -> Result<(), &'static str> {
         let _guard = self.lock.lock();
         self.enable_cx()?;
+        self.enable_gmu_parent()?;
         self.configure_gmu_root()?;
         self.registers.update(
             CX_GMU_BRANCH,
@@ -235,18 +282,23 @@ impl Clk for GpuClock {
         let result = match self.id {
             GPU_CC_PLL1 => Ok(()),
             GPU_CC_CRC_AHB_CLK => self.controller.enable_branch(CRC_AHB_BRANCH, false),
-            GPU_CC_CX_GMU_CLK => self.controller.configure_gmu_root().and_then(|()| {
-                self.controller.registers.update(
-                    CX_GMU_BRANCH,
-                    CX_GMU_WAKE_SLEEP_MASK,
-                    CX_GMU_WAKE_SLEEP_VALUE,
-                );
-                self.controller.enable_branch(CX_GMU_BRANCH, true)
+            GPU_CC_CX_GMU_CLK => self.controller.enable_gmu_parent().and_then(|()| {
+                self.controller.configure_gmu_root().and_then(|()| {
+                    self.controller.registers.update(
+                        CX_GMU_BRANCH,
+                        CX_GMU_WAKE_SLEEP_MASK,
+                        CX_GMU_WAKE_SLEEP_VALUE,
+                    );
+                    self.controller.enable_branch(CX_GMU_BRANCH, true)
+                })
             }),
             GPU_CC_CX_SNOC_DVM_CLK => self.controller.enable_branch(CX_SNOC_DVM_BRANCH, false),
             GPU_CC_CXO_AON_CLK => self.controller.enable_branch(CXO_AON_BRANCH, false),
             GPU_CC_CXO_CLK => self.controller.enable_branch(CXO_BRANCH, true),
-            GPU_CC_GMU_CLK_SRC => self.controller.configure_gmu_root(),
+            GPU_CC_GMU_CLK_SRC => self
+                .controller
+                .enable_gmu_parent()
+                .and_then(|()| self.controller.configure_gmu_root()),
             _ => Err("qcom-sc7180-gpucc: unsupported clock"),
         };
         result.map_err(|_| ClkError::HardwareError)
@@ -299,6 +351,9 @@ impl Clk for GpuClock {
     fn set_rate(&self, rate: u64, parent_rate: u64) -> Result<u64, ClkError> {
         let rounded = self.round_rate(rate, parent_rate)?;
         if matches!(self.id, GPU_CC_CX_GMU_CLK | GPU_CC_GMU_CLK_SRC) {
+            self.controller
+                .enable_gmu_parent()
+                .map_err(|_| ClkError::HardwareError)?;
             self.controller
                 .configure_gmu_root()
                 .map_err(|_| ClkError::HardwareError)?;
@@ -430,11 +485,46 @@ impl PowerDomainProvider for GpuPowerDomainProvider {
 
 static CONTROLLERS: IrqSpinLock<Vec<Arc<Sc7180GpuCc>>> = IrqSpinLock::new(Vec::new());
 
-struct EnabledClocks(Vec<ClkHandle>);
+struct ParentClocks {
+    bi_tcxo: ClkHandle,
+    _gpll0_main: ClkHandle,
+    gpll0_div: ClkHandle,
+}
 
-impl Drop for EnabledClocks {
+struct EnabledClock {
+    clock: Option<ClkHandle>,
+}
+
+impl EnabledClock {
+    fn prepare(clock: ClkHandle) -> Result<Self, ClkError> {
+        clock.prepare_enable()?;
+        Ok(Self { clock: Some(clock) })
+    }
+}
+
+impl Drop for EnabledClock {
     fn drop(&mut self) {
-        for clock in self.0.iter().rev() {
+        if let Some(clock) = self.clock.take() {
+            clock.disable_unprepare();
+        }
+    }
+}
+
+struct EnabledParentClock {
+    clock: IrqSpinLock<Option<ClkHandle>>,
+}
+
+impl EnabledParentClock {
+    const fn new() -> Self {
+        Self {
+            clock: IrqSpinLock::new(None),
+        }
+    }
+}
+
+impl Drop for EnabledParentClock {
+    fn drop(&mut self) {
+        if let Some(clock) = self.clock.lock().take() {
             clock.disable_unprepare();
         }
     }
@@ -478,56 +568,57 @@ fn read_phandle(device: &PlatformDeviceInfo) -> Result<u32, &'static str> {
         .ok_or("qcom-sc7180-gpucc: missing phandle")
 }
 
-fn enable_parent_clocks(
+fn resolve_parent_clocks(
     manager: &DeviceManager,
     device: &PlatformDeviceInfo,
-) -> Result<EnabledClocks, &'static str> {
+) -> Result<ParentClocks, &'static str> {
     let Some(property) = device.property("clock-names") else {
-        return if device.property("clocks").is_some() {
-            Err("qcom-sc7180-gpucc: clocks property is missing clock-names")
+        return Err(if device.property("clocks").is_some() {
+            "qcom-sc7180-gpucc: clocks property is missing clock-names"
         } else {
-            Ok(EnabledClocks(Vec::new()))
-        };
+            "qcom-sc7180-gpucc: parent clocks are missing"
+        });
     };
     let names = property
         .as_string_list()
         .ok_or("qcom-sc7180-gpucc: malformed clock-names")?;
-    let mut parents = EnabledClocks(Vec::new());
+    let mut bi_tcxo = None;
+    let mut gpll0_main = None;
+    let mut gpll0_div = None;
     for name in names {
         let clock = match manager.resolve_clk(device, name) {
             Ok(clock) => clock,
-            // CoachZ firmware hands the always-on BI_TCXO reference to the
-            // kernel, while Scarlet does not yet expose the parent RPMh clock
-            // controller.  This is the same handoff contract used by the GCC
-            // driver.  Keep every programmable GCC parent strict below; only
-            // the immutable XO reference may be inherited.
-            Err("clk: provider not found" | "clk: clock not found") if name == "bi_tcxo" => {
-                early_println!("[qcom-sc7180-gpucc] inheriting firmware-enabled bi_tcxo parent");
-                continue;
-            }
             Err("clk: provider not found") | Err("clk: clock not found") => {
                 return scarlet::device::manager::probe_defer();
             }
             Err(error) => return Err(error),
         };
-        match clock.prepare_enable() {
-            Ok(()) => parents.0.push(clock),
-            Err(ClkError::ProviderNotFound | ClkError::ClockNotFound) => {
-                return scarlet::device::manager::probe_defer();
-            }
-            Err(_) => return Err("qcom-sc7180-gpucc: failed to enable parent clock"),
+        match name {
+            "bi_tcxo" => bi_tcxo = Some(clock),
+            "gcc_gpu_gpll0_clk_src" => gpll0_main = Some(clock),
+            "gcc_gpu_gpll0_div_clk_src" => gpll0_div = Some(clock),
+            _ => return Err("qcom-sc7180-gpucc: unsupported parent clock"),
         }
     }
-    Ok(parents)
+    Ok(ParentClocks {
+        bi_tcxo: bi_tcxo.ok_or("qcom-sc7180-gpucc: bi_tcxo parent is missing")?,
+        _gpll0_main: gpll0_main.ok_or("qcom-sc7180-gpucc: GPLL0 parent is missing")?,
+        gpll0_div: gpll0_div.ok_or("qcom-sc7180-gpucc: GPLL0-div parent is missing")?,
+    })
 }
 
 fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     PowerManager::init();
     let manager = DeviceManager::get_manager();
     let phandle = read_phandle(device)?;
-    // This guard owns every successful prepare/enable and unwinds in reverse
-    // order if a later parent cannot resolve or enable.
-    let parents = enable_parent_clocks(manager, device)?;
+    // Clock-provider registration only resolves its parent topology.  As in
+    // Linux's common-clock framework, parent votes are deferred until a
+    // consumer actually enables the derived GMU clock.
+    let parents = resolve_parent_clocks(manager, device)?;
+    let enabled_bi_tcxo = EnabledClock::prepare(parents.bi_tcxo.clone())
+        .map_err(|_| "qcom-sc7180-gpucc: failed to enable bi_tcxo parent")?;
+    early_println!("[qcom-sc7180-gpucc] bi_tcxo parent enabled");
+    early_println!("[qcom-sc7180-gpucc] GPLL0 parent votes deferred until GMU enable");
     let resource = device
         .get_resources()
         .iter()
@@ -545,13 +636,24 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         base: vm::ioremap(resource.start, resource_size)
             .map_err(|_| "qcom-sc7180-gpucc: ioremap failed")?,
     };
-    let controller = Arc::new(Sc7180GpuCc::new(mapping, phandle, parents));
+    let controller = Arc::new(Sc7180GpuCc::new(mapping, phandle, parents, enabled_bi_tcxo));
+    early_println!("[qcom-sc7180-gpucc] preflight read CX_GDSCR");
+    let cx_gdscr = controller.registers.read(CX_GDSCR);
+    early_println!("[qcom-sc7180-gpucc] preflight CX_GDSCR={:#010x}", cx_gdscr,);
+    early_println!("[qcom-sc7180-gpucc] preflight read PLL1 MODE");
+    let pll1_mode = controller.registers.read(PLL1_BASE + PLL_MODE);
+    early_println!(
+        "[qcom-sc7180-gpucc] preflight PLL1 MODE={:#010x}",
+        pll1_mode,
+    );
+    early_println!("[qcom-sc7180-gpucc] configuring PLL1");
     controller.configure_pll1();
     controller.registers.update(
         CX_GMU_BRANCH,
         CX_GMU_WAKE_SLEEP_MASK,
         CX_GMU_WAKE_SLEEP_VALUE,
     );
+    early_println!("[qcom-sc7180-gpucc] GMU wake/sleep policy configured");
 
     manager.register_clk_provider(phandle, Arc::new(GpuClockProvider::new(&controller)));
     PowerManager::register_provider(

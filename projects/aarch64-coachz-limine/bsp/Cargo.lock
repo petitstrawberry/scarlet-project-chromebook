@@ -179,6 +179,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-rpmh-rsc"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-sc7180-dispcc"
 version = "0.1.0"
 dependencies = [
@@ -218,6 +225,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-sc7180-rpmhcc"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-qcom-cmd-db",
+ "scarlet-driver-qcom-rpmh-rsc",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-sc7180-rpmhpd"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-qcom-cmd-db",
+ "scarlet-driver-qcom-rpmh-rsc",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-sc7180-tlmm"
 version = "0.1.0"
 dependencies = [
@@ -254,11 +279,14 @@ dependencies = [
  "scarlet-driver-qcom-pm8941-rtc",
  "scarlet-driver-qcom-qmp-usb3-dp",
  "scarlet-driver-qcom-qusb2-v2",
+ "scarlet-driver-qcom-rpmh-rsc",
  "scarlet-driver-qcom-sc7180-dispcc",
  "scarlet-driver-qcom-sc7180-gcc-display",
  "scarlet-driver-qcom-sc7180-gpucc",
  "scarlet-driver-qcom-sc7180-mdss",
  "scarlet-driver-qcom-sc7180-qfprom",
+ "scarlet-driver-qcom-sc7180-rpmhcc",
+ "scarlet-driver-qcom-sc7180-rpmhpd",
  "scarlet-driver-qcom-sc7180-tlmm",
  "scarlet-driver-qcom-spmi-pmic-arb",
  "scarlet-driver-ti-sn65dsi86",

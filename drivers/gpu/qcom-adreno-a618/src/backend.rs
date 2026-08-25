@@ -2,7 +2,7 @@
 
 //! Scarlet generic GPU backend for the SC7180 Adreno 618.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use scarlet::{
@@ -18,8 +18,9 @@ use scarlet::{
             GpuBackendContext, GpuBackendContextInfo, GpuBackendDialectDescriptor,
             GpuBackendDialectInfo, GpuBackendImage, GpuBackendImageInfo, GpuBackendImageLayout,
             GpuBackendLinearDisplayInfo, GpuBackendQueue, GpuBackendQueueInfo,
-            GpuBackendSubmitError, GpuBufferCreateInfo, GpuControlDevice, GpuDeviceInfo,
-            GpuDeviceState, GpuImageBackingInfo, GpuImageCreateInfo, GpuImageUploadInfo,
+            GpuBackendSubmitError, GpuBufferCreateInfo, GpuDeviceInfo, GpuDeviceState,
+            GpuImageBackingInfo, GpuImageCreateInfo, GpuImageUploadInfo,
+            register_gpu_control_device,
         },
         graphics::{GpuDisplayResource, PixelFormat},
         iommu::{DmaContext, DmaMapping, IommuDomainConfig, IommuDomainType, IommuMapFlags},
@@ -387,18 +388,18 @@ impl A618Core {
             .is_some_and(|fdt| fdt.root().model().starts_with("Google CoachZ"))
     }
 
-    fn sqe_version_is_secure(firmware: &[u8]) -> bool {
-        if firmware.len() < 12 || firmware.len() & 3 != 0 {
+    fn sqe_version_is_secure(instructions: &[u8]) -> bool {
+        if instructions.len() < 12 || instructions.len() & 3 != 0 {
             return false;
         }
-        let Some(version) = firmware
+        let Some(version) = instructions
             .get(..4)
             .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
             .map(u32::from_le_bytes)
         else {
             return false;
         };
-        let patchlevel = firmware
+        let patchlevel = instructions
             .get(8..12)
             .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
             .map(u32::from_le_bytes)
@@ -423,20 +424,106 @@ impl A618Core {
         Ok(hardware.wptr)
     }
 
+    /// Consume the shared A6xx interrupt status without confusing timestamp
+    /// completion events with execution faults.
+    ///
+    /// Linux uses `CP_CACHE_FLUSH_TS` to retire fences from this same register;
+    /// the status being non-zero is therefore not itself a device-loss signal.
+    fn consume_ring_interrupts(&self) -> Result<u32, u32> {
+        let interrupt = self.registers.read(RBBM_INT_0_STATUS);
+        if interrupt == 0 {
+            return Ok(0);
+        }
+        self.registers.write(RBBM_INT_CLEAR_CMD, interrupt);
+        let completion = interrupt & RBBM_INT_COMPLETION_MASK;
+        let fatal = (interrupt & !completion) & RBBM_INT_FATAL_MASK;
+        if fatal != 0 {
+            Err(interrupt)
+        } else {
+            Ok(interrupt)
+        }
+    }
+
+    fn log_ring_failure(
+        &self,
+        reason: &'static str,
+        target_wptr: u32,
+        interrupt: u32,
+        fence: Option<(u32, u32)>,
+    ) {
+        let rptr = self.registers.read(CP_RB_RPTR);
+        let wptr = self.registers.read(CP_RB_WPTR);
+        let status = self.registers.read(RBBM_STATUS);
+        let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
+        early_println!("[a618] ring failure={}", reason);
+        early_println!(
+            "[a618] irq={:#010x} complete={:#010x}",
+            interrupt,
+            interrupt & RBBM_INT_COMPLETION_MASK,
+        );
+        early_println!(
+            "[a618] fatal={:#010x} cp-int={:#010x}",
+            interrupt & RBBM_INT_FATAL_MASK,
+            cp_interrupt,
+        );
+        early_println!(
+            "[a618] rb rptr={:#x} wptr={:#x} target={:#x}",
+            rptr,
+            wptr,
+            target_wptr,
+        );
+        early_println!("[a618] status={:#010x}", status);
+        if cp_interrupt != 0 {
+            early_println!(
+                "[a618] cp fault={:#010x} protect={:#010x}",
+                self.registers.read(CP_HW_FAULT),
+                self.registers.read(CP_PROTECT_STATUS),
+            );
+        }
+        early_println!(
+            "[a618] ib1={:#x} rem={:#x}",
+            self.registers.read64(CP_IB1_BASE),
+            self.registers.read(CP_IB1_REM_SIZE),
+        );
+        early_println!(
+            "[a618] ib2={:#x} rem={:#x}",
+            self.registers.read64(CP_IB2_BASE),
+            self.registers.read(CP_IB2_REM_SIZE),
+        );
+        if let Some((actual, expected)) = fence {
+            early_println!("[a618] fence actual={:#x} expected={:#x}", actual, expected,);
+        }
+    }
+
     fn wait_ring_idle(&self, target_wptr: u32) -> Result<(), &'static str> {
         let start = time::current_time();
+        let mut observed_interrupts = 0;
         loop {
             if self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
             {
                 return Ok(());
             }
-            let interrupt = self.registers.read(RBBM_INT_0_STATUS);
-            if interrupt != 0 {
-                self.registers.write(RBBM_INT_CLEAR_CMD, interrupt);
-                return Err("qcom-adreno-a618: GPU fault interrupt during synchronous submit");
+            match self.consume_ring_interrupts() {
+                Ok(interrupt) => observed_interrupts |= interrupt,
+                Err(interrupt) => {
+                    observed_interrupts |= interrupt;
+                    self.log_ring_failure(
+                        "fatal interrupt during ME initialization",
+                        target_wptr,
+                        observed_interrupts,
+                        None,
+                    );
+                    return Err("qcom-adreno-a618: GPU fault interrupt during synchronous submit");
+                }
             }
             if time::current_time().saturating_sub(start) >= GPU_TIMEOUT_US {
+                self.log_ring_failure(
+                    "timeout during ME initialization",
+                    target_wptr,
+                    observed_interrupts,
+                    None,
+                );
                 return Err("qcom-adreno-a618: synchronous GPU fence timed out");
             }
             time::udelay(10);
@@ -467,20 +554,42 @@ impl A618Core {
         ring.extend_from_slice(&event);
         let target_wptr = self.write_ring(hardware, &ring)?;
         let start = time::current_time();
+        let mut observed_interrupts = 0;
         loop {
             hardware.fence.invalidate_from_device();
-            if hardware.fence.as_words().first().copied() == Some(sequence)
+            let fence_value = hardware.fence.as_words().first().copied().unwrap_or(0);
+            if fence_value == sequence
                 && self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
             {
+                if sequence == 1 {
+                    early_println!(
+                        "[a618] first submit complete irq={:#010x}",
+                        observed_interrupts,
+                    );
+                }
                 return Ok(());
             }
-            let interrupt = self.registers.read(RBBM_INT_0_STATUS);
-            if interrupt != 0 {
-                self.registers.write(RBBM_INT_CLEAR_CMD, interrupt);
-                return Err("qcom-adreno-a618: GPU fault interrupt during synchronous submit");
+            match self.consume_ring_interrupts() {
+                Ok(interrupt) => observed_interrupts |= interrupt,
+                Err(interrupt) => {
+                    observed_interrupts |= interrupt;
+                    self.log_ring_failure(
+                        "fatal interrupt during submit",
+                        target_wptr,
+                        observed_interrupts,
+                        Some((fence_value, sequence)),
+                    );
+                    return Err("qcom-adreno-a618: GPU fault interrupt during synchronous submit");
+                }
             }
             if time::current_time().saturating_sub(start) >= GPU_TIMEOUT_US {
+                self.log_ring_failure(
+                    "synchronous submit timeout",
+                    target_wptr,
+                    observed_interrupts,
+                    Some((fence_value, sequence)),
+                );
                 return Err("qcom-adreno-a618: synchronous GPU fence timed out");
             }
             time::udelay(10);
@@ -520,21 +629,50 @@ impl A618Core {
         let mut gmu = self.gmu.lock();
         gmu.ensure_ready()
             .map_err(GpuBackendSubmitError::Unavailable)?;
-        gmu.begin_gpu_boot()
-            .map_err(GpuBackendSubmitError::Unavailable)?;
+        if let Err(error) = gmu.begin_gpu_boot() {
+            let gmu_stopped = gmu.force_shutdown().is_ok();
+            hardware.quiesce_failed = !gmu_stopped;
+            hardware.boot = if gmu_stopped {
+                BootState::Cold
+            } else {
+                BootState::Lost
+            };
+            return Err(if gmu_stopped {
+                GpuBackendSubmitError::Unavailable(error)
+            } else {
+                GpuBackendSubmitError::DeviceLost(
+                    "qcom-adreno-a618: failed to quiesce GMU after GPU OOB timeout",
+                )
+            });
+        }
+        hardware.gpu_oob_held = true;
+        early_println!("[qcom-adreno-a618] GPU OOB acknowledged");
         let mut sqe_started = false;
         let preparation = (|| {
             self.dma_context
                 .restore_iommu()
                 .map_err(|_| "qcom-adreno-a618: failed to restore GPU IOMMU")?;
             let firmware = firmware::load(firmware::SQE_FIRMWARE_PATH, SQE_FIRMWARE_MAX_SIZE)?;
-            if !Self::sqe_version_is_secure(&firmware) {
-                return Err("qcom-adreno-a618: a630 SQE firmware lacks required security fixes");
-            }
             let instructions = firmware
                 .get(4..)
                 .filter(|bytes| !bytes.is_empty() && bytes.len() & 3 == 0)
                 .ok_or("qcom-adreno-a618: a630 SQE firmware has no instruction payload")?;
+            // Linux's adreno_fw_create_bo() strips the four-byte host header
+            // before both checking the SQE version and mapping the ucode.
+            if !Self::sqe_version_is_secure(instructions) {
+                return Err("qcom-adreno-a618: a630 SQE firmware lacks required security fixes");
+            }
+            let version = u32::from_le_bytes([
+                instructions[0],
+                instructions[1],
+                instructions[2],
+                instructions[3],
+            ]) & 0xfff;
+            early_println!(
+                "[qcom-adreno-a618] SQE payload bytes={} version={:#05x}",
+                instructions.len(),
+                version,
+            );
             let mut sqe =
                 DmaAllocation::new(&self.dma_context, instructions.len(), IommuMapFlags::READ)?;
             // Qualcomm firmware word 0 is a host-side version header; the CP
@@ -573,7 +711,6 @@ impl A618Core {
         match preparation {
             Ok(()) => {
                 gmu.finish_initial_boot_keep_gpu_on();
-                hardware.gpu_oob_held = true;
                 hardware.boot = BootState::Ready;
                 early_println!("[qcom-adreno-a618] SQE/ring ready in CoachZ no-zap mode");
                 Ok(())
@@ -906,7 +1043,19 @@ impl A618Backend {
 
 impl GpuBackend for A618Backend {
     fn query_info(&self) -> scarlet::device::gpu::GpuBackendInfo {
-        let ready = self.core.ensure_hardware_ready().is_ok();
+        let ready = match self.core.ensure_hardware_ready() {
+            Ok(()) => true,
+            Err(error) => {
+                let (class, detail) = match error {
+                    GpuBackendSubmitError::Rejected(detail) => ("rejected", detail),
+                    GpuBackendSubmitError::Unavailable(detail) => ("unavailable", detail),
+                    GpuBackendSubmitError::DeviceLost(detail) => ("device-lost", detail),
+                };
+                early_println!("[a618] hardware class={}", class);
+                early_println!("[a618] {}", detail);
+                false
+            }
+        };
         scarlet::device::gpu::GpuBackendInfo::new(
             GpuDeviceInfo::new(
                 if ready {
@@ -1129,11 +1278,9 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             next_resource_token: AtomicU64::new(1),
             backend_cookie,
         });
-        let control = Arc::new(GpuControlDevice::new(Arc::new(A618Backend {
+        let (device_id, gpu_name) = register_gpu_control_device(Arc::new(A618Backend {
             core: Arc::clone(&core),
-        })));
-        let device_id = DeviceManager::get_manager()
-            .register_device_with_name(String::from("qcom-adreno"), control);
+        }))?;
         let phandle = own_phandle(device).unwrap_or(0);
         GPUS.lock().push(RegisteredGpu {
             phandle,
@@ -1141,7 +1288,8 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             _core: core,
         });
         early_println!(
-            "[qcom-adreno-a618] registered lazy CoachZ GPU backend paddr={:#x}",
+            "[qcom-adreno-a618] registered lazy CoachZ GPU backend as {} paddr={:#x}",
+            gpu_name,
             resource.start,
         );
         Ok(())
@@ -1162,4 +1310,21 @@ pub(crate) fn remove(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let gpu = gpus.swap_remove(index);
     DeviceManager::get_manager().unregister_device(gpu.device_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::A618Core;
+
+    #[test]
+    fn checks_a630_sqe_version_after_the_linux_firmware_host_header() {
+        // First four bytes are the host-only word stripped by Linux's
+        // adreno_fw_create_bo().  The payload then starts with v2.07.
+        let firmware_prefix = [
+            0x00, 0x00, 0x00, 0x00, 0x07, 0xe2, 0x6e, 0x01, 0xe2, 0x20, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x01,
+        ];
+        assert!(!A618Core::sqe_version_is_secure(&firmware_prefix));
+        assert!(A618Core::sqe_version_is_secure(&firmware_prefix[4..]));
+    }
 }

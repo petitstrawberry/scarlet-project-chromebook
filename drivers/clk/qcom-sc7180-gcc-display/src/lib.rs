@@ -19,10 +19,11 @@ use scarlet::{
     arch::{self, mmio},
     device::{
         clk::{Clk, ClkError, ClkHandle, ClkProvider},
-        manager::{DeviceManager, DriverPriority},
+        manager::{DeviceManager, DriverPriority, probe_defer},
         platform::{
             PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
         },
+        power::PowerManager,
         reset::ResetController,
     },
     early_println, time, vm,
@@ -36,6 +37,8 @@ const REGISTER_WINDOW_SIZE: usize = 0x8d000;
 const GCC_DISP_AHB_BRANCH: usize = 0x0b00c;
 const GCC_DISP_HF_AXI_BRANCH: usize = 0x0b024;
 const GCC_DISP_XO_BRANCH: usize = 0x0b030;
+const GCC_GPU_CFG_AHB_BRANCH: usize = 0x71004;
+const GCC_GPU_MISC: usize = 0x71028;
 const GCC_CLOCK_VOTE: usize = 0x52000;
 
 const GCC_USB30_PRIM_GDSCR: usize = 0x0f004;
@@ -63,14 +66,16 @@ const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
         enable_mask: 1,
         rate: 200_000_000,
         halt_check: false,
+        always_on: false,
     },
     SimpleClockDescriptor {
         id: 35,
         name: "gcc_gpu_cfg_ahb_clk",
-        register: 0x71004,
+        register: GCC_GPU_CFG_AHB_BRANCH,
         enable_mask: 1,
         rate: 19_200_000,
         halt_check: true,
+        always_on: true,
     },
     SimpleClockDescriptor {
         id: 36,
@@ -79,6 +84,7 @@ const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
         enable_mask: 1 << 15,
         rate: 600_000_000,
         halt_check: false,
+        always_on: false,
     },
     SimpleClockDescriptor {
         id: 37,
@@ -87,6 +93,7 @@ const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
         enable_mask: 1 << 16,
         rate: 300_000_000,
         halt_check: false,
+        always_on: false,
     },
     SimpleClockDescriptor {
         id: 38,
@@ -95,6 +102,7 @@ const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
         enable_mask: 1,
         rate: 200_000_000,
         halt_check: false,
+        always_on: false,
     },
     SimpleClockDescriptor {
         id: 39,
@@ -103,6 +111,7 @@ const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
         enable_mask: 1,
         rate: 200_000_000,
         halt_check: true,
+        always_on: false,
     },
 ];
 
@@ -117,6 +126,7 @@ const GCC_USB3_DP_PHY_PRIM_BCR: u32 = 4;
 const GCC_USB3_PHY_PRIM_BCR: u32 = 6;
 
 const GCC_DISP_GPLL0_VOTE: u32 = 1 << 18;
+const GPU_GPLL0_ACTIVE_INPUT_DISABLE: u32 = 0x3;
 const BRANCH_ENABLE: u32 = 1;
 const BRANCH_OFF: u32 = 1 << 31;
 const GDSC_SW_COLLAPSE: u32 = 1;
@@ -245,7 +255,20 @@ fn prepare_display_clocks(registers: RegisterWindow) -> Result<(), &'static str>
     let inherited_ahb = registers.read(GCC_DISP_AHB_BRANCH);
     let inherited_hf_axi = registers.read(GCC_DISP_HF_AXI_BRANCH);
     let inherited_xo = registers.read(GCC_DISP_XO_BRANCH);
+    let inherited_gpu_cfg_ahb = registers.read(GCC_GPU_CFG_AHB_BRANCH);
+    let inherited_gpu_misc = registers.read(GCC_GPU_MISC);
 
+    // Match the ordering in Linux's SC7180 GCC probe.  The GPLL0 active input
+    // must be disconnected from the GPU before consumers vote the GPU GPLL0
+    // parents on; otherwise a collapsed GPU block can stall the subsequent
+    // GPU_CC configuration transaction.
+    registers.update_bits(
+        GCC_GPU_MISC,
+        GPU_GPLL0_ACTIVE_INPUT_DISABLE,
+        GPU_GPLL0_ACTIVE_INPUT_DISABLE,
+    );
+    enable_branch(registers, GCC_GPU_CFG_AHB_BRANCH, true)
+        .map_err(|_| "qcom-sc7180-gcc: GPU config AHB clock failed to start")?;
     registers.set_bits(GCC_CLOCK_VOTE, GCC_DISP_GPLL0_VOTE);
     registers.set_bits(GCC_DISP_AHB_BRANCH, BRANCH_ENABLE);
     registers.set_bits(GCC_DISP_XO_BRANCH, BRANCH_ENABLE);
@@ -253,11 +276,22 @@ fn prepare_display_clocks(registers: RegisterWindow) -> Result<(), &'static str>
         .map_err(|_| "qcom-sc7180-gcc: display HF-AXI clock failed to start")?;
 
     early_println!(
-        "[qcom-sc7180-gcc] display inherited: vote={:#010x} ahb={:#010x} hf-axi={:#010x} xo={:#010x}",
+        "[qcom-sc7180-gcc] handoff inherited: vote={:#010x} disp-ahb={:#010x} hf-axi={:#010x} xo={:#010x} gpu-cfg-ahb={:#010x}",
         inherited_vote,
         inherited_ahb,
         inherited_hf_axi,
         inherited_xo,
+        inherited_gpu_cfg_ahb,
+    );
+    early_println!(
+        "[qcom-sc7180-gcc] GPU MISC ready: {:#010x}->{:#010x}",
+        inherited_gpu_misc,
+        registers.read(GCC_GPU_MISC),
+    );
+    early_println!(
+        "[qcom-sc7180-gcc] GPU CFG AHB ready: {:#010x}->{:#010x}",
+        inherited_gpu_cfg_ahb,
+        registers.read(GCC_GPU_CFG_AHB_BRANCH),
     );
     Ok(())
 }
@@ -498,6 +532,7 @@ struct SimpleClockDescriptor {
     enable_mask: u32,
     rate: u64,
     halt_check: bool,
+    always_on: bool,
 }
 
 struct Sc7180GccSimpleClock {
@@ -528,6 +563,17 @@ impl Clk for Sc7180GccSimpleClock {
     }
 
     fn disable(&self) {
+        // Linux and ChromeOS force GCC_GPU_CFG_AHB_CLK on during GCC probe and
+        // intentionally do not expose it as a consumer-disableable clock.  It
+        // gates access to GPU_CC itself, so dropping a deferred GPU SMMU probe
+        // must release only the logical reference, not the hardware branch.
+        if self.descriptor.always_on {
+            early_println!(
+                "[qcom-sc7180-gcc] retaining always-on clock '{}'",
+                self.descriptor.name,
+            );
+            return;
+        }
         self.registers
             .clear_bits(self.descriptor.register, self.descriptor.enable_mask);
         arch::io_wmb();
@@ -698,6 +744,47 @@ fn node_phandle(device: &PlatformDeviceInfo) -> Result<u32, &'static str> {
         .ok_or("qcom-sc7180-gcc: missing DT phandle")
 }
 
+fn require_parent_power_domain(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+    let property = device
+        .property("power-domains")
+        .ok_or("qcom-sc7180-gcc: parent power domain is missing")?;
+    let bytes = property.value();
+    if bytes.len() < 8 || bytes.len() % 4 != 0 {
+        return Err("qcom-sc7180-gcc: malformed parent power domain");
+    }
+    let phandle = u32::from_be_bytes(
+        bytes[0..4]
+            .try_into()
+            .map_err(|_| "qcom-sc7180-gcc: malformed parent phandle")?,
+    );
+    let domain_id = u32::from_be_bytes(
+        bytes[4..8]
+            .try_into()
+            .map_err(|_| "qcom-sc7180-gcc: malformed parent domain id")?,
+    );
+    if !PowerManager::has_provider(phandle) {
+        early_println!(
+            "[qcom-sc7180-gcc] waiting for parent power provider phandle={:#x}",
+            phandle,
+        );
+        return probe_defer();
+    }
+
+    let domain = PowerManager::resolve_domain(phandle, &[domain_id])?;
+    if !domain.is_enabled() {
+        early_println!(
+            "[qcom-sc7180-gcc] waiting for parent domain '{}' vote",
+            domain.label(),
+        );
+        return probe_defer();
+    }
+    early_println!(
+        "[qcom-sc7180-gcc] parent domain '{}' is active",
+        domain.label(),
+    );
+    Ok(())
+}
+
 /// Enable only the SC7180 primary USB power domain.
 ///
 /// The DWC3 wrapper and PHY consumers enable their own clocks in Linux order;
@@ -725,6 +812,10 @@ pub fn enable_usb30_prim_gdsc() -> Result<(), &'static str> {
 }
 
 fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+    PowerManager::init();
+    // GCC is itself an SC7180 CX-domain consumer.  The RSC node follows GCC in
+    // the CoachZ FDT, so the first pass must defer before any GCC MMIO access.
+    require_parent_power_domain(device)?;
     let resource = device
         .get_resources()
         .iter()
@@ -796,6 +887,19 @@ mod tests {
         assert_eq!(GCC_QUPV3_WRAP1_S1_CMD_RCGR, 0x18148);
         assert_eq!(GCC_QUPV3_WRAP1_S1_HALT, 0x18144);
         assert_eq!(GCC_QUPV3_WRAP1_S1_VOTE, 1 << 23);
+    }
+
+    #[test]
+    fn gpu_cfg_ahb_is_the_only_always_on_gpu_clock() {
+        let always_on: alloc::vec::Vec<_> = GPU_CLOCKS
+            .iter()
+            .filter(|clock| clock.always_on)
+            .map(|clock| (clock.id, clock.name, clock.register))
+            .collect();
+        assert_eq!(
+            always_on.as_slice(),
+            &[(35, "gcc_gpu_cfg_ahb_clk", GCC_GPU_CFG_AHB_BRANCH)]
+        );
     }
 
     #[test]
