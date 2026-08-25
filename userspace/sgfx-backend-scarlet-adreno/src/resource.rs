@@ -14,6 +14,7 @@ use scarlet_os::handle::capability::memory_mapping::{MemoryMappingOps, flags, pr
 #[cfg(not(feature = "std"))]
 use std::handle::capability::memory_mapping::{MemoryMappingOps, flags, prot};
 
+use crate::Handle;
 use crate::{ContextInner, HandleError, HandleResult, Image, IrSubmitError, ir};
 
 pub(crate) struct RawImage {
@@ -56,6 +57,31 @@ impl RawImage {
             .gpu
             .create_image_with_format_and_usage(format, width, height, usage)?;
         Self::finish_create(context, raw, descriptor.format(), width, height)
+    }
+
+    fn import_sampled(
+        context: &Rc<ContextInner>,
+        handle: Handle,
+        descriptor: ir::TextureDesc,
+    ) -> HandleResult<Self> {
+        if descriptor.format() != ir::TextureFormat::Bgra8Unorm
+            || !descriptor.usage().contains(ir::TextureUsage::SAMPLED)
+            || descriptor.usage().contains(ir::TextureUsage::PRESENT)
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+        let raw = GpuImage::from_handle(handle)?;
+        let info = raw.query()?;
+        let width = descriptor.extent().width();
+        let height = descriptor.extent().height();
+        if info.format != GPU_IMAGE_FORMAT_BGRA8_UNORM
+            || info.usage & GPU_IMAGE_USAGE_SAMPLED == 0
+            || info.width != width
+            || info.height != height
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+        Self::finish_create(context, raw, ir::TextureFormat::Bgra8Unorm, width, height)
     }
 
     fn finish_create(
@@ -201,6 +227,61 @@ impl ContextResources {
             return Err(IrSubmitError::ImageAlreadyMapped);
         }
         self.images[slot] = Some(Rc::clone(&image.raw));
+        Ok(())
+    }
+
+    pub(crate) fn import_sampled_image(
+        &mut self,
+        texture: ir::TextureId,
+        handle: Handle,
+    ) -> Result<(), IrSubmitError> {
+        let reference = self.resources.texture_ref(texture)?;
+        let descriptor = self.resources.texture(reference)?;
+        let slot = reference.slot();
+        if self
+            .images
+            .get(slot)
+            .ok_or(IrSubmitError::ResourceTableMismatch)?
+            .is_some()
+        {
+            return Err(IrSubmitError::TextureAlreadyMapped);
+        }
+        let image = Rc::new(RawImage::import_sampled(&self.context, handle, descriptor)?);
+        if self
+            .images
+            .iter()
+            .flatten()
+            .any(|candidate| candidate.attachment_token == image.attachment_token)
+        {
+            let _ = self.context.raw.detach_image(&image.raw);
+            return Err(IrSubmitError::ImageAlreadyMapped);
+        }
+        self.images[slot] = Some(image);
+        Ok(())
+    }
+
+    pub(crate) fn release_imported_image(
+        &mut self,
+        texture: ir::TextureId,
+    ) -> Result<(), IrSubmitError> {
+        let reference = self.resources.texture_ref(texture)?;
+        let descriptor = self.resources.texture(reference)?;
+        if descriptor.usage().contains(ir::TextureUsage::PRESENT) {
+            return Err(IrSubmitError::Unsupported(
+                crate::UnsupportedIrFeature::ResourceState,
+            ));
+        }
+        let slot = reference.slot();
+        let image = self
+            .images
+            .get_mut(slot)
+            .ok_or(IrSubmitError::ResourceTableMismatch)?
+            .take()
+            .ok_or(IrSubmitError::ImageNotMapped)?;
+        if let Err(error) = self.context.raw.detach_image(&image.raw) {
+            self.images[slot] = Some(image);
+            return Err(error.into());
+        }
         Ok(())
     }
 

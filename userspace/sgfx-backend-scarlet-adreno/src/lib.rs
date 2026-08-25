@@ -387,6 +387,23 @@ pub struct MappedTargetSession {
 }
 
 impl MappedTargetSession {
+    /// Import a transferred shared BGRA image into a logical sampled texture.
+    pub fn import_shared_bgra_texture(
+        &mut self,
+        texture: ir::TextureId,
+        handle: Handle,
+    ) -> Result<(), IrSubmitError> {
+        self.resources.import_sampled_image(texture, handle)
+    }
+
+    /// Detach and release a previously imported sampled texture.
+    pub fn release_imported_texture(
+        &mut self,
+        texture: ir::TextureId,
+    ) -> Result<(), IrSubmitError> {
+        self.resources.release_imported_image(texture)
+    }
+
     /// Borrow the image mapped to a logical presentation target.
     pub fn image(&self, target: ir::TextureId) -> Result<ImageRef<'_>, IrSubmitError> {
         self.images
