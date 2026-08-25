@@ -18,6 +18,8 @@ const CP_MEMCPY: u8 = 0x75;
 const CP_DRAW_INDX_OFFSET: u8 = 0x38;
 const CP_LOAD_STATE6_GEOM: u8 = 0x32;
 const CP_LOAD_STATE6_FRAG: u8 = 0x34;
+const CP_SET_VISIBILITY_OVERRIDE: u8 = 0x64;
+const CP_REG_WRITE: u8 = 0x6d;
 
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
@@ -25,7 +27,8 @@ const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
 // Mesa fd6_format_table maps PIPE_FORMAT_B8G8R8A8_UNORM to WXYZ (1).
-const BGRA_COLOR_SWAP: u32 = 1 << 10;
+const A2D_BGRA_COLOR_SWAP: u32 = 1 << 10;
+const MRT_BGRA_COLOR_SWAP: u32 = 1 << 13;
 const BLIT_CHANNEL_MASK: u32 = 0xf << 20;
 const BLIT_SOLID_COLOR: u32 = 1 << 7;
 const BLIT_SCISSOR: u32 = 1 << 16;
@@ -51,10 +54,14 @@ const TPL1_A2D_SRC_TEXTURE_BASE: u32 = 0xb4c2;
 const TPL1_A2D_SRC_TEXTURE_PITCH: u32 = 0xb4c4;
 
 const GRAS_CL_VIEWPORT_XOFFSET: u32 = 0x8010;
+const GRAS_SC_CNTL: u32 = 0x80a0;
 const GRAS_SC_SCREEN_SCISSOR_TL: u32 = 0x80b0;
 const GRAS_SC_VIEWPORT_SCISSOR_TL: u32 = 0x80d0;
 const GRAS_SC_WINDOW_SCISSOR_TL: u32 = 0x80f0;
+const GRAS_SC_BIN_CNTL: u32 = 0x80a1;
+const GRAS_LRZ_CNTL: u32 = 0x8100;
 const GRAS_SU_CNTL: u32 = 0x8090;
+const RB_CNTL: u32 = 0x8800;
 const RB_RENDER_CNTL: u32 = 0x8801;
 const RB_PS_OUTPUT_CNTL: u32 = 0x880b;
 const RB_PS_MRT_CNTL: u32 = 0x880c;
@@ -64,12 +71,21 @@ const RB_MRT_BUF_INFO: u32 = 0x8822;
 const RB_MRT_PITCH: u32 = 0x8823;
 const RB_MRT_BASE: u32 = 0x8825;
 const RB_BLEND_CNTL: u32 = 0x8865;
+const RB_MODE_CNTL: u32 = 0x8811;
+const RB_WINDOW_OFFSET: u32 = 0x8890;
+const RB_LRZ_CNTL: u32 = 0x8898;
+const RB_BIN_CONTROL2: u32 = 0x88d3;
+const RB_WINDOW_OFFSET2: u32 = 0x88d4;
 const VPC_VARYING_LM_TRANSFER_CNTL_DISABLE: u32 = 0x9212;
 const VPC_VS_CNTL: u32 = 0x9301;
 const VPC_PS_CNTL: u32 = 0x9304;
+const VPC_SO_OVERRIDE: u32 = 0x9306;
+const PC_MODE_CNTL: u32 = 0x9804;
 const PC_DGEN_RAST_CNTL: u32 = 0x9981;
 const PC_VS_CNTL: u32 = 0x9b01;
 const VFD_CNTL_0: u32 = 0xa000;
+const VFD_RENDER_MODE: u32 = 0xa007;
+const VFD_MODE_CNTL: u32 = 0xa009;
 const VFD_INDEX_OFFSET: u32 = 0xa00e;
 const VFD_VERTEX_BUFFER_BASE: u32 = 0xa010;
 const VFD_VERTEX_BUFFER_SIZE: u32 = 0xa012;
@@ -93,7 +109,10 @@ const SP_PS_MRT_REG: u32 = 0xa996;
 const SP_PS_INITIAL_TEX_LOAD_CNTL: u32 = 0xa99e;
 const SP_PS_CONFIG: u32 = 0xab04;
 const SP_PS_INSTR_SIZE: u32 = 0xab05;
+const SP_MODE_CNTL: u32 = 0xab00;
 const SP_REG_PROG_ID_0: u32 = 0xb983;
+const TPL1_MODE_CNTL: u32 = 0xb309;
+const SP_UPDATE_CNTL: u32 = 0xbb08;
 
 pub(crate) struct DrawState {
     pub(crate) variant: PipelineVariant,
@@ -289,7 +308,14 @@ impl Emitter {
             0x4c00_6880,
             texture.width | (texture.height << 15),
             pitch_align | (texture.stride << 7) | (1 << 29),
-            u32::try_from(texture.plane_size >> 12).map_err(|_| CompileError::Overflow)?,
+            u32::try_from(
+                texture
+                    .plane_size
+                    .checked_add(0xfff)
+                    .ok_or(CompileError::Overflow)?
+                    >> 12,
+            )
+            .map_err(|_| CompileError::Overflow)?,
         ];
         self.push_word(type7(CP_LOAD_STATE6_FRAG, 19).map_err(|_| CompileError::InvalidPm4)?)?;
         self.extend_words(&[(1 << 14) | (4 << 18) | (1 << 22), 0, 0])?;
@@ -325,8 +351,10 @@ impl Emitter {
             return Err(CompileError::InvalidPm4);
         };
 
-        self.submission_begin()?;
-        self.packet4(RB_RENDER_CNTL, &[0x10])?; // direct/sysmem, LR_TB, CCU cache line size 2
+        self.submission_begin_3d()?;
+        // CP tracks RB_RENDER_CNTL and inserts a required hang-workaround WFI
+        // when render modes change.  A raw type-4 write bypasses that tracker.
+        self.packet7(CP_REG_WRITE, &[2, RB_RENDER_CNTL, 0x10])?;
         self.packet4(
             RB_MRT_CONTROL,
             &[
@@ -338,12 +366,15 @@ impl Emitter {
                 },
             ],
         )?;
-        self.packet4(RB_MRT_BUF_INFO, &[FORMAT_8_8_8_8_UNORM | BGRA_COLOR_SWAP])?;
+        self.packet4(
+            RB_MRT_BUF_INFO,
+            &[FORMAT_8_8_8_8_UNORM | MRT_BGRA_COLOR_SWAP],
+        )?;
         self.packet4(
             RB_MRT_PITCH,
             &[
                 draw.target.stride >> 6,
-                u32::try_from(draw.target.plane_size >> 12).map_err(|_| CompileError::Overflow)?,
+                u32::try_from(draw.target.plane_size >> 6).map_err(|_| CompileError::Overflow)?,
             ],
         )?;
         self.address_register(
@@ -486,13 +517,48 @@ impl Emitter {
         self.packet4(SP_PS_INSTR_SIZE, &[fs.sp_ps_instr_size])
     }
 
-    fn submission_begin(&mut self) -> Result<(), CompileError> {
+    fn invalidate_submission_caches(&mut self) -> Result<(), CompileError> {
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_COLOR])?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])?;
+        Ok(())
+    }
+
+    fn submission_begin_2d(&mut self) -> Result<(), CompileError> {
+        self.invalidate_submission_caches()?;
         self.wait_for_idle()?;
         self.packet4(RB_CCU_CNTL, &[0x0800_0000])?;
         self.packet4(RB_DBG_ECO_CNTL, &[0x0410_0000])?;
         self.packet7(opcode::SET_MARKER, &[12])
+    }
+
+    fn submission_begin_3d(&mut self) -> Result<(), CompileError> {
+        self.invalidate_submission_caches()?;
+        // Start every self-contained draw from the upstream A6xx restore
+        // baseline.  This backend has one synchronous context, so only state
+        // reachable by this compact sysmem stream needs to be reset here.
+        self.packet4(SP_UPDATE_CNTL, &[0x000f_ffff])?;
+        self.wait_for_idle()?;
+        self.packet4(RB_DBG_ECO_CNTL, &[0x0410_0000])?;
+        self.packet4(GRAS_SC_CNTL, &[2])?;
+        self.packet4(GRAS_LRZ_CNTL, &[0])?;
+        self.packet4(RB_LRZ_CNTL, &[0])?;
+        self.packet4(VFD_RENDER_MODE, &[0])?;
+        self.packet4(VFD_MODE_CNTL, &[3])?;
+        self.packet4(PC_MODE_CNTL, &[0x1f])?;
+        self.packet4(SP_MODE_CNTL, &[5])?;
+        self.packet4(TPL1_MODE_CNTL, &[0xa2])?;
+        self.packet4(RB_MODE_CNTL, &[0x10])?;
+        self.packet4(GRAS_SC_BIN_CNTL, &[0x00c0_0000])?;
+        self.packet4(RB_CNTL, &[0x00c0_0000])?;
+        self.packet4(RB_BIN_CONTROL2, &[0])?;
+        self.packet4(RB_WINDOW_OFFSET, &[0])?;
+        self.packet4(RB_WINDOW_OFFSET2, &[0])?;
+        // Sysmem has one rendering pass, so stream-out is not suppressed by
+        // the binning-pass override.
+        self.packet4(VPC_SO_OVERRIDE, &[0])?;
+        self.packet7(opcode::SET_MARKER, &[1])?;
+        self.packet7(CP_SET_VISIBILITY_OVERRIDE, &[1])?;
+        self.packet4(RB_CCU_CNTL, &[0x0800_0000])
     }
 
     fn submission_end(&mut self) -> Result<(), CompileError> {
@@ -543,7 +609,7 @@ impl Emitter {
     fn emit_destination(&mut self, target: Surface) -> Result<(), CompileError> {
         self.packet4(
             RB_A2D_DEST_BUFFER_INFO,
-            &[FORMAT_8_8_8_8_UNORM | BGRA_COLOR_SWAP],
+            &[FORMAT_8_8_8_8_UNORM | A2D_BGRA_COLOR_SWAP],
         )?;
         self.address_register(
             RB_A2D_DEST_BUFFER_BASE,
@@ -567,7 +633,7 @@ impl Emitter {
         area: PixelRect,
         color: Color,
     ) -> Result<(), CompileError> {
-        self.submission_begin()?;
+        self.submission_begin_2d()?;
         self.wait_for_idle()?;
         self.emit_coordinates(area, None)?;
         let [red, green, blue, alpha] = color.components();
@@ -588,7 +654,7 @@ impl Emitter {
         destination: Surface,
         destination_rect: PixelRect,
     ) -> Result<(), CompileError> {
-        self.submission_begin()?;
+        self.submission_begin_2d()?;
         self.wait_for_idle()?;
         self.packet4(
             GRAS_A2D_SRC_XMIN,
@@ -603,7 +669,7 @@ impl Emitter {
         self.emit_a2d_common(false, true)?;
         self.packet4(
             TPL1_A2D_SRC_TEXTURE_INFO,
-            &[FORMAT_8_8_8_8_UNORM | BGRA_COLOR_SWAP | SOURCE_TEXTURE_REQUIRED],
+            &[FORMAT_8_8_8_8_UNORM | A2D_BGRA_COLOR_SWAP | SOURCE_TEXTURE_REQUIRED],
         )?;
         self.packet4(
             TPL1_A2D_SRC_TEXTURE_SIZE,

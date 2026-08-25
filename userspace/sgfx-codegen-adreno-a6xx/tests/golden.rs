@@ -1,4 +1,4 @@
-use adreno_a6xx_pm4::Packets;
+use adreno_a6xx_pm4::{Header, Packets};
 use sgfx_codegen_adreno_a6xx::{
     Access, Capabilities, CompileError, CompileInput, ImageMeta, ImageModifier, ObjectId,
     ObjectRef, Operation, PipelineId, PipelineMeta, PlaneLayout, RenderPass, ResourceKind,
@@ -325,6 +325,37 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
         artifact.fixups[3].object,
         ObjectRef::CanonicalShader(_)
     ));
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(packets.iter().any(|packet| {
+        matches!(packet.header, Header::Type7 { opcode: 0x65, .. }) && packet.payload == [1]
+    }));
+    assert!(!packets.iter().any(|packet| {
+        matches!(packet.header, Header::Type7 { opcode: 0x65, .. }) && packet.payload == [12]
+    }));
+    assert!(packets.iter().any(|packet| {
+        matches!(packet.header, Header::Type7 { opcode: 0x6d, .. })
+            && packet.payload == [2, 0x8801, 0x10]
+    }));
+    assert!(packets.iter().any(|packet| {
+        matches!(
+            packet.header,
+            Header::Type4 {
+                register: 0x8822,
+                ..
+            }
+        ) && packet.payload == [0x2030]
+    }));
+    assert!(packets.iter().any(|packet| {
+        matches!(
+            packet.header,
+            Header::Type4 {
+                register: 0x8823,
+                ..
+            }
+        ) && packet.payload == [1, 16]
+    }));
 }
 
 #[test]

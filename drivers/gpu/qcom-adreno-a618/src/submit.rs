@@ -13,13 +13,16 @@ use adreno_a6xx_submit_wire::{
 };
 
 const CP_MEMCPY: u8 = 0x75;
+const CP_SET_VISIBILITY_OVERRIDE: u8 = 0x64;
+const CP_REG_WRITE: u8 = 0x6d;
 
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
-const COLOR_SWAP_WXYZ: u32 = 1 << 10;
+const A2D_COLOR_SWAP_WXYZ: u32 = 1 << 10;
+const MRT_COLOR_SWAP_WXYZ: u32 = 1 << 13;
 const RB_CCU_CNTL: u32 = 0x8e07;
 const RB_DBG_ECO_CNTL: u32 = 0x8e04;
 const RB_A2D_BLT_CNTL: u32 = 0x8c00;
@@ -42,9 +45,13 @@ const CP_LOAD_STATE6_GEOM: u8 = 0x32;
 const CP_LOAD_STATE6_FRAG: u8 = 0x34;
 const GRAS_CL_VIEWPORT_XOFFSET: u32 = 0x8010;
 const GRAS_SU_CNTL: u32 = 0x8090;
+const GRAS_SC_CNTL: u32 = 0x80a0;
 const GRAS_SC_SCREEN_SCISSOR_TL: u32 = 0x80b0;
 const GRAS_SC_VIEWPORT_SCISSOR_TL: u32 = 0x80d0;
 const GRAS_SC_WINDOW_SCISSOR_TL: u32 = 0x80f0;
+const GRAS_SC_BIN_CNTL: u32 = 0x80a1;
+const GRAS_LRZ_CNTL: u32 = 0x8100;
+const RB_CNTL: u32 = 0x8800;
 const RB_RENDER_CNTL: u32 = 0x8801;
 const RB_PS_OUTPUT_CNTL: u32 = 0x880b;
 const RB_PS_MRT_CNTL: u32 = 0x880c;
@@ -54,12 +61,21 @@ const RB_MRT_BUF_INFO: u32 = 0x8822;
 const RB_MRT_PITCH: u32 = 0x8823;
 const RB_MRT_BASE: u32 = 0x8825;
 const RB_BLEND_CNTL: u32 = 0x8865;
+const RB_MODE_CNTL: u32 = 0x8811;
+const RB_WINDOW_OFFSET: u32 = 0x8890;
+const RB_LRZ_CNTL: u32 = 0x8898;
+const RB_BIN_CONTROL2: u32 = 0x88d3;
+const RB_WINDOW_OFFSET2: u32 = 0x88d4;
 const VPC_VARYING_LM_TRANSFER_CNTL_DISABLE: u32 = 0x9212;
 const VPC_VS_CNTL: u32 = 0x9301;
 const VPC_PS_CNTL: u32 = 0x9304;
+const VPC_SO_OVERRIDE: u32 = 0x9306;
+const PC_MODE_CNTL: u32 = 0x9804;
 const PC_DGEN_RAST_CNTL: u32 = 0x9981;
 const PC_VS_CNTL: u32 = 0x9b01;
 const VFD_CNTL_0: u32 = 0xa000;
+const VFD_RENDER_MODE: u32 = 0xa007;
+const VFD_MODE_CNTL: u32 = 0xa009;
 const VFD_INDEX_OFFSET: u32 = 0xa00e;
 const VFD_VERTEX_BUFFER_BASE: u32 = 0xa010;
 const VFD_VERTEX_BUFFER_SIZE: u32 = 0xa012;
@@ -83,7 +99,10 @@ const SP_PS_MRT_REG: u32 = 0xa996;
 const SP_PS_INITIAL_TEX_LOAD_CNTL: u32 = 0xa99e;
 const SP_PS_CONFIG: u32 = 0xab04;
 const SP_PS_INSTR_SIZE: u32 = 0xab05;
+const SP_MODE_CNTL: u32 = 0xab00;
 const SP_REG_PROG_ID_0: u32 = 0xb983;
+const TPL1_MODE_CNTL: u32 = 0xb309;
+const SP_UPDATE_CNTL: u32 = 0xbb08;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AddressField {
@@ -117,7 +136,13 @@ struct ImageExpectation {
     height: u32,
     exact_extent: bool,
     pitch_align: Option<u32>,
-    array_pitch: Option<u32>,
+    array_pitch: Option<ArrayPitchExpectation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArrayPitchExpectation {
+    bytes: u64,
+    alignment: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,7 +283,9 @@ fn validate_type4(
             }
         }
         (RB_A2D_PIXEL_CNTL, 1) => exact(payload, &[0]),
-        (RB_A2D_DEST_BUFFER_INFO, 1) => exact(payload, &[FORMAT_8_8_8_8_UNORM | COLOR_SWAP_WXYZ]),
+        (RB_A2D_DEST_BUFFER_INFO, 1) => {
+            exact(payload, &[FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ])
+        }
         (RB_A2D_DEST_BUFFER_BASE, 2) => {
             address_field(addresses, packet_word + 1, ACCESS_WRITE, true, None)
         }
@@ -269,7 +296,7 @@ fn validate_type4(
         (SP_A2D_OUTPUT_INFO, 1) => exact(payload, &[(FORMAT_8_8_8_8_UNORM << 3) | (0xf << 12)]),
         (TPL1_A2D_SRC_TEXTURE_INFO, 1) => exact(
             payload,
-            &[FORMAT_8_8_8_8_UNORM | COLOR_SWAP_WXYZ | (1 << 20) | (1 << 22)],
+            &[FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ | (1 << 20) | (1 << 22)],
         ),
         (TPL1_A2D_SRC_TEXTURE_SIZE, 1) if payload[0] != 0 && payload[0] & 0xc000_0000 == 0 => {
             Ok(())
@@ -282,12 +309,29 @@ fn validate_type4(
         {
             Ok(())
         }
-        (RB_RENDER_CNTL, 1) => exact(payload, &[0x10]),
+        (GRAS_SC_CNTL, 1) => exact(payload, &[2]),
+        (GRAS_SC_BIN_CNTL | RB_CNTL, 1) => exact(payload, &[0x00c0_0000]),
+        (
+            GRAS_LRZ_CNTL | RB_LRZ_CNTL | RB_BIN_CONTROL2 | RB_WINDOW_OFFSET | RB_WINDOW_OFFSET2
+            | VPC_SO_OVERRIDE | VFD_RENDER_MODE,
+            1,
+        ) => exact(payload, &[0]),
+        (VFD_MODE_CNTL, 1) => exact(payload, &[3]),
+        (PC_MODE_CNTL, 1) => exact(payload, &[0x1f]),
+        (SP_MODE_CNTL, 1) => exact(payload, &[5]),
+        (TPL1_MODE_CNTL, 1) => exact(payload, &[0xa2]),
+        (RB_MODE_CNTL, 1) => exact(payload, &[0x10]),
+        (SP_UPDATE_CNTL, 1) => exact(payload, &[0x000f_ffff]),
         (RB_MRT_CONTROL, 2) if matches!(payload, [0x780, 0x0001_0001] | [0x783, 0x0701_0706]) => {
             Ok(())
         }
-        (RB_MRT_BUF_INFO, 1) => exact(payload, &[FORMAT_8_8_8_8_UNORM | COLOR_SWAP_WXYZ]),
-        (RB_MRT_PITCH, 2) if payload[0] != 0 && payload[0] <= 0xffff && payload[1] <= 0x7f_ffff => {
+        (RB_MRT_BUF_INFO, 1) => exact(payload, &[FORMAT_8_8_8_8_UNORM | MRT_COLOR_SWAP_WXYZ]),
+        (RB_MRT_PITCH, 2)
+            if payload[0] != 0
+                && payload[0] <= 0xffff
+                && payload[1] != 0
+                && payload[1] <= 0x1fff_ffff =>
+        {
             Ok(())
         }
         (RB_MRT_BASE, 2) => address_field(addresses, packet_word + 1, ACCESS_WRITE, false, None),
@@ -372,7 +416,9 @@ fn validate_type7(
         {
             Ok(())
         }
-        (opcode::SET_MARKER, 1) => exact(payload, &[12]),
+        (opcode::SET_MARKER, 1) if matches!(payload[0], 1 | 12) => Ok(()),
+        (CP_SET_VISIBILITY_OVERRIDE, 1) => exact(payload, &[1]),
+        (CP_REG_WRITE, 3) => exact(payload, &[2, RB_RENDER_CNTL, 0x10]),
         (opcode::BLIT, 1) => exact(payload, &[3]),
         (CP_MEMCPY, 5) if payload[0] != 0 => {
             let size = u64::from(payload[0])
@@ -435,6 +481,7 @@ fn validate_type7(
 
 #[derive(Default)]
 struct A2dState {
+    render_mode: Option<u32>,
     solid: Option<bool>,
     gras_control: Option<u32>,
     rb_control: Option<u32>,
@@ -533,10 +580,15 @@ fn validate_a2d_sequences(
                 _ => {}
             },
             Header::Type7 {
+                opcode: opcode::SET_MARKER,
+                ..
+            } => state.render_mode = packet.payload.first().copied(),
+            Header::Type7 {
                 opcode: opcode::BLIT,
                 ..
             } => {
-                if state.rb_control.is_none()
+                if state.render_mode != Some(12)
+                    || state.rb_control.is_none()
                     || state.gras_control != state.rb_control
                     || state.solid.is_none()
                     || !state.pixel_control
@@ -678,7 +730,35 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
             })
             .count()
     };
-    reg(SP_VS_CNTL_0) == Some(&[vs.sp_vs_cntl_0])
+    let type7_count = |wanted_opcode, wanted_payload: &[u32]| {
+        packets_in_segment(words, start, end)
+            .filter(|packet| {
+                matches!(packet.header, Header::Type7 { opcode, .. } if opcode == wanted_opcode)
+                    && packet.payload == wanted_payload
+            })
+            .count()
+    };
+    let last_marker = packets_in_segment(words, start, end)
+        .filter_map(|packet| {
+            matches!(
+                packet.header,
+                Header::Type7 {
+                    opcode: opcode::SET_MARKER,
+                    ..
+                }
+            )
+            .then(|| packet.payload.first().copied())
+            .flatten()
+        })
+        .last();
+    type7_count(opcode::SET_MARKER, &[1]) == 1
+        // A clear/copy before the first draw legitimately leaves an earlier
+        // BLIT2D marker in this segment.  What controls the draw is the final
+        // marker, which must select direct rendering.
+        && last_marker == Some(1)
+        && type7_count(CP_SET_VISIBILITY_OVERRIDE, &[1]) == 1
+        && type7_count(CP_REG_WRITE, &[2, RB_RENDER_CNTL, 0x10]) == 1
+        && reg(SP_VS_CNTL_0) == Some(&[vs.sp_vs_cntl_0])
         && reg(VFD_DEST_CNTL) == Some(vs.vfd_dest_cntl)
         && reg(SP_VS_OUTPUT_CNTL) == Some(&[link.sp_vs_output_cntl])
         && reg(SP_VS_OUTPUT_REG) == Some(link.sp_vs_output_reg)
@@ -874,7 +954,10 @@ fn validate_3d_sequences(
                 height: (screen[1] >> 16).saturating_add(1),
                 exact_extent: false,
                 pitch_align: None,
-                array_pitch: Some(pitch[1]),
+                array_pitch: Some(ArrayPitchExpectation {
+                    bytes: u64::from(pitch[1]) << 6,
+                    alignment: 64,
+                }),
             },
         )?;
         let (_, vertex_layout) = segment_reg(words, start, end, VFD_VERTEX_BUFFER_SIZE)
@@ -925,7 +1008,10 @@ fn validate_3d_sequences(
                     height,
                     exact_extent: true,
                     pitch_align: Some(descriptor[5] & 0xf),
-                    array_pitch: Some(descriptor[6] & 0x7f_ffff),
+                    array_pitch: Some(ArrayPitchExpectation {
+                        bytes: u64::from(descriptor[6] & 0x7f_ffff) << 12,
+                        alignment: 4096,
+                    }),
                 },
             )?;
         }
@@ -1172,9 +1258,13 @@ pub(crate) fn validate_and_relocate(
                 || expectation.pitch_align.is_some_and(|align| {
                     align != image.row_pitch.trailing_zeros().saturating_sub(6).min(15)
                 })
-                || expectation
-                    .array_pitch
-                    .is_some_and(|pitch| u64::from(pitch) != image.visible_size >> 12)
+                || expectation.array_pitch.is_some_and(|pitch| {
+                    image
+                        .visible_size
+                        .checked_add(pitch.alignment - 1)
+                        .map(|size| size & !(pitch.alignment - 1))
+                        != Some(pitch.bytes)
+                })
             {
                 return Err(
                     "qcom-adreno-a618: 3D descriptor does not match attached image metadata",
@@ -1721,6 +1811,65 @@ mod tests {
         .unwrap();
         assert!(accept_codegen(&artifact).is_ok());
 
+        // A real frame normally clears the target before its first 3D draw.
+        // The A2D marker from that clear must not make the following canonical
+        // direct-render segment ambiguous.
+        let mut clear_then_draw = operations.clone();
+        let Operation::BeginRenderPass(pass) = &mut clear_then_draw[0] else {
+            unreachable!()
+        };
+        pass.load = LoadOp::Clear(Color::rgba(0.1, 0.2, 0.3, 1.0).unwrap());
+        let clear_artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &clear_then_draw,
+        })
+        .unwrap();
+        assert!(accept_codegen(&clear_artifact).is_ok());
+
+        let mut clear_then_two_draws = clear_then_draw.to_vec();
+        clear_then_two_draws.insert(
+            clear_then_two_draws.len() - 1,
+            Operation::Draw {
+                vertex_count: 3,
+                first_vertex: 0,
+            },
+        );
+        let two_draw_artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &clear_then_two_draws,
+        })
+        .unwrap();
+        assert!(accept_codegen(&two_draw_artifact).is_ok());
+
+        let mut wrong_final_marker = clear_artifact.clone();
+        let draw_word = Packets::new(&wrong_final_marker.words)
+            .filter_map(Result::ok)
+            .find(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: super::CP_DRAW_INDX_OFFSET,
+                        ..
+                    }
+                )
+            })
+            .unwrap()
+            .word_offset as usize;
+        wrong_final_marker.words.splice(
+            draw_word..draw_word,
+            [type7(opcode::SET_MARKER, 1).unwrap(), 12],
+        );
+        for fixup in &mut wrong_final_marker.fixups {
+            if fixup.word_offset as usize >= draw_word {
+                fixup.word_offset += 2;
+            }
+        }
+        assert!(accept_codegen(&wrong_final_marker).is_err());
+
         let mut hostile = artifact.clone();
         let linkage = hostile
             .words
@@ -1939,7 +2088,7 @@ mod tests {
                 Operation::BeginRenderPass(RenderPass {
                     target: TARGET,
                     area: PixelRect::new(0, 0, 16, 16).unwrap(),
-                    load: LoadOp::Load,
+                    load: LoadOp::Clear(Color::rgba(0.05, 0.1, 0.2, 1.0).unwrap()),
                     store: StoreOp::Store,
                     depth: None,
                 }),

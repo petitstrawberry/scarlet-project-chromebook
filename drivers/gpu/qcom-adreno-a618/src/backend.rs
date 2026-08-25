@@ -118,6 +118,26 @@ enum BootState {
     Lost,
 }
 
+#[derive(Clone, Copy)]
+struct RingFailureSnapshot {
+    reason: &'static str,
+    sequence: u32,
+    command_words: usize,
+    interrupt: u32,
+    rptr: u32,
+    wptr: u32,
+    target_wptr: u32,
+    status: u32,
+    cp_interrupt: u32,
+    cp_hw_fault: u32,
+    cp_protect_status: u32,
+    ib1_base: u64,
+    ib1_remaining: u32,
+    ib2_base: u64,
+    ib2_remaining: u32,
+    fence: Option<(u32, u32)>,
+}
+
 struct HardwareState {
     boot: BootState,
     ring: DmaAllocation,
@@ -129,6 +149,8 @@ struct HardwareState {
     fence_sequence: u32,
     gpu_oob_held: bool,
     quiesce_failed: bool,
+    lost_reason: Option<&'static str>,
+    last_ring_failure: Option<RingFailureSnapshot>,
 }
 
 struct ResourceEntry {
@@ -346,6 +368,37 @@ impl A618Core {
         ] {
             registers.write(register, 1);
         }
+
+        // A618 context/errata state from the same pinned Freedreno device
+        // description used to build the canonical IR3 shader pack.  Linux
+        // leaves these non-privileged registers to userspace; Scarlet owns
+        // both sides of this backend, so establish them before CP protection
+        // and before the first command buffer can execute.
+        for (register, value) in [
+            (UCHE_UNKNOWN_0E12, 0x0000_0001),
+            (GRAS_SC_CNTL, 0x0000_0002),
+            (GRAS_DBG_ECO_CNTL, 0x0000_0880),
+            (RB_MODE_CNTL, 0x0000_0010),
+            (RB_RBP_CNTL, 0x0000_0001),
+            (RB_DBG_ECO_CNTL, 0x0410_0000),
+            (VPC_DBG_ECO_CNTL, 0x0000_0000),
+            (PC_MODE_CNTL, 0x0000_001f),
+            (PC_POWER_CNTL, 0x0000_0000),
+            (VFD_MODE_CNTL, 0x0000_0003),
+            (VFD_POWER_CNTL, 0x0000_0000),
+            (SP_GFX_USIZE, 0x0000_0000),
+            (SP_DBG_ECO_CNTL, 0x0000_0000),
+            (SP_CHICKEN_BITS, 0x0000_0430),
+            (SP_PERFCTR_SHADER_MASK, 0x0000_003f),
+            (TPL1_DBG_ECO_CNTL, 0x0010_8000),
+            (TPL1_UNKNOWN_B605, 0x0000_0044),
+            (HLSQ_SHARED_CONSTS, 0x0000_0000),
+            (HLSQ_UNKNOWN_BE00, 0x0000_0080),
+            (HLSQ_UNKNOWN_BE01, 0x0000_0000),
+            (HLSQ_DBG_ECO_CNTL, 0x0008_0000),
+        ] {
+            registers.write(register, value);
+        }
         registers.write(RBBM_VBIF_CLIENT_QOS_CNTL, 3);
         registers.write(RBBM_PERFCTR_GPU_BUSY_MASKED, u32::MAX);
         registers.write64(
@@ -444,58 +497,119 @@ impl A618Core {
         }
     }
 
-    fn log_ring_failure(
+    fn capture_ring_failure(
         &self,
         reason: &'static str,
+        sequence: u32,
+        command_words: usize,
         target_wptr: u32,
         interrupt: u32,
         fence: Option<(u32, u32)>,
-    ) {
-        let rptr = self.registers.read(CP_RB_RPTR);
-        let wptr = self.registers.read(CP_RB_WPTR);
-        let status = self.registers.read(RBBM_STATUS);
+    ) -> RingFailureSnapshot {
         let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
-        early_println!("[a618] ring failure={}", reason);
+        RingFailureSnapshot {
+            reason,
+            sequence,
+            command_words,
+            interrupt,
+            rptr: self.registers.read(CP_RB_RPTR),
+            wptr: self.registers.read(CP_RB_WPTR),
+            target_wptr,
+            status: self.registers.read(RBBM_STATUS),
+            cp_interrupt,
+            cp_hw_fault: if cp_interrupt != 0 {
+                self.registers.read(CP_HW_FAULT)
+            } else {
+                0
+            },
+            cp_protect_status: if cp_interrupt != 0 {
+                self.registers.read(CP_PROTECT_STATUS)
+            } else {
+                0
+            },
+            ib1_base: self.registers.read64(CP_IB1_BASE),
+            ib1_remaining: self.registers.read(CP_IB1_REM_SIZE),
+            ib2_base: self.registers.read64(CP_IB2_BASE),
+            ib2_remaining: self.registers.read(CP_IB2_REM_SIZE),
+            fence,
+        }
+    }
+
+    fn print_ring_failure(snapshot: RingFailureSnapshot) {
+        early_println!("[a618] ring failure={}", snapshot.reason);
+        early_println!(
+            "[a618] submit seq={} words={}",
+            snapshot.sequence,
+            snapshot.command_words,
+        );
         early_println!(
             "[a618] irq={:#010x} complete={:#010x}",
-            interrupt,
-            interrupt & RBBM_INT_COMPLETION_MASK,
+            snapshot.interrupt,
+            snapshot.interrupt & RBBM_INT_COMPLETION_MASK,
         );
         early_println!(
             "[a618] fatal={:#010x} cp-int={:#010x}",
-            interrupt & RBBM_INT_FATAL_MASK,
-            cp_interrupt,
+            snapshot.interrupt & RBBM_INT_FATAL_MASK,
+            snapshot.cp_interrupt,
         );
         early_println!(
             "[a618] rb rptr={:#x} wptr={:#x} target={:#x}",
-            rptr,
-            wptr,
-            target_wptr,
+            snapshot.rptr,
+            snapshot.wptr,
+            snapshot.target_wptr,
         );
-        early_println!("[a618] status={:#010x}", status);
-        if cp_interrupt != 0 {
+        early_println!("[a618] status={:#010x}", snapshot.status);
+        if snapshot.cp_interrupt != 0 {
             early_println!(
                 "[a618] cp fault={:#010x} protect={:#010x}",
-                self.registers.read(CP_HW_FAULT),
-                self.registers.read(CP_PROTECT_STATUS),
+                snapshot.cp_hw_fault,
+                snapshot.cp_protect_status,
             );
         }
         early_println!(
             "[a618] ib1={:#x} rem={:#x}",
-            self.registers.read64(CP_IB1_BASE),
-            self.registers.read(CP_IB1_REM_SIZE),
+            snapshot.ib1_base,
+            snapshot.ib1_remaining,
         );
         early_println!(
             "[a618] ib2={:#x} rem={:#x}",
-            self.registers.read64(CP_IB2_BASE),
-            self.registers.read(CP_IB2_REM_SIZE),
+            snapshot.ib2_base,
+            snapshot.ib2_remaining,
         );
-        if let Some((actual, expected)) = fence {
+        if let Some((actual, expected)) = snapshot.fence {
             early_println!("[a618] fence actual={:#x} expected={:#x}", actual, expected,);
         }
     }
 
-    fn wait_ring_idle(&self, target_wptr: u32) -> Result<(), &'static str> {
+    fn record_ring_failure(
+        &self,
+        hardware: &mut HardwareState,
+        reason: &'static str,
+        sequence: u32,
+        command_words: usize,
+        target_wptr: u32,
+        interrupt: u32,
+        fence: Option<(u32, u32)>,
+    ) {
+        let snapshot = self.capture_ring_failure(
+            reason,
+            sequence,
+            command_words,
+            target_wptr,
+            interrupt,
+            fence,
+        );
+        Self::print_ring_failure(snapshot);
+        hardware.last_ring_failure = Some(snapshot);
+        hardware.lost_reason = Some(reason);
+    }
+
+    fn wait_ring_idle(
+        &self,
+        hardware: &mut HardwareState,
+        target_wptr: u32,
+        command_words: usize,
+    ) -> Result<(), &'static str> {
         let start = time::current_time();
         let mut observed_interrupts = 0;
         loop {
@@ -508,8 +622,11 @@ impl A618Core {
                 Ok(interrupt) => observed_interrupts |= interrupt,
                 Err(interrupt) => {
                     observed_interrupts |= interrupt;
-                    self.log_ring_failure(
+                    self.record_ring_failure(
+                        hardware,
                         "fatal interrupt during ME initialization",
+                        0,
+                        command_words,
                         target_wptr,
                         observed_interrupts,
                         None,
@@ -518,8 +635,11 @@ impl A618Core {
                 }
             }
             if time::current_time().saturating_sub(start) >= GPU_TIMEOUT_US {
-                self.log_ring_failure(
+                self.record_ring_failure(
+                    hardware,
                     "timeout during ME initialization",
+                    0,
+                    command_words,
                     target_wptr,
                     observed_interrupts,
                     None,
@@ -534,6 +654,7 @@ impl A618Core {
         &self,
         hardware: &mut HardwareState,
         words: &[u32],
+        command_words: usize,
     ) -> Result<(), &'static str> {
         hardware.fence_sequence = hardware.fence_sequence.wrapping_add(1).max(1);
         let sequence = hardware.fence_sequence;
@@ -574,8 +695,11 @@ impl A618Core {
                 Ok(interrupt) => observed_interrupts |= interrupt,
                 Err(interrupt) => {
                     observed_interrupts |= interrupt;
-                    self.log_ring_failure(
+                    self.record_ring_failure(
+                        hardware,
                         "fatal interrupt during submit",
+                        sequence,
+                        command_words,
                         target_wptr,
                         observed_interrupts,
                         Some((fence_value, sequence)),
@@ -584,8 +708,11 @@ impl A618Core {
                 }
             }
             if time::current_time().saturating_sub(start) >= GPU_TIMEOUT_US {
-                self.log_ring_failure(
+                self.record_ring_failure(
+                    hardware,
                     "synchronous submit timeout",
+                    sequence,
+                    command_words,
                     target_wptr,
                     observed_interrupts,
                     Some((fence_value, sequence)),
@@ -596,7 +723,8 @@ impl A618Core {
         }
     }
 
-    fn quiesce_lost(&self, hardware: &mut HardwareState) {
+    fn quiesce_lost(&self, hardware: &mut HardwareState, reason: &'static str) {
+        hardware.lost_reason = Some(reason);
         if hardware.gpu_oob_held {
             let gpu_stopped = Self::force_stop_gpu(self.registers, hardware).is_ok();
             let mut gmu = self.gmu.lock();
@@ -614,8 +742,13 @@ impl A618Core {
         match hardware.boot {
             BootState::Ready => return Ok(()),
             BootState::Lost => {
+                if let Some(snapshot) = hardware.last_ring_failure {
+                    Self::print_ring_failure(snapshot);
+                }
                 return Err(GpuBackendSubmitError::DeviceLost(
-                    "qcom-adreno-a618: GPU was lost during a prior hardware operation",
+                    hardware.lost_reason.unwrap_or(
+                        "qcom-adreno-a618: GPU was lost during a prior hardware operation",
+                    ),
                 ));
             }
             BootState::Cold => {}
@@ -637,6 +770,10 @@ impl A618Core {
             } else {
                 BootState::Lost
             };
+            if !gmu_stopped {
+                hardware.lost_reason =
+                    Some("qcom-adreno-a618: failed to quiesce GMU after GPU OOB timeout");
+            }
             return Err(if gmu_stopped {
                 GpuBackendSubmitError::Unavailable(error)
             } else {
@@ -701,7 +838,7 @@ impl A618Core {
             // Secure-mode CP initialization may not write a host fence. Drain
             // the ring and hardware status exactly as the upstream path does.
             let target_wptr = self.write_ring(&mut hardware, &me_init)?;
-            self.wait_ring_idle(target_wptr)?;
+            self.wait_ring_idle(&mut hardware, target_wptr, me_init.len())?;
             // CoachZ/Trogdor deletes the zap-shader node; this is Linux's
             // canonical no-zap secure-mode exit for that exact board family.
             self.registers.write(RBBM_SECVID_TRUST_CNTL, 0);
@@ -712,6 +849,8 @@ impl A618Core {
             Ok(()) => {
                 gmu.finish_initial_boot_keep_gpu_on();
                 hardware.boot = BootState::Ready;
+                hardware.lost_reason = None;
+                hardware.last_ring_failure = None;
                 early_println!("[qcom-adreno-a618] SQE/ring ready in CoachZ no-zap mode");
                 Ok(())
             }
@@ -729,6 +868,7 @@ impl A618Core {
                     BootState::Cold
                 };
                 if sqe_started {
+                    hardware.lost_reason = Some(error);
                     Err(GpuBackendSubmitError::DeviceLost(error))
                 } else {
                     Err(GpuBackendSubmitError::Unavailable(error))
@@ -752,9 +892,9 @@ impl A618Core {
             word_count,
         ];
         let mut hardware = self.hardware.lock();
-        self.execute_ring(&mut hardware, &indirect)
+        self.execute_ring(&mut hardware, &indirect, command.as_words().len())
             .map_err(|error| {
-                self.quiesce_lost(&mut hardware);
+                self.quiesce_lost(&mut hardware, error);
                 GpuBackendSubmitError::DeviceLost(error)
             })
     }
@@ -995,7 +1135,10 @@ impl GpuBackendQueue for A618Queue {
             |token| self.context.resolve(token),
             |variant| self.context.core.resolve_shader(variant),
         )
-        .map_err(GpuBackendSubmitError::Rejected)?;
+        .map_err(|error| {
+            early_println!("[a618] submit rejected: {}", error);
+            GpuBackendSubmitError::Rejected(error)
+        })?;
         let byte_size = words.len().checked_mul(core::mem::size_of::<u32>()).ok_or(
             GpuBackendSubmitError::Rejected("qcom-adreno-a618: command byte size overflows"),
         )?;
@@ -1273,6 +1416,8 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
                 fence_sequence: 0,
                 gpu_oob_held: false,
                 quiesce_failed: false,
+                lost_reason: None,
+                last_ring_failure: None,
             }),
             resources: IrqSpinLock::new(Vec::new()),
             next_resource_token: AtomicU64::new(1),
