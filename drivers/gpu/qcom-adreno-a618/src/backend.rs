@@ -74,7 +74,7 @@ fn completion_events(fence_address: u64, sequence: u32) -> Result<[u32; 10], &'s
         (ccu_fence_address >> 32) as u32,
         sequence,
         header,
-        EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP | CP_EVENT_WRITE_IRQ,
+        EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ,
         fence_address as u32,
         (fence_address >> 32) as u32,
         sequence,
@@ -685,9 +685,11 @@ impl A618Core {
         hardware.fence.as_words_mut()[0] = 0;
         hardware.fence.as_words_mut()[1] = 0;
         hardware.fence.clean_for_device();
-        // Both events are timestamped A6xx events and therefore require the
-        // complete four-dword payload.  Keep the CCU completion in a separate
-        // word so only the final UCHE/cache event can satisfy the CPU fence.
+        // Both events require the complete four-dword addressed form.  Keep
+        // CP_EVENT_WRITE::TIMESTAMP on the CCU event and store its GPU-generated
+        // timestamp in a separate word.  The final cache event deliberately
+        // omits TIMESTAMP so A6xx writes our software sequence into the CPU
+        // fence, matching Linux's A6xx submit fence packet.
         let event = completion_events(hardware.fence.dma_addr(), sequence)?;
         let mut ring = Vec::new();
         ring.try_reserve_exact(words.len() + event.len())
@@ -1508,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_events_use_addressed_timestamp_packets() {
+    fn completion_events_use_addressed_flush_packets() {
         let events = completion_events(0x1_2345_6000, 7).unwrap();
         assert_eq!(
             events[1],
@@ -1518,10 +1520,7 @@ mod tests {
         assert_eq!(events[3], 1);
         assert_eq!(events[4], 7);
         assert_eq!(events[5], events[0]);
-        assert_eq!(
-            events[6],
-            EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP | CP_EVENT_WRITE_IRQ
-        );
+        assert_eq!(events[6], EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
         assert_eq!(events[7], 0x2345_6000);
         assert_eq!(events[8], 1);
         assert_eq!(events[9], 7);
