@@ -484,13 +484,13 @@ impl A618Core {
     /// the status being non-zero is therefore not itself a device-loss signal.
     fn consume_ring_interrupts(&self) -> Result<u32, u32> {
         let interrupt = self.registers.read(RBBM_INT_0_STATUS);
-        if interrupt == 0 {
-            return Ok(0);
+        let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
+        if interrupt != 0 {
+            self.registers.write(RBBM_INT_CLEAR_CMD, interrupt);
         }
-        self.registers.write(RBBM_INT_CLEAR_CMD, interrupt);
         let completion = interrupt & RBBM_INT_COMPLETION_MASK;
         let fatal = (interrupt & !completion) & RBBM_INT_FATAL_MASK;
-        if fatal != 0 {
+        if fatal != 0 || cp_interrupt & CP_INT_FATAL_MASK != 0 {
             Err(interrupt)
         } else {
             Ok(interrupt)
@@ -663,7 +663,7 @@ impl A618Core {
         let event = [
             type7(opcode::EVENT_WRITE, 4)
                 .map_err(|_| "qcom-adreno-a618: failed to encode kernel fence")?,
-            4,
+            4 | (1 << 31),
             hardware.fence.dma_addr() as u32,
             (hardware.fence.dma_addr() >> 32) as u32,
             sequence,
@@ -695,16 +695,26 @@ impl A618Core {
                 Ok(interrupt) => observed_interrupts |= interrupt,
                 Err(interrupt) => {
                     observed_interrupts |= interrupt;
+                    let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
+                    let reason = if cp_interrupt & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
+                        "CP illegal instruction during submit"
+                    } else {
+                        "fatal interrupt during submit"
+                    };
                     self.record_ring_failure(
                         hardware,
-                        "fatal interrupt during submit",
+                        reason,
                         sequence,
                         command_words,
                         target_wptr,
                         observed_interrupts,
                         Some((fence_value, sequence)),
                     );
-                    return Err("qcom-adreno-a618: GPU fault interrupt during synchronous submit");
+                    return Err(if cp_interrupt & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
+                        "qcom-adreno-a618: CP illegal instruction during synchronous submit"
+                    } else {
+                        "qcom-adreno-a618: GPU fault interrupt during synchronous submit"
+                    });
                 }
             }
             if time::current_time().saturating_sub(start) >= GPU_TIMEOUT_US {

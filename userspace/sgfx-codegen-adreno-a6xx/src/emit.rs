@@ -469,7 +469,11 @@ impl Emitter {
         self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
         if let Some(texture) = draw.texture {
             self.texture_descriptor(texture)?;
-            let mut sampler = [0_u32; 16];
+            // ST6_SHADER sampler units are four dwords each. Texture
+            // descriptors use sixteen dwords under ST6_CONSTANTS, but padding
+            // a sampler to that size makes CP_LOAD_STATE6 consume an invalid
+            // direct-state payload and raises CP_ILLEGAL_INSTR_ERROR.
+            let mut sampler = [0_u32; 4];
             sampler[0] = if draw.linear_sampler { 0x92a } else { 0x920 };
             self.load_direct(CP_LOAD_STATE6_FRAG, 4, 0, 1, &sampler)?;
         }

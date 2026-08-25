@@ -600,6 +600,34 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
         })
         .unwrap();
         assert_well_formed(&artifact);
+        if textured {
+            let packets = Packets::new(&artifact.words)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let texture_state = packets
+                .iter()
+                .find(|packet| {
+                    matches!(packet.header, Header::Type7 { opcode: 0x34, .. })
+                        && packet.payload.len() == 19
+                        && (packet.payload[0] >> 14) & 0x3 == 1
+                        && (packet.payload[0] >> 18) & 0xf == 4
+                        && (packet.payload[0] >> 22) & 0x3ff == 1
+                })
+                .expect("one 16-dword FS texture descriptor");
+            assert_eq!(texture_state.payload.len(), 3 + 16);
+            let sampler_state = packets
+                .iter()
+                .find(|packet| {
+                    matches!(packet.header, Header::Type7 { opcode: 0x34, .. })
+                        && packet.payload.len() == 7
+                        && (packet.payload[0] >> 14) & 0x3 == 0
+                        && (packet.payload[0] >> 18) & 0xf == 4
+                        && (packet.payload[0] >> 22) & 0x3ff == 1
+                })
+                .expect("one four-dword FS sampler descriptor");
+            let expected_sampler = if stride == 24 { 0x92a } else { 0x920 };
+            assert_eq!(&sampler_state.payload[3..], &[expected_sampler, 0, 0, 0]);
+        }
         assert_eq!(artifact.generated_objects.len(), 0);
         assert_eq!(
             artifact

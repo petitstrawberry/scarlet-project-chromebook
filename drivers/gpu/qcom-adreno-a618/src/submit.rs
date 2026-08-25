@@ -459,11 +459,11 @@ fn validate_type7(
                 AddressEncoding::GpuVa49TexDescriptor,
             )
         }
-        (CP_LOAD_STATE6_FRAG, 19)
+        (CP_LOAD_STATE6_FRAG, 7)
             if payload[0] == ((4 << 18) | (1 << 22))
                 && payload[1..3] == [0, 0]
                 && matches!(payload[3], 0x920 | 0x92a)
-                && payload[4..] == [0; 15] =>
+                && payload[4..] == [0; 3] =>
         {
             Ok(())
         }
@@ -826,7 +826,7 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
                         opcode: CP_LOAD_STATE6_FRAG,
                         ..
                     }
-                ) && p.payload.len() == 19
+                ) && p.payload.len() == 7
                     && p.payload[0] == ((4 << 18) | (1 << 22))
                     && p.payload[3] == expected
             }),
@@ -837,7 +837,7 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
                         opcode: CP_LOAD_STATE6_FRAG,
                         ..
                     }
-                ) && p.payload.len() == 19
+                ) && p.payload.len() == 7
                     && p.payload[0] & (3 << 14) == 0
                     && p.payload[0] >> 18 & 0xf == 4
             }),
@@ -2151,7 +2151,7 @@ mod tests {
                                 opcode: super::CP_LOAD_STATE6_FRAG,
                                 ..
                             }
-                        ) && packet.payload.len() == 19
+                        ) && packet.payload.len() == 7
                             && packet.payload[0] == ((4 << 18) | (1 << 22))
                     })
                     .unwrap();
@@ -2162,10 +2162,31 @@ mod tests {
                 hostile.words.splice(end..end, duplicate_packet);
                 for fixup in &mut hostile.fixups {
                     if fixup.word_offset as usize >= end {
-                        fixup.word_offset += 20;
+                        fixup.word_offset += 8;
                     }
                 }
                 assert!(accept_codegen(&hostile).is_err());
+
+                // The former emitter padded one four-dword ST6_SHADER sampler
+                // unit to sixteen dwords. It is packet-framed PM4, but not a
+                // legal CP_LOAD_STATE6 payload for a sampler and must never be
+                // blessed by the kernel validator again.
+                let mut padded_sampler = artifact.clone();
+                let mut old_packet = std::vec![
+                    type7(super::CP_LOAD_STATE6_FRAG, 19).unwrap(),
+                    (4 << 18) | (1 << 22),
+                    0,
+                    0,
+                    sampler.payload[3],
+                ];
+                old_packet.extend_from_slice(&[0; 15]);
+                padded_sampler.words.splice(begin..end, old_packet);
+                for fixup in &mut padded_sampler.fixups {
+                    if fixup.word_offset as usize >= end {
+                        fixup.word_offset += 12;
+                    }
+                }
+                assert!(accept_codegen(&padded_sampler).is_err());
 
                 let descriptor = Packets::new(&artifact.words)
                     .filter_map(Result::ok)

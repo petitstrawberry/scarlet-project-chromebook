@@ -227,6 +227,20 @@ pub(crate) const CP_RB_WPTR: usize = 0x0807;
 pub(crate) const CP_SQE_CNTL: usize = 0x0808;
 pub(crate) const CP_HW_FAULT: usize = 0x0821;
 pub(crate) const CP_INTERRUPT_STATUS: usize = 0x0823;
+pub(crate) const CP_INT_OPCODE_ERROR: u32 = 1 << 0;
+pub(crate) const CP_INT_UCODE_ERROR: u32 = 1 << 1;
+pub(crate) const CP_INT_HW_FAULT_ERROR: u32 = 1 << 2;
+pub(crate) const CP_INT_REGISTER_PROTECTION_ERROR: u32 = 1 << 4;
+pub(crate) const CP_INT_AHB_ERROR: u32 = 1 << 5;
+pub(crate) const CP_INT_VSD_PARITY_ERROR: u32 = 1 << 6;
+pub(crate) const CP_INT_ILLEGAL_INSTR_ERROR: u32 = 1 << 7;
+pub(crate) const CP_INT_FATAL_MASK: u32 = CP_INT_OPCODE_ERROR
+    | CP_INT_UCODE_ERROR
+    | CP_INT_HW_FAULT_ERROR
+    | CP_INT_REGISTER_PROTECTION_ERROR
+    | CP_INT_AHB_ERROR
+    | CP_INT_VSD_PARITY_ERROR
+    | CP_INT_ILLEGAL_INSTR_ERROR;
 pub(crate) const CP_PROTECT_STATUS: usize = 0x0824;
 pub(crate) const CP_SQE_INSTR_BASE: usize = 0x0830;
 pub(crate) const CP_ADDR_MODE_CNTL: usize = 0x0842;
@@ -342,5 +356,12 @@ mod tests {
         assert_eq!(RBBM_INT_COMPLETION_MASK & RBBM_INT_FATAL_MASK, 0);
         assert_ne!(RBBM_INT_FATAL_MASK & RBBM_INT_CP_HW_ERROR, 0);
         assert_ne!(RBBM_INT_FATAL_MASK & RBBM_INT_RBBM_HANG_DETECT, 0);
+    }
+
+    #[test]
+    fn every_a6xx_cp_error_bit_is_fatal() {
+        assert_eq!(CP_INT_FATAL_MASK, 0x0000_00f7);
+        assert_ne!(CP_INT_FATAL_MASK & CP_INT_ILLEGAL_INSTR_ERROR, 0);
+        assert_eq!(CP_INT_FATAL_MASK & (1 << 3), 0);
     }
 }
