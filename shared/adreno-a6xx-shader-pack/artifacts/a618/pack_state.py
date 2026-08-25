@@ -26,6 +26,19 @@ d = json.loads((ROOT / "mesa-metadata.json").read_text())
 variants = {v["name"]: v for v in d["variants"]}
 INVALID = 0xfc  # regid(63, 0)
 
+def xs_config(v):
+    """Pack A6XX_SP_xS_CONFIG for this non-bindless shader pack."""
+    assert v["pvtmem_size"] == 0
+    assert v["num_samp"] in (0, 1)
+    assert not v["has_tex"] or v["num_samp"]
+    assert not v["has_samp"] or v["num_samp"]
+    return 0x100 | (v["num_samp"] << 9) | (v["num_samp"] << 17)
+
+def const_config(v):
+    """Pack A6XX_SP_xS_CONST_CONFIG (CONSTLEN is encoded in vec4 groups)."""
+    assert v["constlen"] % 4 == 0
+    return 0x100 | (v["constlen"] >> 2)
+
 def xs_state(v):
     full = v["max_reg"] + 1
     half = v["max_half_reg"] + 1
@@ -40,8 +53,13 @@ def xs_state(v):
             if not x["sysval"]:
                 loc = x["slot"] - 15  # VERT_ATTRIB_GENERIC0
                 vfd[loc] = x["compmask"] | (x["regid"] << 4)
+        assert not any(x["sysval"] for x in v["inputs"])
         return {"sp_vs_cntl_0": cntl0, "sp_vs_instr_size": instr,
-                "vfd_dest_cntl": vfd}
+                "sp_vs_const_config": const_config(v),
+                "sp_vs_config": xs_config(v),
+                "vfd_dest_cntl": vfd,
+                "vfd_cntl_1_6": [0xfcfcfcfc, 0x0000fcfc, 0xfcfcfcfc,
+                                  0x000000fc, 0x0000fcfc, 0]}
 
     cntl0 = ((half << 1) | (full << 7) | (branch << 13) |
              ((1 if v["threadsize"] == 128 else 0) << 20) |
@@ -72,7 +90,16 @@ def xs_state(v):
                       (int(v["writes_pos"]) << 1) |
                       (int(v["writes_smask"]) << 2) |
                       (int(v["writes_stencilref"]) << 3))
+    has_ij = ij != INVALID
     return {"sp_ps_cntl_0": cntl0, "sp_ps_instr_size": v["instrlen"],
+            "sp_ps_const_config": const_config(v),
+            "sp_ps_config": xs_config(v),
+            "sp_ps_wave_cntl": int(v["threadsize"] == 128) |
+                               (int(bool(v["total_in"])) << 1),
+            "gras_cl_interp_cntl": int(has_ij),
+            "rb_interp_cntl": int(has_ij) |
+                              (int(bool(v["total_in"])) << 10),
+            "rb_ps_input_cntl": 0,
             "sp_ps_initial_tex_load_cntl": initial,
             "sp_ps_initial_tex_load_cmd": cmds,
             "sp_reg_prog_id": [prog0, prog1, prog2, prog3],

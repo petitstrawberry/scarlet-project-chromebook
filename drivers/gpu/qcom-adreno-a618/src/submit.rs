@@ -42,37 +42,84 @@ const TPL1_A2D_SRC_TEXTURE_PITCH: u32 = 0xb4c4;
 const CP_DRAW_INDX_OFFSET: u8 = 0x38;
 const CP_LOAD_STATE6_GEOM: u8 = 0x32;
 const CP_LOAD_STATE6_FRAG: u8 = 0x34;
+const GRAS_CL_CNTL: u32 = 0x8000;
+const GRAS_CL_VS_CLIP_CULL_DISTANCE: u32 = 0x8001;
+const GRAS_CL_ARRAY_SIZE: u32 = 0x8004;
+const GRAS_CL_INTERP_CNTL: u32 = 0x8005;
+const GRAS_CL_GUARDBAND_CLIP_ADJ: u32 = 0x8006;
 const GRAS_CL_VIEWPORT_XOFFSET: u32 = 0x8010;
 const GRAS_SU_CNTL: u32 = 0x8090;
+const GRAS_SU_POINT_MINMAX: u32 = 0x8091;
+const GRAS_SU_POINT_SIZE: u32 = 0x8092;
+const GRAS_SU_DEPTH_PLANE_CNTL: u32 = 0x8094;
+const GRAS_SU_POLY_OFFSET_SCALE: u32 = 0x8095;
+const GRAS_SU_DEPTH_BUFFER_INFO: u32 = 0x8098;
+const GRAS_SU_VS_SIV_CNTL: u32 = 0x809b;
 const GRAS_SC_CNTL: u32 = 0x80a0;
+const GRAS_SC_RAS_MSAA_CNTL: u32 = 0x80a2;
+const GRAS_SC_SCREEN_SCISSOR_CNTL: u32 = 0x80af;
 const GRAS_SC_SCREEN_SCISSOR_TL: u32 = 0x80b0;
 const GRAS_SC_VIEWPORT_SCISSOR_TL: u32 = 0x80d0;
 const GRAS_SC_WINDOW_SCISSOR_TL: u32 = 0x80f0;
 const GRAS_SC_BIN_CNTL: u32 = 0x80a1;
 const GRAS_LRZ_CNTL: u32 = 0x8100;
+const GRAS_LRZ_PS_INPUT_CNTL: u32 = 0x8101;
+const GRAS_LRZ_MRT_BUFFER_INFO_0: u32 = 0x8102;
+const GRAS_LRZ_PS_SAMPLEFREQ_CNTL: u32 = 0x8109;
+const GRAS_SU_DEPTH_CNTL: u32 = 0x8114;
+const GRAS_SU_STENCIL_CNTL: u32 = 0x8115;
 const RB_CNTL: u32 = 0x8800;
 const RB_RENDER_CNTL: u32 = 0x8801;
+const RB_RAS_MSAA_CNTL: u32 = 0x8802;
+const RB_INTERP_CNTL: u32 = 0x8809;
+const RB_PS_INPUT_CNTL: u32 = 0x880a;
 const RB_PS_OUTPUT_CNTL: u32 = 0x880b;
 const RB_PS_MRT_CNTL: u32 = 0x880c;
 const RB_PS_OUTPUT_MASK: u32 = 0x880d;
+const RB_DITHER_CNTL: u32 = 0x880e;
+const RB_SRGB_CNTL: u32 = 0x880f;
+const RB_PS_SAMPLEFREQ_CNTL: u32 = 0x8810;
 const RB_MRT_CONTROL: u32 = 0x8820;
 const RB_MRT_BUF_INFO: u32 = 0x8822;
 const RB_MRT_PITCH: u32 = 0x8823;
 const RB_MRT_BASE: u32 = 0x8825;
+const RB_MRT_BASE_GMEM: u32 = 0x8827;
+const RB_ALPHA_TEST_CNTL: u32 = 0x8864;
 const RB_BLEND_CNTL: u32 = 0x8865;
+const RB_DEPTH_PLANE_CNTL: u32 = 0x8870;
+const RB_DEPTH_CNTL: u32 = 0x8871;
+const RB_DEPTH_BUFFER_INFO: u32 = 0x8872;
+const RB_DEPTH_BOUND_MIN: u32 = 0x8878;
+const RB_STENCIL_CNTL: u32 = 0x8880;
+const RB_STENCIL_BUFFER_INFO: u32 = 0x8881;
+const RB_STENCIL_REF_CNTL: u32 = 0x8887;
+const RB_STENCIL_MASK: u32 = 0x8888;
 const RB_MODE_CNTL: u32 = 0x8811;
 const RB_WINDOW_OFFSET: u32 = 0x8890;
 const RB_LRZ_CNTL: u32 = 0x8898;
 const RB_BIN_CONTROL2: u32 = 0x88d3;
 const RB_WINDOW_OFFSET2: u32 = 0x88d4;
+const RB_RESOLVE_GMEM_BUFFER_INFO: u32 = 0x88d5;
+const RB_COLOR_FLAG_BUFFER_ADDR: u32 = 0x8903;
+const VPC_RAST_CNTL: u32 = 0x9108;
+const VPC_VARYING_INTERP_MODE: u32 = 0x9200;
+const VPC_VARYING_REPLACE_MODE: u32 = 0x9208;
 const VPC_VARYING_LM_TRANSFER_CNTL_DISABLE: u32 = 0x9212;
+const VPC_VS_CLIP_CULL_CNTL: u32 = 0x9101;
+const VPC_VS_SIV_CNTL: u32 = 0x9104;
 const VPC_VS_CNTL: u32 = 0x9301;
 const VPC_PS_CNTL: u32 = 0x9304;
 const VPC_SO_OVERRIDE: u32 = 0x9306;
+const VPC_VS_CLIP_CULL_CNTL_V2: u32 = 0x9311;
+const VPC_VS_SIV_CNTL_V2: u32 = 0x9314;
 const PC_MODE_CNTL: u32 = 0x9804;
+const PC_PS_CNTL: u32 = 0x9806;
 const PC_DGEN_RAST_CNTL: u32 = 0x9981;
+const PC_CNTL: u32 = 0x9b00;
 const PC_VS_CNTL: u32 = 0x9b01;
+const PC_STEREO_RENDERING_CNTL: u32 = 0x9b07;
 const VFD_CNTL_0: u32 = 0xa000;
+const VFD_CNTL_1: u32 = 0xa001;
 const VFD_RENDER_MODE: u32 = 0xa007;
 const VFD_MODE_CNTL: u32 = 0xa009;
 const VFD_INDEX_OFFSET: u32 = 0xa00e;
@@ -84,24 +131,43 @@ const SP_VS_CNTL_0: u32 = 0xa800;
 const SP_VS_OUTPUT_CNTL: u32 = 0xa802;
 const SP_VS_OUTPUT_REG: u32 = 0xa803;
 const SP_VS_VPC_DEST_REG: u32 = 0xa813;
+const SP_VS_PROGRAM_COUNTER_OFFSET: u32 = 0xa81b;
 const SP_VS_BASE: u32 = 0xa81c;
+const SP_VS_PVT_MEM_PARAM: u32 = 0xa81e;
 const SP_VS_CONFIG: u32 = 0xa823;
 const SP_VS_INSTR_SIZE: u32 = 0xa824;
+const SP_VS_PVT_MEM_STACK_OFFSET: u32 = 0xa825;
+const SP_HS_CONFIG: u32 = 0xa83b;
+const SP_DS_CONFIG: u32 = 0xa863;
+const SP_GS_CONFIG: u32 = 0xa894;
 const SP_PS_CNTL_0: u32 = 0xa980;
+const SP_PS_PROGRAM_COUNTER_OFFSET: u32 = 0xa982;
 const SP_PS_BASE: u32 = 0xa983;
+const SP_PS_PVT_MEM_PARAM: u32 = 0xa985;
 const SP_BLEND_CNTL: u32 = 0xa989;
+const SP_SRGB_CNTL: u32 = 0xa98a;
 const SP_PS_OUTPUT_MASK: u32 = 0xa98b;
 const SP_PS_OUTPUT_CNTL: u32 = 0xa98c;
 const SP_PS_MRT_CNTL: u32 = 0xa98d;
 const SP_PS_OUTPUT_REG: u32 = 0xa98e;
 const SP_PS_MRT_REG: u32 = 0xa996;
 const SP_PS_INITIAL_TEX_LOAD_CNTL: u32 = 0xa99e;
+const SP_PS_PVT_MEM_STACK_OFFSET: u32 = 0xa9a9;
 const SP_PS_CONFIG: u32 = 0xab04;
 const SP_PS_INSTR_SIZE: u32 = 0xab05;
 const SP_MODE_CNTL: u32 = 0xab00;
+const SP_GFX_USIZE: u32 = 0xab20;
+const SP_VS_CONST_CONFIG: u32 = 0xb800;
+const SP_PS_WAVE_CNTL: u32 = 0xb980;
+const SP_LB_PARAM_LIMIT: u32 = 0xb982;
 const SP_REG_PROG_ID_0: u32 = 0xb983;
+const TPL1_RAS_MSAA_CNTL: u32 = 0xb300;
+const TPL1_MSAA_SAMPLE_POS_CNTL: u32 = 0xb304;
+const TPL1_WINDOW_OFFSET: u32 = 0xb307;
 const TPL1_MODE_CNTL: u32 = 0xb309;
+const SP_WINDOW_OFFSET: u32 = 0xb4d1;
 const SP_UPDATE_CNTL: u32 = 0xbb08;
+const SP_PS_CONST_CONFIG: u32 = 0xbb10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AddressField {
@@ -239,12 +305,21 @@ fn any_shader_payload(register: u32, payload: &[u32]) -> bool {
             ShaderMeta::Vertex(meta) => match register {
                 SP_VS_CNTL_0 => payload == [meta.sp_vs_cntl_0],
                 SP_VS_INSTR_SIZE => payload == [meta.sp_vs_instr_size],
+                SP_VS_CONST_CONFIG => payload == [meta.sp_vs_const_config, 0, 0, 0],
+                SP_VS_CONFIG => payload == [meta.sp_vs_config],
+                VFD_CNTL_1 => payload == meta.vfd_cntl_1_6,
                 VFD_DEST_CNTL => payload == meta.vfd_dest_cntl,
                 _ => false,
             },
             ShaderMeta::Fragment(meta) => match register {
                 SP_PS_CNTL_0 => payload == [meta.sp_ps_cntl_0],
                 SP_PS_INSTR_SIZE => payload == [meta.sp_ps_instr_size],
+                SP_PS_CONST_CONFIG => payload == [meta.sp_ps_const_config],
+                SP_PS_CONFIG => payload == [meta.sp_ps_config],
+                SP_PS_WAVE_CNTL => payload == [meta.sp_ps_wave_cntl],
+                GRAS_CL_INTERP_CNTL => payload == [meta.gras_cl_interp_cntl],
+                RB_INTERP_CNTL => payload == [meta.rb_interp_cntl],
+                RB_PS_INPUT_CNTL => payload == [meta.rb_ps_input_cntl],
                 SP_PS_INITIAL_TEX_LOAD_CNTL => {
                     payload.first() == Some(&meta.initial_tex_load_cntl)
                         && payload.get(1..) == Some(meta.initial_tex_load_cmd)
@@ -311,17 +386,71 @@ fn validate_type4(
         (GRAS_SC_CNTL, 1) => exact(payload, &[2]),
         (GRAS_SC_BIN_CNTL | RB_CNTL, 1) => exact(payload, &[0x00c0_0000]),
         (
-            GRAS_LRZ_CNTL | RB_LRZ_CNTL | RB_BIN_CONTROL2 | RB_WINDOW_OFFSET | RB_WINDOW_OFFSET2
-            | VPC_SO_OVERRIDE | VFD_RENDER_MODE,
+            GRAS_LRZ_CNTL
+            | RB_LRZ_CNTL
+            | RB_BIN_CONTROL2
+            | RB_WINDOW_OFFSET
+            | RB_WINDOW_OFFSET2
+            | RB_RESOLVE_GMEM_BUFFER_INFO
+            | SP_WINDOW_OFFSET
+            | TPL1_WINDOW_OFFSET
+            | GRAS_SC_SCREEN_SCISSOR_CNTL
+            | VFD_RENDER_MODE
+            | GRAS_CL_ARRAY_SIZE
+            | GRAS_CL_VS_CLIP_CULL_DISTANCE
+            | GRAS_SU_DEPTH_BUFFER_INFO
+            | GRAS_SU_VS_SIV_CNTL
+            | GRAS_SU_DEPTH_CNTL
+            | GRAS_SU_STENCIL_CNTL
+            | GRAS_LRZ_PS_INPUT_CNTL
+            | GRAS_LRZ_PS_SAMPLEFREQ_CNTL
+            | RB_PS_SAMPLEFREQ_CNTL
+            | RB_DITHER_CNTL
+            | RB_SRGB_CNTL
+            | RB_MRT_BASE_GMEM
+            | RB_ALPHA_TEST_CNTL
+            | RB_DEPTH_PLANE_CNTL
+            | RB_DEPTH_CNTL
+            | RB_STENCIL_CNTL
+            | RB_STENCIL_BUFFER_INFO
+            | RB_STENCIL_REF_CNTL
+            | PC_PS_CNTL
+            | PC_CNTL
+            | PC_STEREO_RENDERING_CNTL
+            | SP_SRGB_CNTL
+            | SP_VS_PROGRAM_COUNTER_OFFSET
+            | SP_VS_PVT_MEM_STACK_OFFSET
+            | SP_PS_PROGRAM_COUNTER_OFFSET
+            | SP_PS_PVT_MEM_STACK_OFFSET
+            | SP_GFX_USIZE,
             1,
         ) => exact(payload, &[0]),
         (VFD_MODE_CNTL, 1) => exact(payload, &[3]),
+        (VPC_SO_OVERRIDE, 1) => exact(payload, &[1]),
         (PC_MODE_CNTL, 1) => exact(payload, &[0x1f]),
         (SP_MODE_CNTL, 1) => exact(payload, &[5]),
         (TPL1_MODE_CNTL, 1) => exact(payload, &[0xa2]),
         (RB_MODE_CNTL, 1) => exact(payload, &[0x10]),
-        (SP_UPDATE_CNTL, 1) => exact(payload, &[0x000f_ffff]),
-        (RB_MRT_CONTROL, 2) if matches!(payload, [0x780, 0x0001_0001] | [0x783, 0x0701_0706]) => {
+        (SP_UPDATE_CNTL, 1) => exact(payload, &[0x0000_00ff]),
+        (SP_HS_CONFIG | SP_DS_CONFIG | SP_GS_CONFIG, 1) => exact(payload, &[0]),
+        (SP_VS_PVT_MEM_PARAM | SP_PS_PVT_MEM_PARAM, 4) => exact(payload, &[0; 4]),
+        (SP_LB_PARAM_LIMIT, 1) => exact(payload, &[7]),
+        (GRAS_CL_CNTL, 1) => exact(payload, &[0x80]),
+        (GRAS_CL_GUARDBAND_CLIP_ADJ, 1) if payload[0] & !(0x1ff | (0x1ff << 10)) == 0 => Ok(()),
+        (GRAS_SU_POINT_MINMAX, 1) => exact(payload, &[0x0010_0010]),
+        (GRAS_SU_POINT_SIZE, 1) => exact(payload, &[0x10]),
+        (GRAS_SU_POLY_OFFSET_SCALE, 3) => exact(payload, &[0; 3]),
+        (GRAS_SU_DEPTH_PLANE_CNTL, 1) => exact(payload, &[0]),
+        (GRAS_LRZ_MRT_BUFFER_INFO_0, 1) => exact(payload, &[FORMAT_8_8_8_8_UNORM]),
+        (TPL1_RAS_MSAA_CNTL, 2) => exact(payload, &[0, 4]),
+        (GRAS_SC_RAS_MSAA_CNTL | RB_RAS_MSAA_CNTL, 3) => exact(payload, &[0, 4, 0]),
+        (TPL1_MSAA_SAMPLE_POS_CNTL, 1) => exact(payload, &[0]),
+        (RB_DEPTH_BUFFER_INFO, 6) => exact(payload, &[0; 6]),
+        (RB_DEPTH_BOUND_MIN, 2) => exact(payload, &[0, 1.0_f32.to_bits()]),
+        (RB_STENCIL_MASK, 2) => exact(payload, &[0, 0]),
+        (RB_COLOR_FLAG_BUFFER_ADDR, 3) => exact(payload, &[0; 3]),
+        (VPC_VARYING_INTERP_MODE | VPC_VARYING_REPLACE_MODE, 8) => exact(payload, &[0; 8]),
+        (RB_MRT_CONTROL, 2) if matches!(payload, [0x7e0, 0x0001_0001] | [0x7e3, 0x0701_0706]) => {
             Ok(())
         }
         (RB_MRT_BUF_INFO, 1) => exact(payload, &[FORMAT_8_8_8_8_UNORM | MRT_COLOR_SWAP_WXYZ]),
@@ -334,8 +463,8 @@ fn validate_type4(
             Ok(())
         }
         (RB_MRT_BASE, 2) => address_field(addresses, packet_word + 1, ACCESS_WRITE, false, None),
-        (RB_BLEND_CNTL, 1) if matches!(payload[0], 0x0001_0100 | 0x0001_0101) => Ok(()),
-        (SP_BLEND_CNTL, 1) if matches!(payload[0], 0x100 | 0x101) => Ok(()),
+        (RB_BLEND_CNTL, 1) if matches!(payload[0], 0xffff_0000 | 0xffff_0001) => Ok(()),
+        (SP_BLEND_CNTL, 1) if matches!(payload[0], 0 | 1) => Ok(()),
         (SP_PS_MRT_CNTL | RB_PS_MRT_CNTL, 1) => exact(payload, &[1]),
         (SP_PS_MRT_REG, 1) => exact(payload, &[FORMAT_8_8_8_8_UNORM]),
         (GRAS_CL_VIEWPORT_XOFFSET, 6) => Ok(()),
@@ -344,12 +473,13 @@ fn validate_type4(
             2,
         ) => Ok(()),
         (GRAS_SU_CNTL, 1) if payload[0] & !0x2017 == 0 && payload[0] & 0x2010 == 0x2010 => Ok(()),
-        (PC_DGEN_RAST_CNTL, 1) => exact(payload, &[3]),
+        (VPC_RAST_CNTL | PC_DGEN_RAST_CNTL, 1) => exact(payload, &[3]),
         (VFD_CNTL_0, 1)
             if payload[0] & 0xffff_0000 == 0 && payload[0] & 0xff == payload[0] >> 8 =>
         {
             Ok(())
         }
+        (VFD_CNTL_1, 6) if any_shader_payload(register, payload) => Ok(()),
         (VFD_INDEX_OFFSET, 2) => exact(&payload[1..], &[0]),
         (VFD_VERTEX_BUFFER_BASE, 2) => {
             address_field(addresses, packet_word + 1, ACCESS_READ, false, None)
@@ -373,8 +503,16 @@ fn validate_type4(
         (
             SP_VS_CNTL_0
             | SP_VS_INSTR_SIZE
+            | SP_VS_CONST_CONFIG
+            | SP_VS_CONFIG
             | SP_PS_CNTL_0
             | SP_PS_INSTR_SIZE
+            | SP_PS_CONST_CONFIG
+            | SP_PS_CONFIG
+            | SP_PS_WAVE_CNTL
+            | GRAS_CL_INTERP_CNTL
+            | RB_INTERP_CNTL
+            | RB_PS_INPUT_CNTL
             | SP_PS_INITIAL_TEX_LOAD_CNTL
             | SP_REG_PROG_ID_0
             | SP_PS_OUTPUT_CNTL
@@ -387,8 +525,8 @@ fn validate_type4(
         (SP_VS_OUTPUT_CNTL | VPC_VS_CNTL | VPC_PS_CNTL | PC_VS_CNTL, 1) => Ok(()),
         (SP_VS_OUTPUT_REG | SP_VS_VPC_DEST_REG, count) if count <= 2 => Ok(()),
         (VPC_VARYING_LM_TRANSFER_CNTL_DISABLE, 4) => Ok(()),
-        (SP_VS_CONFIG, 1) => exact(payload, &[0x100]),
-        (SP_PS_CONFIG, 1) if matches!(payload[0], 0x100 | 0x10101) => Ok(()),
+        (VPC_VS_CLIP_CULL_CNTL | VPC_VS_CLIP_CULL_CNTL_V2, 1) => exact(payload, &[0x00ff_ff00]),
+        (VPC_VS_SIV_CNTL | VPC_VS_SIV_CNTL_V2, 1) => exact(payload, &[0x0000_ffff]),
         (SP_VS_BASE, 2) => {
             canonical_address_field(addresses, packet_word + 1, ShaderVariant::VsStride16Pos2)
         }
@@ -426,6 +564,28 @@ fn validate_type7(
             address_field(addresses, packet_word + 2, ACCESS_READ, false, Some(size))?;
             address_field(addresses, packet_word + 4, ACCESS_WRITE, false, Some(size))
         }
+        (CP_LOAD_STATE6_GEOM, 3)
+            if payload[0] == ((2 << 16) | (8 << 18) | (1 << 22)) && payload[1..3] == [0, 0] =>
+        {
+            address_field(
+                addresses,
+                packet_word + 2,
+                ACCESS_READ,
+                false,
+                Some(adreno_a6xx_shader_pack::SHADER_SIZE as u64),
+            )
+        }
+        (CP_LOAD_STATE6_FRAG, 3)
+            if payload[0] == ((2 << 16) | (12 << 18) | (1 << 22)) && payload[1..3] == [0, 0] =>
+        {
+            address_field(
+                addresses,
+                packet_word + 2,
+                ACCESS_READ,
+                false,
+                Some(adreno_a6xx_shader_pack::SHADER_SIZE as u64),
+            )
+        }
         (CP_LOAD_STATE6_GEOM, 23)
             if payload[0] == ((1 << 14) | (8 << 18) | (5 << 22)) && payload[1..3] == [0, 0] =>
         {
@@ -443,7 +603,7 @@ fn validate_type7(
                 && payload[4] & 0xc000_0000 == 0
                 && payload[4] & 0x7fff != 0
                 && (payload[4] >> 15) & 0x7fff != 0
-                && payload[5] & 0x70 == 0
+                && payload[5] & 0x7f == 0
                 && payload[5] >> 29 == 1
                 && payload[6] & !0x007f_ffff == 0
                 && payload[8] == (1 << 17)
@@ -461,8 +621,7 @@ fn validate_type7(
         (CP_LOAD_STATE6_FRAG, 7)
             if payload[0] == ((4 << 18) | (1 << 22))
                 && payload[1..3] == [0, 0]
-                && matches!(payload[3], 0x920 | 0x92a)
-                && payload[4..] == [0; 3] =>
+                && matches!(&payload[3..], [0x920, 0x40, 0, 0] | [0x92a, 0x40, 0x20, 0]) =>
         {
             Ok(())
         }
@@ -757,26 +916,64 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
         && last_marker == Some(1)
         && type7_count(CP_SET_VISIBILITY_OVERRIDE, &[1]) == 1
         && type7_count(CP_REG_WRITE, &[2, RB_RENDER_CNTL, 0x10]) == 1
+        && reg(SP_UPDATE_CNTL) == Some(&[0x0000_00ff])
+        && reg(GRAS_SC_CNTL) == Some(&[2])
+        && reg(GRAS_SC_BIN_CNTL) == Some(&[0x00c0_0000])
+        && reg(RB_CNTL) == Some(&[0x00c0_0000])
+        && reg(RB_MODE_CNTL) == Some(&[0x10])
+        && reg(RB_BIN_CONTROL2) == Some(&[0])
+        && reg(RB_WINDOW_OFFSET) == Some(&[0])
+        && reg(RB_WINDOW_OFFSET2) == Some(&[0])
+        && reg(SP_WINDOW_OFFSET) == Some(&[0])
+        && reg(TPL1_WINDOW_OFFSET) == Some(&[0])
+        && reg(GRAS_SC_SCREEN_SCISSOR_CNTL) == Some(&[0])
+        && reg(VPC_SO_OVERRIDE) == Some(&[1])
+        && reg(PC_STEREO_RENDERING_CNTL) == Some(&[0])
         && reg(SP_VS_CNTL_0) == Some(&[vs.sp_vs_cntl_0])
+        && reg(SP_VS_CONST_CONFIG) == Some(&[vs.sp_vs_const_config, 0, 0, 0])
+        && reg(SP_PS_CONST_CONFIG) == Some(&[fs.sp_ps_const_config])
+        && reg(SP_HS_CONFIG) == Some(&[0])
+        && reg(SP_DS_CONFIG) == Some(&[0])
+        && reg(SP_GS_CONFIG) == Some(&[0])
+        && reg(SP_GFX_USIZE) == Some(&[0])
+        && reg(VFD_CNTL_1) == Some(&vs.vfd_cntl_1_6)
         && reg(VFD_DEST_CNTL) == Some(vs.vfd_dest_cntl)
         && reg(SP_VS_OUTPUT_CNTL) == Some(&[link.sp_vs_output_cntl])
         && reg(SP_VS_OUTPUT_REG) == Some(link.sp_vs_output_reg)
         && reg(SP_VS_VPC_DEST_REG) == Some(link.sp_vs_vpc_dest_reg)
         && reg(VPC_VS_CNTL) == Some(&[link.vpc_vs_cntl])
+        && reg(VPC_VS_CLIP_CULL_CNTL) == Some(&[0x00ff_ff00])
+        && reg(VPC_VS_CLIP_CULL_CNTL_V2) == Some(&[0x00ff_ff00])
+        && reg(GRAS_CL_VS_CLIP_CULL_DISTANCE) == Some(&[0])
+        && reg(VPC_VS_SIV_CNTL) == Some(&[0x0000_ffff])
+        && reg(VPC_VS_SIV_CNTL_V2) == Some(&[0x0000_ffff])
+        && reg(GRAS_SU_VS_SIV_CNTL) == Some(&[0])
+        && reg(PC_PS_CNTL) == Some(&[0])
         && reg(VPC_PS_CNTL) == Some(&[link.vpc_ps_cntl])
         && reg(PC_VS_CNTL) == Some(&[link.pc_vs_cntl])
         && reg(VPC_VARYING_LM_TRANSFER_CNTL_DISABLE) == Some(&link.lm_transfer_disable)
         && reg(SP_PS_CNTL_0) == Some(&[fs.sp_ps_cntl_0])
+        && reg(SP_PS_WAVE_CNTL) == Some(&[fs.sp_ps_wave_cntl])
+        && reg(SP_LB_PARAM_LIMIT) == Some(&[7])
+        && reg(GRAS_CL_INTERP_CNTL) == Some(&[fs.gras_cl_interp_cntl])
+        && reg(RB_INTERP_CNTL) == Some(&[fs.rb_interp_cntl])
+        && reg(RB_PS_INPUT_CNTL) == Some(&[fs.rb_ps_input_cntl])
+        && reg(RB_PS_SAMPLEFREQ_CNTL) == Some(&[0])
+        && reg(GRAS_LRZ_PS_INPUT_CNTL) == Some(&[0])
+        && reg(GRAS_LRZ_PS_SAMPLEFREQ_CNTL) == Some(&[0])
+        && reg(VPC_VARYING_INTERP_MODE) == Some(&[0; 8])
+        && reg(VPC_VARYING_REPLACE_MODE) == Some(&[0; 8])
         && reg(SP_PS_OUTPUT_REG) == Some(fs.sp_ps_output_reg)
         && reg(SP_VS_INSTR_SIZE) == Some(&[vs.sp_vs_instr_size])
-        && reg(SP_VS_CONFIG) == Some(&[0x100])
+        && reg(SP_VS_CONFIG) == Some(&[vs.sp_vs_config])
         && reg(SP_PS_INSTR_SIZE) == Some(&[fs.sp_ps_instr_size])
-        && reg(SP_PS_CONFIG)
-            == Some(&[if fixed.sampler_dword0.is_some() {
-                0x10101
-            } else {
-                0x100
-            }])
+        && reg(SP_PS_CONFIG) == Some(&[fs.sp_ps_config])
+        && reg(SP_VS_PROGRAM_COUNTER_OFFSET) == Some(&[0])
+        && reg(SP_VS_PVT_MEM_PARAM) == Some(&[0, 0, 0, 0])
+        && reg(SP_VS_PVT_MEM_STACK_OFFSET) == Some(&[0])
+        && reg(SP_PS_PROGRAM_COUNTER_OFFSET) == Some(&[0])
+        && reg(SP_PS_PVT_MEM_PARAM) == Some(&[0, 0, 0, 0])
+        && reg(SP_PS_PVT_MEM_STACK_OFFSET) == Some(&[0])
         && reg(SP_REG_PROG_ID_0) == Some(&fs.sp_reg_prog_id)
         && reg(SP_PS_OUTPUT_CNTL) == Some(&[fs.sp_ps_output_cntl])
         && reg(SP_PS_OUTPUT_MASK) == Some(&[fs.sp_ps_output_mask])
@@ -792,19 +989,48 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
             == Some(&[
                 (fixed.vfd_fetch.len() as u32 / 2) | ((fixed.vfd_fetch.len() as u32 / 2) << 8)
             ])
+        && reg(RB_MRT_BUF_INFO) == Some(&[FORMAT_8_8_8_8_UNORM | MRT_COLOR_SWAP_WXYZ])
+        && reg(RB_MRT_BASE_GMEM) == Some(&[0])
+        && reg(RB_COLOR_FLAG_BUFFER_ADDR) == Some(&[0, 0, 0])
+        && reg(GRAS_LRZ_MRT_BUFFER_INFO_0) == Some(&[FORMAT_8_8_8_8_UNORM])
+        && reg(RB_SRGB_CNTL) == Some(&[0])
+        && reg(SP_SRGB_CNTL) == Some(&[0])
+        && reg(GRAS_CL_ARRAY_SIZE) == Some(&[0])
         && reg(RB_MRT_CONTROL)
             == Some(if fixed.source_over {
-                &[0x783, 0x0701_0706]
+                &[0x7e3, 0x0701_0706]
             } else {
-                &[0x780, 0x0001_0001]
+                &[0x7e0, 0x0001_0001]
             })
         && reg(RB_BLEND_CNTL)
             == Some(&[if fixed.source_over {
-                0x0001_0101
+                0xffff_0001
             } else {
-                0x0001_0100
+                0xffff_0000
             }])
-        && reg(SP_BLEND_CNTL) == Some(&[if fixed.source_over { 0x101 } else { 0x100 }])
+        && reg(SP_BLEND_CNTL) == Some(&[u32::from(fixed.source_over)])
+        && reg(RB_DITHER_CNTL) == Some(&[0])
+        && reg(RB_ALPHA_TEST_CNTL) == Some(&[0])
+        && reg(RB_STENCIL_CNTL) == Some(&[0])
+        && reg(GRAS_SU_STENCIL_CNTL) == Some(&[0])
+        && reg(RB_STENCIL_REF_CNTL) == Some(&[0])
+        && reg(RB_STENCIL_MASK) == Some(&[0, 0])
+        && reg(RB_DEPTH_CNTL) == Some(&[0])
+        && reg(GRAS_SU_DEPTH_CNTL) == Some(&[0])
+        && reg(RB_DEPTH_PLANE_CNTL) == Some(&[0])
+        && reg(GRAS_SU_DEPTH_PLANE_CNTL) == Some(&[0])
+        && reg(RB_DEPTH_BOUND_MIN) == Some(&[0, 1.0_f32.to_bits()])
+        && reg(RB_DEPTH_BUFFER_INFO) == Some(&[0, 0, 0, 0, 0, 0])
+        && reg(GRAS_SU_DEPTH_BUFFER_INFO) == Some(&[0])
+        && reg(RB_STENCIL_BUFFER_INFO) == Some(&[0])
+        && reg(TPL1_RAS_MSAA_CNTL) == Some(&[0, 4])
+        && reg(GRAS_SC_RAS_MSAA_CNTL) == Some(&[0, 4, 0])
+        && reg(RB_RAS_MSAA_CNTL) == Some(&[0, 4, 0])
+        && reg(TPL1_MSAA_SAMPLE_POS_CNTL) == Some(&[0])
+        && reg(RB_RESOLVE_GMEM_BUFFER_INFO) == Some(&[0])
+        && reg(GRAS_CL_CNTL) == Some(&[0x80])
+        && reg(GRAS_CL_GUARDBAND_CLIP_ADJ)
+            .is_some_and(|p| p.len() == 1 && p[0] & !(0x1ff | (0x1ff << 10)) == 0)
         && reg(GRAS_SU_CNTL).is_some_and(|p| {
             p.len() == 1
                 && if fixed.stride == 28 {
@@ -813,11 +1039,19 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
                     p[0] == if fixed.stride == 40 { 0x2012 } else { 0x2010 }
                 }
         })
+        && reg(GRAS_SU_POINT_MINMAX) == Some(&[0x0010_0010])
+        && reg(GRAS_SU_POINT_SIZE) == Some(&[0x10])
+        && reg(GRAS_SU_POLY_OFFSET_SCALE) == Some(&[0, 0, 0])
+        && reg(PC_CNTL) == Some(&[0])
+        && reg(VPC_RAST_CNTL) == Some(&[3])
+        && reg(PC_DGEN_RAST_CNTL) == Some(&[3])
         && load_count(CP_LOAD_STATE6_GEOM, 8, 1) == 1
         && load_count(CP_LOAD_STATE6_FRAG, 12, 1) == 1
-        && load_count(CP_LOAD_STATE6_FRAG, 4, 1) == usize::from(fixed.sampler_dword0.is_some())
-        && load_count(CP_LOAD_STATE6_FRAG, 4, 0) == usize::from(fixed.sampler_dword0.is_some())
-        && match fixed.sampler_dword0 {
+        && load_count(CP_LOAD_STATE6_GEOM, 8, 0) == 1
+        && load_count(CP_LOAD_STATE6_FRAG, 12, 0) == 1
+        && load_count(CP_LOAD_STATE6_FRAG, 4, 1) == usize::from(fixed.sampler_dwords.is_some())
+        && load_count(CP_LOAD_STATE6_FRAG, 4, 0) == usize::from(fixed.sampler_dwords.is_some())
+        && match fixed.sampler_dwords {
             Some(expected) => packets_in_segment(words, start, end).any(|p| {
                 matches!(
                     p.header,
@@ -827,7 +1061,7 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
                     }
                 ) && p.payload.len() == 7
                     && p.payload[0] == ((4 << 18) | (1 << 22))
-                    && p.payload[3] == expected
+                    && p.payload[3..] == expected
             }),
             None => !packets_in_segment(words, start, end).any(|p| {
                 matches!(
@@ -913,6 +1147,31 @@ fn validate_3d_sequences(
         set_address_source(
             addresses,
             fs_packet + 1,
+            AddressSource::CanonicalShader(link.fs),
+        )?;
+        let shader_preload_word = |wanted_opcode: u8, wanted_block: u32| {
+            packets_in_segment(words, start, end)
+                .find(|candidate| {
+                    matches!(
+                        candidate.header,
+                        Header::Type7 { opcode, .. } if opcode == wanted_opcode
+                    ) && candidate.payload.len() == 3
+                        && (candidate.payload[0] >> 14) & 3 == 0
+                        && (candidate.payload[0] >> 16) & 3 == 2
+                        && (candidate.payload[0] >> 18) & 0xf == wanted_block
+                })
+                .map(|candidate| candidate.word_offset + 2)
+        };
+        set_address_source(
+            addresses,
+            shader_preload_word(CP_LOAD_STATE6_GEOM, 8)
+                .ok_or("qcom-adreno-a618: vertex shader preload is missing")?,
+            AddressSource::CanonicalShader(link.vs),
+        )?;
+        set_address_source(
+            addresses,
+            shader_preload_word(CP_LOAD_STATE6_FRAG, 12)
+                .ok_or("qcom-adreno-a618: fragment shader preload is missing")?,
             AddressSource::CanonicalShader(link.fs),
         )?;
 
@@ -1254,9 +1513,11 @@ pub(crate) fn validate_and_relocate(
                 || expectation.height > image.height
                 || (expectation.exact_extent
                     && (expectation.width != image.width || expectation.height != image.height))
-                || expectation.pitch_align.is_some_and(|align| {
-                    align != image.row_pitch.trailing_zeros().saturating_sub(6).min(15)
-                })
+                // SGFX imports an explicit linear BGRA8 layout.  Pinned
+                // Freedreno assigns that layout the minimum 64-byte pitch
+                // alignment (descriptor encoding zero), independent of any
+                // larger power-of-two factor in the actual row pitch.
+                || expectation.pitch_align.is_some_and(|align| align != 0)
                 || expectation.array_pitch.is_some_and(|pitch| {
                     image
                         .visible_size
@@ -2203,6 +2464,10 @@ mod tests {
                 }
                 assert!(accept_codegen(&padded_sampler).is_err());
 
+                let mut missing_mip_disable = artifact.clone();
+                missing_mip_disable.words[begin + 5] = 0;
+                assert!(accept_codegen(&missing_mip_disable).is_err());
+
                 let descriptor = Packets::new(&artifact.words)
                     .filter_map(Result::ok)
                     .find(|packet| {
@@ -2224,6 +2489,10 @@ mod tests {
                 bad_type.words[descriptor.word_offset as usize + 6] |= 2 << 29;
                 assert!(accept_codegen(&bad_type).is_err());
 
+                let mut bad_pitch_align = artifact.clone();
+                bad_pitch_align.words[descriptor.word_offset as usize + 6] |= 1;
+                assert!(accept_codegen(&bad_pitch_align).is_err());
+
                 let mut bad_depth = artifact.clone();
                 bad_depth.words[descriptor.word_offset as usize + 9] = 2 << 17;
                 assert!(accept_codegen(&bad_depth).is_err());
@@ -2239,6 +2508,62 @@ mod tests {
                     .unwrap();
                 texture_fixup.required_size -= 64;
                 assert!(accept_codegen(&bad_range).is_err());
+
+                let packet_for = |register| {
+                    Packets::new(&artifact.words)
+                        .filter_map(Result::ok)
+                        .find(|packet| {
+                            matches!(
+                                packet.header,
+                                Header::Type4 {
+                                    register: actual,
+                                    ..
+                                } if actual == register
+                            )
+                        })
+                        .unwrap()
+                };
+
+                // These were all accepted or emitted by earlier bring-up
+                // revisions.  Keep the kernel boundary pinned to Mesa's A618
+                // encodings so a userspace regression cannot revive them.
+                let mut stream_out_enabled = artifact.clone();
+                let stream_out = packet_for(super::VPC_SO_OVERRIDE);
+                stream_out_enabled.words[stream_out.word_offset as usize + 1] = 0;
+                assert!(accept_codegen(&stream_out_enabled).is_err());
+
+                let mut old_ps_config = artifact.clone();
+                let ps_config = packet_for(super::SP_PS_CONFIG);
+                old_ps_config.words[ps_config.word_offset as usize + 1] = 0x0001_0101;
+                assert!(accept_codegen(&old_ps_config).is_err());
+
+                let mut missing_constlen = artifact.clone();
+                let ps_const = packet_for(super::SP_PS_CONST_CONFIG);
+                missing_constlen.words[ps_const.word_offset as usize + 1] = 0;
+                assert!(accept_codegen(&missing_constlen).is_err());
+
+                let preload = Packets::new(&artifact.words)
+                    .filter_map(Result::ok)
+                    .find(|packet| {
+                        matches!(
+                            packet.header,
+                            Header::Type7 {
+                                opcode: super::CP_LOAD_STATE6_FRAG,
+                                ..
+                            }
+                        ) && packet.payload.len() == 3
+                            && (packet.payload[0] >> 16) & 3 == 2
+                            && (packet.payload[0] >> 18) & 0xf == 12
+                    })
+                    .unwrap();
+                let mut direct_shader_load = artifact.clone();
+                direct_shader_load.words[preload.word_offset as usize + 1] &= !(3 << 16);
+                assert!(accept_codegen(&direct_shader_load).is_err());
+
+                let mut flat_interpolation = artifact.clone();
+                let interpolation = packet_for(super::VPC_VARYING_INTERP_MODE);
+                flat_interpolation.words[interpolation.word_offset as usize + 1] = 1;
+                assert!(accept_codegen(&flat_interpolation).is_err());
             }
         }
     }

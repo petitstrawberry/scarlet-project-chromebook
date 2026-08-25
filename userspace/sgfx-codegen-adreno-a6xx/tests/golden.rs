@@ -1,4 +1,5 @@
 use adreno_a6xx_pm4::{Header, Packets};
+use adreno_a6xx_shader_pack::ShaderVariant;
 use sgfx_codegen_adreno_a6xx::{
     Access, Capabilities, CompileError, CompileInput, ImageMeta, ImageModifier, ObjectId,
     ObjectRef, Operation, PipelineId, PipelineMeta, PlaneLayout, RenderPass, ResourceKind,
@@ -312,15 +313,30 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
     .unwrap();
     assert_well_formed(&artifact);
     assert_eq!(artifact.generated_objects.len(), 0);
-    assert_eq!(artifact.fixups.len(), 4);
-    assert!(matches!(
-        artifact.fixups[2].object,
-        ObjectRef::CanonicalShader(_)
-    ));
-    assert!(matches!(
-        artifact.fixups[3].object,
-        ObjectRef::CanonicalShader(_)
-    ));
+    assert_eq!(artifact.fixups.len(), 6);
+    let canonical: Vec<_> = artifact
+        .fixups
+        .iter()
+        .filter_map(|fixup| match fixup.object {
+            ObjectRef::CanonicalShader(variant) => Some(variant),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(canonical.len(), 4);
+    assert_eq!(
+        canonical
+            .iter()
+            .filter(|variant| **variant == ShaderVariant::VsStride40Pos4Color4)
+            .count(),
+        2
+    );
+    assert_eq!(
+        canonical
+            .iter()
+            .filter(|variant| **variant == ShaderVariant::FsVertexColor)
+            .count(),
+        2
+    );
     let packets = Packets::new(&artifact.words)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -333,6 +349,29 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
     assert!(packets.iter().any(|packet| {
         matches!(packet.header, Header::Type7 { opcode: 0x6d, .. })
             && packet.payload == [2, 0x8801, 0x10]
+    }));
+    let shader_preloads: Vec<_> = packets
+        .iter()
+        .filter(|packet| {
+            matches!(
+                packet.header,
+                Header::Type7 {
+                    opcode: 0x32 | 0x34,
+                    ..
+                }
+            ) && packet.payload.len() == 3
+                && (packet.payload[0] >> 14) & 3 == 0
+                && (packet.payload[0] >> 16) & 3 == 2
+        })
+        .collect();
+    assert_eq!(shader_preloads.len(), 2);
+    assert!(shader_preloads.iter().any(|packet| {
+        matches!(packet.header, Header::Type7 { opcode: 0x32, .. })
+            && (packet.payload[0] >> 18) & 0xf == 8
+    }));
+    assert!(shader_preloads.iter().any(|packet| {
+        matches!(packet.header, Header::Type7 { opcode: 0x34, .. })
+            && (packet.payload[0] >> 18) & 0xf == 12
     }));
     assert!(packets.iter().any(|packet| {
         matches!(
@@ -352,6 +391,42 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
             }
         ) && packet.payload == [1, 16]
     }));
+    for (register, expected) in [
+        (0x8827, &[0][..]),
+        (0x8903, &[0, 0, 0]),
+        (0x8102, &[0x30]),
+        (0x880f, &[0]),
+        (0xa98a, &[0]),
+        (0x8820, &[0x7e3, 0x0701_0706]),
+        (0x8865, &[0xffff_0001]),
+        (0xa989, &[1]),
+        (0x8870, &[0]),
+        (0x8872, &[0, 0, 0, 0, 0, 0]),
+        (0x8094, &[0]),
+        (0xb300, &[0, 4]),
+        (0x80a2, &[0, 4, 0]),
+        (0x8802, &[0, 4, 0]),
+        (0x9200, &[0, 0, 0, 0, 0, 0, 0, 0]),
+        (0x9208, &[0, 0, 0, 0, 0, 0, 0, 0]),
+        (0x9306, &[1]),
+        (0x8000, &[0x80]),
+        (0x8006, &[0x0007_fdff]),
+        (0x9108, &[3]),
+        (0x9b00, &[0]),
+    ] {
+        assert!(
+            packets.iter().any(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type4 {
+                        register: actual,
+                        ..
+                    } if actual == register
+                ) && packet.payload == expected
+            }),
+            "missing canonical A618 register {register:#x}"
+        );
+    }
 }
 
 #[test]
@@ -621,8 +696,12 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
                         && (packet.payload[0] >> 22) & 0x3ff == 1
                 })
                 .expect("one four-dword FS sampler descriptor");
-            let expected_sampler = if stride == 24 { 0x92a } else { 0x920 };
-            assert_eq!(&sampler_state.payload[3..], &[expected_sampler, 0, 0, 0]);
+            let expected_sampler = if stride == 24 {
+                [0x92a, 0x40, 0x20, 0]
+            } else {
+                [0x920, 0x40, 0, 0]
+            };
+            assert_eq!(&sampler_state.payload[3..], &expected_sampler);
         }
         assert_eq!(artifact.generated_objects.len(), 0);
         assert_eq!(
@@ -631,7 +710,7 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
                 .iter()
                 .filter(|fixup| matches!(fixup.object, ObjectRef::CanonicalShader(_)))
                 .count(),
-            2
+            4
         );
     }
 }

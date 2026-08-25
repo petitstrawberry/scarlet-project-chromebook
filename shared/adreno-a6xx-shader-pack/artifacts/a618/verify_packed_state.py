@@ -35,7 +35,12 @@ for name, v in mv.items():
         expected |= int(v["early_preamble"]) << 21
         assert s["sp_vs_cntl_0"] == expected
         assert s["sp_vs_instr_size"] == v["instrlen"]
+        assert s["sp_vs_const_config"] == 0x100 | (v["constlen"] >> 2)
+        assert s["sp_vs_config"] == 0x100
         assert len(s["vfd_dest_cntl"]) == v["attr_in"]
+        assert s["vfd_cntl_1_6"] == [
+            0xfcfcfcfc, 0x0000fcfc, 0xfcfcfcfc, 0x000000fc, 0x0000fcfc, 0
+        ]
     else:
         expected = ((v["max_half_reg"] + 1) << 1) | ((v["max_reg"] + 1) << 7)
         expected |= v["branchstack_hw"] << 13
@@ -49,6 +54,17 @@ for name, v in mv.items():
         assert v["double_threadsize"] == (v["threadsize"] == 128)
         assert s["sp_ps_cntl_0"] == expected
         assert s["sp_ps_instr_size"] == v["instrlen"]
+        assert s["sp_ps_const_config"] == 0x100 | (v["constlen"] >> 2)
+        assert s["sp_ps_config"] == (
+            0x100 | (v["num_samp"] << 9) | (v["num_samp"] << 17)
+        )
+        assert s["sp_ps_wave_cntl"] == (
+            int(v["threadsize"] == 128) | (int(bool(v["total_in"])) << 1)
+        )
+        has_ij = any(x["sysval"] and x["regid"] != 0xfc for x in v["inputs"])
+        assert s["gras_cl_interp_cntl"] == int(has_ij)
+        assert s["rb_interp_cntl"] == int(has_ij) | (int(bool(v["total_in"])) << 10)
+        assert s["rb_ps_input_cntl"] == 0
         assert (s["sp_ps_initial_tex_load_cntl"] & 7) == v["num_sampler_prefetch"]
         assert ((s["sp_ps_initial_tex_load_cntl"] >> 4) & 1) == int(v["prefetch_end_of_quad"])
         assert len(s["sp_ps_initial_tex_load_cmd"]) == v["num_sampler_prefetch"]

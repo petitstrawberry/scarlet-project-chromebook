@@ -52,37 +52,84 @@ const TPL1_A2D_SRC_TEXTURE_SIZE: u32 = 0xb4c1;
 const TPL1_A2D_SRC_TEXTURE_BASE: u32 = 0xb4c2;
 const TPL1_A2D_SRC_TEXTURE_PITCH: u32 = 0xb4c4;
 
+const GRAS_CL_CNTL: u32 = 0x8000;
+const GRAS_CL_VS_CLIP_CULL_DISTANCE: u32 = 0x8001;
+const GRAS_CL_ARRAY_SIZE: u32 = 0x8004;
+const GRAS_CL_INTERP_CNTL: u32 = 0x8005;
+const GRAS_CL_GUARDBAND_CLIP_ADJ: u32 = 0x8006;
 const GRAS_CL_VIEWPORT_XOFFSET: u32 = 0x8010;
+const GRAS_SU_POINT_MINMAX: u32 = 0x8091;
+const GRAS_SU_POINT_SIZE: u32 = 0x8092;
+const GRAS_SU_POLY_OFFSET_SCALE: u32 = 0x8095;
+const GRAS_SU_DEPTH_BUFFER_INFO: u32 = 0x8098;
 const GRAS_SC_CNTL: u32 = 0x80a0;
+const GRAS_SC_RAS_MSAA_CNTL: u32 = 0x80a2;
+const GRAS_SC_SCREEN_SCISSOR_CNTL: u32 = 0x80af;
 const GRAS_SC_SCREEN_SCISSOR_TL: u32 = 0x80b0;
 const GRAS_SC_VIEWPORT_SCISSOR_TL: u32 = 0x80d0;
 const GRAS_SC_WINDOW_SCISSOR_TL: u32 = 0x80f0;
 const GRAS_SC_BIN_CNTL: u32 = 0x80a1;
 const GRAS_LRZ_CNTL: u32 = 0x8100;
+const GRAS_LRZ_MRT_BUFFER_INFO_0: u32 = 0x8102;
 const GRAS_SU_CNTL: u32 = 0x8090;
+const GRAS_SU_DEPTH_PLANE_CNTL: u32 = 0x8094;
+const GRAS_SU_VS_SIV_CNTL: u32 = 0x809b;
+const GRAS_LRZ_PS_INPUT_CNTL: u32 = 0x8101;
+const GRAS_LRZ_PS_SAMPLEFREQ_CNTL: u32 = 0x8109;
+const GRAS_SU_DEPTH_CNTL: u32 = 0x8114;
+const GRAS_SU_STENCIL_CNTL: u32 = 0x8115;
 const RB_CNTL: u32 = 0x8800;
 const RB_RENDER_CNTL: u32 = 0x8801;
+const RB_RAS_MSAA_CNTL: u32 = 0x8802;
+const RB_INTERP_CNTL: u32 = 0x8809;
+const RB_PS_INPUT_CNTL: u32 = 0x880a;
 const RB_PS_OUTPUT_CNTL: u32 = 0x880b;
 const RB_PS_MRT_CNTL: u32 = 0x880c;
 const RB_PS_OUTPUT_MASK: u32 = 0x880d;
+const RB_DITHER_CNTL: u32 = 0x880e;
+const RB_SRGB_CNTL: u32 = 0x880f;
 const RB_MRT_CONTROL: u32 = 0x8820;
 const RB_MRT_BUF_INFO: u32 = 0x8822;
 const RB_MRT_PITCH: u32 = 0x8823;
 const RB_MRT_BASE: u32 = 0x8825;
+const RB_MRT_BASE_GMEM: u32 = 0x8827;
+const RB_ALPHA_TEST_CNTL: u32 = 0x8864;
 const RB_BLEND_CNTL: u32 = 0x8865;
+const RB_DEPTH_PLANE_CNTL: u32 = 0x8870;
+const RB_DEPTH_CNTL: u32 = 0x8871;
+const RB_DEPTH_BUFFER_INFO: u32 = 0x8872;
+const RB_DEPTH_BOUND_MIN: u32 = 0x8878;
+const RB_STENCIL_CNTL: u32 = 0x8880;
+const RB_STENCIL_BUFFER_INFO: u32 = 0x8881;
+const RB_STENCIL_REF_CNTL: u32 = 0x8887;
+const RB_STENCIL_MASK: u32 = 0x8888;
 const RB_MODE_CNTL: u32 = 0x8811;
+const RB_PS_SAMPLEFREQ_CNTL: u32 = 0x8810;
 const RB_WINDOW_OFFSET: u32 = 0x8890;
 const RB_LRZ_CNTL: u32 = 0x8898;
 const RB_BIN_CONTROL2: u32 = 0x88d3;
 const RB_WINDOW_OFFSET2: u32 = 0x88d4;
+const RB_RESOLVE_GMEM_BUFFER_INFO: u32 = 0x88d5;
+const RB_COLOR_FLAG_BUFFER_ADDR: u32 = 0x8903;
+const VPC_RAST_CNTL: u32 = 0x9108;
+const VPC_VARYING_INTERP_MODE: u32 = 0x9200;
+const VPC_VARYING_REPLACE_MODE: u32 = 0x9208;
 const VPC_VARYING_LM_TRANSFER_CNTL_DISABLE: u32 = 0x9212;
+const VPC_VS_CLIP_CULL_CNTL: u32 = 0x9101;
+const VPC_VS_SIV_CNTL: u32 = 0x9104;
 const VPC_VS_CNTL: u32 = 0x9301;
 const VPC_PS_CNTL: u32 = 0x9304;
 const VPC_SO_OVERRIDE: u32 = 0x9306;
+const VPC_VS_CLIP_CULL_CNTL_V2: u32 = 0x9311;
+const VPC_VS_SIV_CNTL_V2: u32 = 0x9314;
 const PC_MODE_CNTL: u32 = 0x9804;
+const PC_PS_CNTL: u32 = 0x9806;
 const PC_DGEN_RAST_CNTL: u32 = 0x9981;
+const PC_CNTL: u32 = 0x9b00;
 const PC_VS_CNTL: u32 = 0x9b01;
+const PC_STEREO_RENDERING_CNTL: u32 = 0x9b07;
 const VFD_CNTL_0: u32 = 0xa000;
+const VFD_CNTL_1: u32 = 0xa001;
 const VFD_RENDER_MODE: u32 = 0xa007;
 const VFD_MODE_CNTL: u32 = 0xa009;
 const VFD_INDEX_OFFSET: u32 = 0xa00e;
@@ -94,12 +141,22 @@ const SP_VS_CNTL_0: u32 = 0xa800;
 const SP_VS_OUTPUT_CNTL: u32 = 0xa802;
 const SP_VS_OUTPUT_REG: u32 = 0xa803;
 const SP_VS_VPC_DEST_REG: u32 = 0xa813;
+const SP_VS_PROGRAM_COUNTER_OFFSET: u32 = 0xa81b;
 const SP_VS_BASE: u32 = 0xa81c;
+const SP_VS_PVT_MEM_PARAM: u32 = 0xa81e;
+const SP_VS_PVT_MEM_STACK_OFFSET: u32 = 0xa825;
 const SP_VS_CONFIG: u32 = 0xa823;
 const SP_VS_INSTR_SIZE: u32 = 0xa824;
+const SP_HS_CONFIG: u32 = 0xa83b;
+const SP_DS_CONFIG: u32 = 0xa863;
+const SP_GS_CONFIG: u32 = 0xa894;
 const SP_PS_CNTL_0: u32 = 0xa980;
+const SP_PS_PROGRAM_COUNTER_OFFSET: u32 = 0xa982;
 const SP_PS_BASE: u32 = 0xa983;
+const SP_PS_PVT_MEM_PARAM: u32 = 0xa985;
+const SP_PS_PVT_MEM_STACK_OFFSET: u32 = 0xa9a9;
 const SP_BLEND_CNTL: u32 = 0xa989;
+const SP_SRGB_CNTL: u32 = 0xa98a;
 const SP_PS_OUTPUT_MASK: u32 = 0xa98b;
 const SP_PS_OUTPUT_CNTL: u32 = 0xa98c;
 const SP_PS_MRT_CNTL: u32 = 0xa98d;
@@ -109,9 +166,18 @@ const SP_PS_INITIAL_TEX_LOAD_CNTL: u32 = 0xa99e;
 const SP_PS_CONFIG: u32 = 0xab04;
 const SP_PS_INSTR_SIZE: u32 = 0xab05;
 const SP_MODE_CNTL: u32 = 0xab00;
+const SP_GFX_USIZE: u32 = 0xab20;
+const SP_VS_CONST_CONFIG: u32 = 0xb800;
+const SP_PS_WAVE_CNTL: u32 = 0xb980;
+const SP_LB_PARAM_LIMIT: u32 = 0xb982;
 const SP_REG_PROG_ID_0: u32 = 0xb983;
+const TPL1_RAS_MSAA_CNTL: u32 = 0xb300;
+const TPL1_MSAA_SAMPLE_POS_CNTL: u32 = 0xb304;
+const TPL1_WINDOW_OFFSET: u32 = 0xb307;
 const TPL1_MODE_CNTL: u32 = 0xb309;
+const SP_WINDOW_OFFSET: u32 = 0xb4d1;
 const SP_UPDATE_CNTL: u32 = 0xbb08;
+const SP_PS_CONST_CONFIG: u32 = 0xbb10;
 
 pub(crate) struct DrawState {
     pub(crate) variant: PipelineVariant,
@@ -300,13 +366,35 @@ impl Emitter {
         self.packet7(opcode, &payload)
     }
 
+    fn preload_shader(
+        &mut self,
+        opcode: u8,
+        block: u32,
+        units: u32,
+        variant: adreno_a6xx_shader_pack::ShaderVariant,
+    ) -> Result<(), CompileError> {
+        // SS6_INDIRECT is encoded as 2 in STATE_SRC.  A6xx requires this
+        // CP_LOAD_STATE6 operation in addition to programming SP_xS_BASE;
+        // SP_UPDATE_CNTL deliberately invalidates the previous shader load.
+        self.push_word(type7(opcode, 3).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.push_word((2 << 16) | (block << 18) | (units << 22))?;
+        self.address_words(
+            ObjectRef::CanonicalShader(variant),
+            0,
+            SHADER_SIZE as u64,
+            Access::READ,
+        )
+    }
+
     fn texture_descriptor(&mut self, texture: Surface) -> Result<(), CompileError> {
-        // A6XX_TEX_MEMOBJ, single-level linear 2D BGRA8, identity view swizzle.
-        let pitch_align = texture.stride.trailing_zeros().saturating_sub(6).min(15);
+        // A6XX_TEX_MEMOBJ, single-level explicit-layout linear 2D BGRA8,
+        // identity view swizzle.  Freedreno assigns explicit linear BGRA8 a
+        // 64-byte minimum pitch alignment (PITCHALIGN encoding zero); a wider
+        // incidental stride alignment must not change the descriptor.
         let descriptor = [
             0x4c00_6880,
             texture.width | (texture.height << 15),
-            pitch_align | (texture.stride << 7) | (1 << 29),
+            (texture.stride << 7) | (1 << 29),
             u32::try_from(
                 texture
                     .plane_size
@@ -351,13 +439,14 @@ impl Emitter {
         };
 
         self.submission_begin_3d()?;
+        self.emit_program_config(vs, fs)?;
         // CP tracks RB_RENDER_CNTL and inserts a required hang-workaround WFI
         // when render modes change.  A raw type-4 write bypasses that tracker.
         self.packet7(CP_REG_WRITE, &[2, RB_RENDER_CNTL, 0x10])?;
         self.packet4(
             RB_MRT_CONTROL,
             &[
-                if draw.source_over { 0x783 } else { 0x780 },
+                if draw.source_over { 0x7e3 } else { 0x7e0 },
                 if draw.source_over {
                     0x0701_0706
                 } else {
@@ -383,21 +472,30 @@ impl Emitter {
             draw.target.plane_size,
             Access::WRITE,
         )?;
+        // This backend renders directly to linear system memory.  Program the
+        // complete no-GMEM/no-UBWC MRT state instead of inheriting flag-buffer
+        // or GMEM state from firmware or an earlier operation.
+        self.packet4(RB_MRT_BASE_GMEM, &[0])?;
+        self.packet4(RB_COLOR_FLAG_BUFFER_ADDR, &[0; 3])?;
+        self.packet4(GRAS_LRZ_MRT_BUFFER_INFO_0, &[FORMAT_8_8_8_8_UNORM])?;
+        self.packet4(RB_SRGB_CNTL, &[0])?;
+        self.packet4(SP_SRGB_CNTL, &[0])?;
+        self.packet4(GRAS_CL_ARRAY_SIZE, &[0])?;
         self.packet4(
             RB_BLEND_CNTL,
             &[if draw.source_over {
-                0x0001_0101
+                0xffff_0001
             } else {
-                0x0001_0100
+                0xffff_0000
             }],
         )?;
-        self.packet4(
-            SP_BLEND_CNTL,
-            &[if draw.source_over { 0x101 } else { 0x100 }],
-        )?;
+        self.packet4(SP_BLEND_CNTL, &[if draw.source_over { 1 } else { 0 }])?;
+        self.packet4(RB_DITHER_CNTL, &[0])?;
         self.packet4(SP_PS_MRT_CNTL, &[1])?;
         self.packet4(RB_PS_MRT_CNTL, &[1])?;
         self.packet4(SP_PS_MRT_REG, &[FORMAT_8_8_8_8_UNORM])?;
+        self.emit_no_depth_state()?;
+        self.emit_single_sample_state()?;
 
         let area_br = pack_xy(
             draw.area.x() + draw.area.width() - 1,
@@ -414,10 +512,11 @@ impl Emitter {
                 f32_bits(draw.area.width() as f32 * 0.5),
                 f32_bits(draw.area.y() as f32 + draw.area.height() as f32 * 0.5),
                 f32_bits(draw.area.height() as f32 * 0.5),
-                0,
-                f32_bits(1.0),
+                f32_bits(0.5),
+                f32_bits(0.5),
             ],
         )?;
+        self.packet4(GRAS_CL_GUARDBAND_CLIP_ADJ, &[guardband_clip_adj(draw.area)])?;
         self.packet4(
             GRAS_SC_SCREEN_SCISSOR_TL,
             &[pack_xy(draw.area.x(), draw.area.y()), area_br],
@@ -430,13 +529,20 @@ impl Emitter {
             GRAS_SC_WINDOW_SCISSOR_TL,
             &[pack_xy(draw.scissor.x(), draw.scissor.y()), scissor_br],
         )?;
+        self.packet4(GRAS_CL_CNTL, &[0x80])?;
         self.packet4(GRAS_SU_CNTL, &[0x2010 | draw.cull])?;
+        self.packet4(GRAS_SU_POINT_MINMAX, &[0x0010_0010])?;
+        self.packet4(GRAS_SU_POINT_SIZE, &[0x10])?;
+        self.packet4(GRAS_SU_POLY_OFFSET_SCALE, &[0, 0, 0])?;
+        self.packet4(PC_CNTL, &[0])?;
+        self.packet4(VPC_RAST_CNTL, &[3])?;
         self.packet4(PC_DGEN_RAST_CNTL, &[3])?;
 
         self.packet4(
             VFD_CNTL_0,
             &[(draw.attributes.len() as u32) | ((draw.attributes.len() as u32) << 8)],
         )?;
+        self.packet4(VFD_CNTL_1, &vs.vfd_cntl_1_6)?;
         self.packet4(VFD_INDEX_OFFSET, &[draw.first_vertex, 0])?;
         self.address_register(
             VFD_VERTEX_BUFFER_BASE,
@@ -462,8 +568,8 @@ impl Emitter {
 
         self.emit_vs(vs, link)?;
         self.emit_fs(fs)?;
-        self.canonical_shader(SP_VS_BASE, link.vs)?;
-        self.canonical_shader(SP_PS_BASE, link.fs)?;
+        self.emit_vs_program(vs, link.vs)?;
+        self.emit_fs_program(fs, link.fs)?;
         self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms)?;
         self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
         if let Some(texture) = draw.texture {
@@ -472,8 +578,13 @@ impl Emitter {
             // descriptors use sixteen dwords under ST6_CONSTANTS, but padding
             // a sampler to that size makes CP_LOAD_STATE6 consume an invalid
             // direct-state payload and raises CP_ILLEGAL_INSTR_ERROR.
-            let mut sampler = [0_u32; 4];
-            sampler[0] = if draw.linear_sampler { 0x92a } else { 0x920 };
+            let sampler = if draw.linear_sampler {
+                // clamp-to-edge, linear min/mag, no mip chain, chroma-linear
+                [0x92a, 0x40, 0x20, 0]
+            } else {
+                // clamp-to-edge, nearest min/mag, no mip chain
+                [0x920, 0x40, 0, 0]
+            };
             self.load_direct(CP_LOAD_STATE6_FRAG, 4, 0, 1, &sampler)?;
         }
         self.wait_for_idle()?;
@@ -486,15 +597,21 @@ impl Emitter {
         self.packet4(SP_VS_OUTPUT_CNTL, &[link.sp_vs_output_cntl])?;
         self.packet4(SP_VS_OUTPUT_REG, link.sp_vs_output_reg)?;
         self.packet4(SP_VS_VPC_DEST_REG, link.sp_vs_vpc_dest_reg)?;
-        self.packet4(SP_VS_CONFIG, &[0x100])?;
         self.packet4(SP_VS_INSTR_SIZE, &[vs.sp_vs_instr_size])?;
         self.packet4(
             VPC_VARYING_LM_TRANSFER_CNTL_DISABLE,
             &link.lm_transfer_disable,
         )?;
         self.packet4(VPC_VS_CNTL, &[link.vpc_vs_cntl])?;
+        self.packet4(VPC_VS_CLIP_CULL_CNTL, &[0x00ff_ff00])?;
+        self.packet4(VPC_VS_CLIP_CULL_CNTL_V2, &[0x00ff_ff00])?;
+        self.packet4(GRAS_CL_VS_CLIP_CULL_DISTANCE, &[0])?;
         self.packet4(VPC_PS_CNTL, &[link.vpc_ps_cntl])?;
-        self.packet4(PC_VS_CNTL, &[link.pc_vs_cntl])
+        self.packet4(PC_VS_CNTL, &[link.pc_vs_cntl])?;
+        self.packet4(VPC_VS_SIV_CNTL, &[0x0000_ffff])?;
+        self.packet4(VPC_VS_SIV_CNTL_V2, &[0x0000_ffff])?;
+        self.packet4(GRAS_SU_VS_SIV_CNTL, &[0])?;
+        self.packet4(PC_PS_CNTL, &[0])
     }
 
     fn emit_fs(&mut self, fs: FragmentMeta) -> Result<(), CompileError> {
@@ -509,15 +626,85 @@ impl Emitter {
         self.packet4(SP_PS_OUTPUT_MASK, &[fs.sp_ps_output_mask])?;
         self.packet4(RB_PS_OUTPUT_CNTL, &[fs.rb_ps_output_cntl])?;
         self.packet4(RB_PS_OUTPUT_MASK, &[fs.rb_ps_output_mask])?;
-        self.packet4(
-            SP_PS_CONFIG,
-            &[if fs.initial_tex_load_cmd.is_empty() {
-                0x100
-            } else {
-                0x10101
-            }],
-        )?;
-        self.packet4(SP_PS_INSTR_SIZE, &[fs.sp_ps_instr_size])
+        self.packet4(SP_PS_INSTR_SIZE, &[fs.sp_ps_instr_size])?;
+        self.packet4(SP_PS_WAVE_CNTL, &[fs.sp_ps_wave_cntl])?;
+        self.packet4(SP_LB_PARAM_LIMIT, &[7])?;
+        self.packet4(GRAS_CL_INTERP_CNTL, &[fs.gras_cl_interp_cntl])?;
+        self.packet4(RB_INTERP_CNTL, &[fs.rb_interp_cntl])?;
+        self.packet4(RB_PS_INPUT_CNTL, &[fs.rb_ps_input_cntl])?;
+        self.packet4(VPC_VARYING_INTERP_MODE, &[0; 8])?;
+        self.packet4(VPC_VARYING_REPLACE_MODE, &[0; 8])?;
+        self.packet4(RB_PS_SAMPLEFREQ_CNTL, &[0])?;
+        self.packet4(GRAS_LRZ_PS_INPUT_CNTL, &[0])?;
+        self.packet4(GRAS_LRZ_PS_SAMPLEFREQ_CNTL, &[0])
+    }
+
+    fn emit_program_config(
+        &mut self,
+        vs: VertexMeta,
+        fs: FragmentMeta,
+    ) -> Result<(), CompileError> {
+        self.packet4(SP_VS_CONST_CONFIG, &[vs.sp_vs_const_config, 0, 0, 0])?;
+        self.packet4(SP_PS_CONST_CONFIG, &[fs.sp_ps_const_config])?;
+        self.packet4(SP_VS_CONFIG, &[vs.sp_vs_config])?;
+        self.packet4(SP_HS_CONFIG, &[0])?;
+        self.packet4(SP_DS_CONFIG, &[0])?;
+        self.packet4(SP_GS_CONFIG, &[0])?;
+        self.packet4(SP_PS_CONFIG, &[fs.sp_ps_config])?;
+        self.packet4(SP_GFX_USIZE, &[0])
+    }
+
+    fn emit_no_depth_state(&mut self) -> Result<(), CompileError> {
+        self.packet4(RB_ALPHA_TEST_CNTL, &[0])?;
+        self.packet4(RB_STENCIL_CNTL, &[0])?;
+        self.packet4(GRAS_SU_STENCIL_CNTL, &[0])?;
+        self.packet4(RB_STENCIL_REF_CNTL, &[0])?;
+        self.packet4(RB_STENCIL_MASK, &[0, 0])?;
+        self.packet4(RB_DEPTH_CNTL, &[0])?;
+        self.packet4(GRAS_SU_DEPTH_CNTL, &[0])?;
+        self.packet4(RB_DEPTH_PLANE_CNTL, &[0])?;
+        self.packet4(GRAS_SU_DEPTH_PLANE_CNTL, &[0])?;
+        self.packet4(RB_DEPTH_BOUND_MIN, &[0, f32_bits(1.0)])?;
+
+        // DEPTH_BUFFER_INFO, PITCH, ARRAY_PITCH, BASE_LO/HI and GMEM_BASE.
+        self.packet4(RB_DEPTH_BUFFER_INFO, &[0; 6])?;
+        self.packet4(GRAS_SU_DEPTH_BUFFER_INFO, &[0])?;
+        self.packet4(RB_STENCIL_BUFFER_INFO, &[0])
+    }
+
+    fn emit_single_sample_state(&mut self) -> Result<(), CompileError> {
+        // MSAA_ONE is encoded as zero.  DEST_MSAA.MSAA_DISABLE is bit 2.
+        self.packet4(TPL1_RAS_MSAA_CNTL, &[0, 4])?;
+        self.packet4(GRAS_SC_RAS_MSAA_CNTL, &[0, 4, 0])?;
+        self.packet4(RB_RAS_MSAA_CNTL, &[0, 4, 0])?;
+        self.packet4(TPL1_MSAA_SAMPLE_POS_CNTL, &[0])?;
+        self.packet4(RB_RESOLVE_GMEM_BUFFER_INFO, &[0])
+    }
+
+    fn emit_vs_program(
+        &mut self,
+        vs: VertexMeta,
+        variant: adreno_a6xx_shader_pack::ShaderVariant,
+    ) -> Result<(), CompileError> {
+        self.packet4(SP_VS_PROGRAM_COUNTER_OFFSET, &[0])?;
+        self.canonical_shader(SP_VS_BASE, variant)?;
+        // PVT_MEM_PARAM, PVT_MEM_BASE_LO/HI, and PVT_MEM_SIZE are all zero:
+        // every generated shader has pvtmem_size=0 in pinned Mesa metadata.
+        self.packet4(SP_VS_PVT_MEM_PARAM, &[0; 4])?;
+        self.packet4(SP_VS_PVT_MEM_STACK_OFFSET, &[0])?;
+        self.preload_shader(CP_LOAD_STATE6_GEOM, 8, vs.sp_vs_instr_size, variant)
+    }
+
+    fn emit_fs_program(
+        &mut self,
+        fs: FragmentMeta,
+        variant: adreno_a6xx_shader_pack::ShaderVariant,
+    ) -> Result<(), CompileError> {
+        self.packet4(SP_PS_PROGRAM_COUNTER_OFFSET, &[0])?;
+        self.canonical_shader(SP_PS_BASE, variant)?;
+        self.packet4(SP_PS_PVT_MEM_PARAM, &[0; 4])?;
+        self.packet4(SP_PS_PVT_MEM_STACK_OFFSET, &[0])?;
+        self.preload_shader(CP_LOAD_STATE6_FRAG, 12, fs.sp_ps_instr_size, variant)
     }
 
     fn invalidate_submission_caches(&mut self) -> Result<(), CompileError> {
@@ -539,7 +726,7 @@ impl Emitter {
         // Start every self-contained draw from the upstream A6xx restore
         // baseline.  This backend has one synchronous context, so only state
         // reachable by this compact sysmem stream needs to be reset here.
-        self.packet4(SP_UPDATE_CNTL, &[0x000f_ffff])?;
+        self.packet4(SP_UPDATE_CNTL, &[0x0000_00ff])?;
         self.wait_for_idle()?;
         self.packet4(RB_DBG_ECO_CNTL, &[0x0410_0000])?;
         self.packet4(GRAS_SC_CNTL, &[2])?;
@@ -548,6 +735,7 @@ impl Emitter {
         self.packet4(VFD_RENDER_MODE, &[0])?;
         self.packet4(VFD_MODE_CNTL, &[3])?;
         self.packet4(PC_MODE_CNTL, &[0x1f])?;
+        self.packet4(PC_STEREO_RENDERING_CNTL, &[0])?;
         self.packet4(SP_MODE_CNTL, &[5])?;
         self.packet4(TPL1_MODE_CNTL, &[0xa2])?;
         self.packet4(RB_MODE_CNTL, &[0x10])?;
@@ -556,9 +744,14 @@ impl Emitter {
         self.packet4(RB_BIN_CONTROL2, &[0])?;
         self.packet4(RB_WINDOW_OFFSET, &[0])?;
         self.packet4(RB_WINDOW_OFFSET2, &[0])?;
-        // Sysmem has one rendering pass, so stream-out is not suppressed by
-        // the binning-pass override.
-        self.packet4(VPC_SO_OVERRIDE, &[0])?;
+        self.packet4(SP_WINDOW_OFFSET, &[0])?;
+        self.packet4(TPL1_WINDOW_OFFSET, &[0])?;
+        self.packet4(GRAS_SC_SCREEN_SCISSOR_CNTL, &[0])?;
+        // SGFX has no transform-feedback operations.  Match Mesa's A6xx
+        // restore baseline and suppress stream-out for every self-contained
+        // draw.  Leaving it enabled can strand PC/VPC once a shader exports
+        // varyings even though a no-varying smoke draw completes.
+        self.packet4(VPC_SO_OVERRIDE, &[1])?;
         self.packet7(opcode::SET_MARKER, &[1])?;
         self.packet7(CP_SET_VISIBILITY_OVERRIDE, &[1])?;
         self.packet4(RB_CCU_CNTL, &[0x0800_0000])
@@ -788,6 +981,36 @@ fn f32_bits(value: f32) -> u32 {
     value.to_bits()
 }
 
+fn guardband_axis(offset: f32, scale: f32) -> u32 {
+    const MAX_GUARDBAND: u32 = 0x1ff;
+
+    let scale = scale.abs();
+    let minimum = (-32_768.0 - offset) / scale;
+    let maximum = (32_767.0 - offset) / scale;
+    let adjustment = (-minimum).min(maximum);
+    if adjustment < 1.0 || !adjustment.is_finite() {
+        return MAX_GUARDBAND;
+    }
+
+    // Freedreno converts the positive adjustment to a 3.6 floating-point
+    // value, rounding down.  IEEE-754's exponent and top six mantissa bits
+    // are the same encoding after removing the implicit leading one.
+    let bits = adjustment.to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    if !(0..=7).contains(&exponent) {
+        return MAX_GUARDBAND;
+    }
+    ((exponent as u32) << 6) | ((bits >> 17) & 0x3f)
+}
+
+fn guardband_clip_adj(area: PixelRect) -> u32 {
+    let x_scale = area.width() as f32 * 0.5;
+    let y_scale = area.height() as f32 * 0.5;
+    let x_offset = area.x() as f32 + x_scale;
+    let y_offset = area.y() as f32 + y_scale;
+    guardband_axis(x_offset, x_scale) | (guardband_axis(y_offset, y_scale) << 10)
+}
+
 fn unorm8(value: f32) -> u32 {
     let value = value.clamp(0.0, 1.0);
     (value * 255.0 + 0.5) as u32
@@ -797,7 +1020,9 @@ fn unorm8(value: f32) -> u32 {
 mod tests {
     use alloc::vec;
 
-    use super::Emitter;
+    use sgfx_core::ir::PixelRect;
+
+    use super::{Emitter, guardband_axis, guardband_clip_adj};
     use crate::model::{
         Access, AddressEncoding, CompileError, ObjectId, ObjectRef, SymbolicAddress,
     };
@@ -830,5 +1055,15 @@ mod tests {
         };
 
         assert_eq!(emitter.finish(), Err(CompileError::InvalidPm4));
+    }
+
+    #[test]
+    fn guardband_matches_freedreno_3_6_encoding() {
+        assert_eq!(guardband_axis(8.0, 8.0), 0x1ff);
+        assert_eq!(guardband_axis(1080.0, 1080.0), 0x135);
+        assert_eq!(guardband_axis(720.0, 720.0), 0x159);
+
+        let panel = PixelRect::new(0, 0, 2160, 1440).unwrap();
+        assert_eq!(guardband_clip_adj(panel), 0x0005_6535);
     }
 }

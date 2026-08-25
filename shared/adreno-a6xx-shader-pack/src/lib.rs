@@ -16,7 +16,7 @@ pub const MESA_METADATA_SHA256: &str =
     "84a727b282d051a97cc9a3d43c5921dbe3751845db7c2de39d8f241727e701b9";
 /// SHA256 of the generated packed-state metadata represented below.
 pub const PACKED_STATE_SHA256: &str =
-    "76e7198f6c88f578a03f3b9e6506eda3c31d4972910cf9963152d3008d8cc234";
+    "c4c746958a7c1dbbd2e2860299194f4ebe5a0d6e8401a1c7cc71494ed6f2de48";
 /// Required start alignment and fixed allocation stride of every program.
 pub const SHADER_ALIGNMENT: usize = 128;
 /// Exact byte count of every canonical program.
@@ -127,7 +127,10 @@ impl ShaderVariant {
 pub struct VertexMeta {
     pub sp_vs_cntl_0: u32,
     pub sp_vs_instr_size: u32,
+    pub sp_vs_const_config: u32,
+    pub sp_vs_config: u32,
     pub vfd_dest_cntl: &'static [u32],
+    pub vfd_cntl_1_6: [u32; 6],
 }
 
 /// Mesa-derived A618 fragment-stage payloads for one canonical program.
@@ -135,6 +138,12 @@ pub struct VertexMeta {
 pub struct FragmentMeta {
     pub sp_ps_cntl_0: u32,
     pub sp_ps_instr_size: u32,
+    pub sp_ps_const_config: u32,
+    pub sp_ps_config: u32,
+    pub sp_ps_wave_cntl: u32,
+    pub gras_cl_interp_cntl: u32,
+    pub rb_interp_cntl: u32,
+    pub rb_ps_input_cntl: u32,
     pub initial_tex_load_cntl: u32,
     pub initial_tex_load_cmd: &'static [u32],
     pub sp_reg_prog_id: [u32; 4],
@@ -154,6 +163,14 @@ pub enum ShaderMeta {
 
 const PROG_ID_SOLID: [u32; 4] = [0xfcfc_fcfc, 0xfcfc_fcfc, 0xfcfc_fcfc, 0xfcfc];
 const PROG_ID_VARYING: [u32; 4] = [0xfcfc_fcfc, 0xfcfc_fc00, 0xfcfc_fcfc, 0xfcfc];
+const VFD_CNTL_1_6_NO_SYSVALS: [u32; 6] = [
+    0xfcfc_fcfc,
+    0x0000_fcfc,
+    0xfcfc_fcfc,
+    0x0000_00fc,
+    0x0000_fcfc,
+    0,
+];
 
 /// Return immutable generated metadata for one stable program identity.
 pub const fn shader_meta(variant: ShaderVariant) -> ShaderMeta {
@@ -162,41 +179,68 @@ pub const fn shader_meta(variant: ShaderVariant) -> ShaderMeta {
         VsStride16Pos2 => ShaderMeta::Vertex(VertexMeta {
             sp_vs_cntl_0: 0x0010_0180,
             sp_vs_instr_size: 1,
+            sp_vs_const_config: 0x103,
+            sp_vs_config: 0x100,
             vfd_dest_cntl: &[3],
+            vfd_cntl_1_6: VFD_CNTL_1_6_NO_SYSVALS,
         }),
         VsStride16Pos2Uv2 => ShaderMeta::Vertex(VertexMeta {
             sp_vs_cntl_0: 0x0010_0180,
             sp_vs_instr_size: 1,
+            sp_vs_const_config: 0x103,
+            sp_vs_config: 0x100,
             vfd_dest_cntl: &[3, 35],
+            vfd_cntl_1_6: VFD_CNTL_1_6_NO_SYSVALS,
         }),
         VsStride40Pos4 => ShaderMeta::Vertex(VertexMeta {
             sp_vs_cntl_0: 0x0010_0180,
             sp_vs_instr_size: 1,
+            sp_vs_const_config: 0x103,
+            sp_vs_config: 0x100,
             vfd_dest_cntl: &[15],
+            vfd_cntl_1_6: VFD_CNTL_1_6_NO_SYSVALS,
         }),
         VsStride40Pos4Color4 => ShaderMeta::Vertex(VertexMeta {
             sp_vs_cntl_0: 0x0010_0200,
             sp_vs_instr_size: 1,
+            sp_vs_const_config: 0x103,
+            sp_vs_config: 0x100,
             vfd_dest_cntl: &[15, 79],
+            vfd_cntl_1_6: VFD_CNTL_1_6_NO_SYSVALS,
         }),
         VsStride40Pos4Color4Uv2 => ShaderMeta::Vertex(VertexMeta {
             sp_vs_cntl_0: 0x0010_0280,
             sp_vs_instr_size: 1,
+            sp_vs_const_config: 0x103,
+            sp_vs_config: 0x100,
             vfd_dest_cntl: &[15, 79, 131],
+            vfd_cntl_1_6: VFD_CNTL_1_6_NO_SYSVALS,
         }),
         VsStride24Pos4Uv2 => ShaderMeta::Vertex(VertexMeta {
             sp_vs_cntl_0: 0x0010_0200,
             sp_vs_instr_size: 1,
+            sp_vs_const_config: 0x103,
+            sp_vs_config: 0x100,
             vfd_dest_cntl: &[15, 67],
+            vfd_cntl_1_6: VFD_CNTL_1_6_NO_SYSVALS,
         }),
         VsStride28Pos4Color3 => ShaderMeta::Vertex(VertexMeta {
             sp_vs_cntl_0: 0x0010_0200,
             sp_vs_instr_size: 1,
+            sp_vs_const_config: 0x103,
+            sp_vs_config: 0x100,
             vfd_dest_cntl: &[15, 71],
+            vfd_cntl_1_6: VFD_CNTL_1_6_NO_SYSVALS,
         }),
         FsSolid => ShaderMeta::Fragment(FragmentMeta {
             sp_ps_cntl_0: 0x8110_0080,
             sp_ps_instr_size: 1,
+            sp_ps_const_config: 0x102,
+            sp_ps_config: 0x100,
+            sp_ps_wave_cntl: 1,
+            gras_cl_interp_cntl: 0,
+            rb_interp_cntl: 0,
+            rb_ps_input_cntl: 0,
             initial_tex_load_cntl: 8,
             initial_tex_load_cmd: &[],
             sp_reg_prog_id: PROG_ID_SOLID,
@@ -223,6 +267,12 @@ const fn fragment_varying(
     ShaderMeta::Fragment(FragmentMeta {
         sp_ps_cntl_0: cntl,
         sp_ps_instr_size: 1,
+        sp_ps_const_config: 0x102,
+        sp_ps_config: if tex_cntl == 0 { 0x100 } else { 0x20300 },
+        sp_ps_wave_cntl: 3,
+        gras_cl_interp_cntl: 1,
+        rb_interp_cntl: 0x401,
+        rb_ps_input_cntl: 0,
         initial_tex_load_cntl: tex_cntl,
         initial_tex_load_cmd: tex_cmd,
         sp_reg_prog_id: PROG_ID_VARYING,
@@ -284,7 +334,7 @@ impl PipelineVariant {
 pub struct PipelineStateMeta {
     pub stride: u32,
     pub vfd_fetch: &'static [u32],
-    pub sampler_dword0: Option<u32>,
+    pub sampler_dwords: Option<[u32; 4]>,
     pub source_over: bool,
 }
 
@@ -300,13 +350,17 @@ pub const fn pipeline_state_meta(variant: PipelineVariant) -> PipelineStateMeta 
     const POS4_COLOR4_UV2: &[u32] = &[0xc820_0000, 1, 0xc820_0200, 1, 0xc670_0400, 1];
     match variant {
         Stride16Solid => fixed(16, POS2, None, true),
-        Stride16TextureRgba | Stride16TextureAlphaMask => fixed(16, POS2_UV2, Some(0x920), true),
+        Stride16TextureRgba | Stride16TextureAlphaMask => {
+            fixed(16, POS2_UV2, Some([0x920, 0x40, 0, 0]), true)
+        }
         Stride40Solid => fixed(40, POS4, None, true),
         Stride40VertexColor => fixed(40, POS4_COLOR4, None, true),
-        Stride40TextureVertexColorRgba => fixed(40, POS4_COLOR4_UV2, Some(0x920), true),
+        Stride40TextureVertexColorRgba => {
+            fixed(40, POS4_COLOR4_UV2, Some([0x920, 0x40, 0, 0]), true)
+        }
         Stride24Solid => fixed(24, POS4, None, true),
         Stride24TextureRgba | Stride24TextureRgbIgnoreAlpha => {
-            fixed(24, POS4_UV2, Some(0x92a), true)
+            fixed(24, POS4_UV2, Some([0x92a, 0x40, 0x20, 0]), true)
         }
         Stride28VertexColor => fixed(28, POS4_COLOR3, None, false),
     }
@@ -315,13 +369,13 @@ pub const fn pipeline_state_meta(variant: PipelineVariant) -> PipelineStateMeta 
 const fn fixed(
     stride: u32,
     vfd_fetch: &'static [u32],
-    sampler_dword0: Option<u32>,
+    sampler_dwords: Option<[u32; 4]>,
     source_over: bool,
 ) -> PipelineStateMeta {
     PipelineStateMeta {
         stride,
         vfd_fetch,
-        sampler_dword0,
+        sampler_dwords,
         source_over,
     }
 }
@@ -562,11 +616,32 @@ mod tests {
                 ShaderMeta::Vertex(meta) => {
                     assert_eq!(meta.sp_vs_cntl_0, number(generated, "sp_vs_cntl_0"));
                     assert_eq!(meta.sp_vs_instr_size, number(generated, "sp_vs_instr_size"));
+                    assert_eq!(
+                        meta.sp_vs_const_config,
+                        number(generated, "sp_vs_const_config")
+                    );
+                    assert_eq!(meta.sp_vs_config, number(generated, "sp_vs_config"));
                     assert_eq!(meta.vfd_dest_cntl, array(generated, "vfd_dest_cntl"));
+                    assert_eq!(
+                        meta.vfd_cntl_1_6,
+                        array(generated, "vfd_cntl_1_6").as_slice()
+                    );
                 }
                 ShaderMeta::Fragment(meta) => {
                     assert_eq!(meta.sp_ps_cntl_0, number(generated, "sp_ps_cntl_0"));
                     assert_eq!(meta.sp_ps_instr_size, number(generated, "sp_ps_instr_size"));
+                    assert_eq!(
+                        meta.sp_ps_const_config,
+                        number(generated, "sp_ps_const_config")
+                    );
+                    assert_eq!(meta.sp_ps_config, number(generated, "sp_ps_config"));
+                    assert_eq!(meta.sp_ps_wave_cntl, number(generated, "sp_ps_wave_cntl"));
+                    assert_eq!(
+                        meta.gras_cl_interp_cntl,
+                        number(generated, "gras_cl_interp_cntl")
+                    );
+                    assert_eq!(meta.rb_interp_cntl, number(generated, "rb_interp_cntl"));
+                    assert_eq!(meta.rb_ps_input_cntl, number(generated, "rb_ps_input_cntl"));
                     assert_eq!(
                         meta.initial_tex_load_cntl,
                         number(generated, "sp_ps_initial_tex_load_cntl")
@@ -631,6 +706,14 @@ mod tests {
             );
             assert_eq!(meta.vpc_ps_cntl, number(generated, "vpc_ps_cntl"));
         }
+        assert_eq!(
+            pipeline_state_meta(PipelineVariant::Stride16TextureRgba).sampler_dwords,
+            Some([0x920, 0x40, 0, 0])
+        );
+        assert_eq!(
+            pipeline_state_meta(PipelineVariant::Stride24TextureRgba).sampler_dwords,
+            Some([0x92a, 0x40, 0x20, 0])
+        );
         assert_eq!(PACKED_STATE_SHA256.len(), 64);
     }
 }
