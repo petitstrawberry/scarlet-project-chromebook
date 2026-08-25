@@ -41,7 +41,7 @@ use crate::{
     gmu::{self, A618Gmu},
     memory::{DmaAllocation, bidirectional_flags},
     registers::*,
-    submit::{LinearImage, ResolvedResource, validate_and_relocate},
+    submit::{LinearImage, ResolvedResource, diagnose_rejected_packet, validate_and_relocate},
 };
 
 const GPU_IOVA_BASE: u64 = 0x1_0000_0000;
@@ -1170,6 +1170,16 @@ impl GpuBackendQueue for A618Queue {
         )
         .map_err(|error| {
             early_println!("[a618] submit rejected: {}", error);
+            if let Some(packet) = diagnose_rejected_packet(commands) {
+                early_println!(
+                    "[a618] rejected PM4 packet kind={} word={} selector={:#06x} count={} first={:#010x}",
+                    packet.kind.label(),
+                    packet.word_offset,
+                    packet.selector,
+                    packet.payload_len,
+                    packet.first_value.unwrap_or(0),
+                );
+            }
             GpuBackendSubmitError::Rejected(error)
         })?;
         let byte_size = words.len().checked_mul(core::mem::size_of::<u32>()).ok_or(

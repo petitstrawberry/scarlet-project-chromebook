@@ -1,0 +1,6 @@
+[patch."https://github.com/petitstrawberry/scarlet-project-chromebook.git"]
+adreno-a6xx-pm4 = { path = "../../scarlet-project-chromebook/shared/adreno-a6xx-pm4" }
+adreno-a6xx-shader-pack = { path = "../../scarlet-project-chromebook/shared/adreno-a6xx-shader-pack" }
+adreno-a6xx-submit-wire = { path = "../../scarlet-project-chromebook/shared/adreno-a6xx-submit-wire" }
+sgfx-codegen-adreno-a6xx = { path = "../../scarlet-project-chromebook/userspace/sgfx-codegen-adreno-a6xx" }
+sgfx-backend-scarlet-adreno = { path = "../../scarlet-project-chromebook/userspace/sgfx-backend-scarlet-adreno" }

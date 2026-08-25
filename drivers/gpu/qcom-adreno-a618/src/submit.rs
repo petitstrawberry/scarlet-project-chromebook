@@ -228,6 +228,30 @@ pub(crate) struct ResolvedResource {
     pub(crate) linear_image: Option<LinearImage>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RejectedPacketKind {
+    Type4,
+    Type7,
+}
+
+impl RejectedPacketKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Type4 => "type4",
+            Self::Type7 => "type7",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RejectedPacket {
+    pub(crate) kind: RejectedPacketKind,
+    pub(crate) word_offset: u32,
+    pub(crate) selector: u32,
+    pub(crate) payload_len: u32,
+    pub(crate) first_value: Option<u32>,
+}
+
 fn exact(values: &[u32], expected: &[u32]) -> Result<(), &'static str> {
     if values == expected {
         Ok(())
@@ -1288,7 +1312,7 @@ fn packets_in_segment<'a>(
         .filter(move |p| p.word_offset >= start && p.word_offset < end)
 }
 
-fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressField>), &'static str> {
+fn copy_pm4(decoded: DecodedSubmit<'_>) -> Result<Vec<u32>, &'static str> {
     let mut words = Vec::new();
     words
         .try_reserve_exact(decoded.pm4_len())
@@ -1300,6 +1324,46 @@ fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressFiel
                 .ok_or("qcom-adreno-a618: PM4 table changed during decode")?,
         );
     }
+    Ok(words)
+}
+
+/// Return the first individually rejected PM4 packet for a diagnostic log.
+///
+/// Sequence-level and relocation-level failures intentionally return `None`;
+/// this helper never weakens or replaces the authoritative validation pass.
+pub(crate) fn diagnose_rejected_packet(bytes: &[u8]) -> Option<RejectedPacket> {
+    let decoded = adreno_a6xx_submit_wire::decode(bytes).ok()?;
+    let words = copy_pm4(decoded).ok()?;
+    let mut addresses = Vec::new();
+    for packet in Packets::new(&words) {
+        let packet = packet.ok()?;
+        let (kind, selector, result) = match packet.header {
+            Header::Type4 { register, .. } => (
+                RejectedPacketKind::Type4,
+                register,
+                validate_type4(register, packet.payload, packet.word_offset, &mut addresses),
+            ),
+            Header::Type7 { opcode, .. } => (
+                RejectedPacketKind::Type7,
+                u32::from(opcode),
+                validate_type7(opcode, packet.payload, packet.word_offset, &mut addresses),
+            ),
+        };
+        if result.is_err() {
+            return Some(RejectedPacket {
+                kind,
+                word_offset: packet.word_offset,
+                selector,
+                payload_len: packet.payload.len() as u32,
+                first_value: packet.payload.first().copied(),
+            });
+        }
+    }
+    None
+}
+
+fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressField>), &'static str> {
+    let words = copy_pm4(decoded)?;
 
     let mut addresses = Vec::new();
     for packet in Packets::new(&words) {
@@ -1558,7 +1622,8 @@ mod tests {
     };
 
     use super::{
-        LinearImage, RB_A2D_DEST_BUFFER_BASE, ResolvedResource, relocate_one, validate_and_relocate,
+        LinearImage, RB_A2D_DEST_BUFFER_BASE, RejectedPacketKind, ResolvedResource,
+        diagnose_rejected_packet, relocate_one, validate_and_relocate,
     };
 
     const TARGET: ObjectId = ObjectId::new(0);
@@ -1777,6 +1842,33 @@ mod tests {
         let mut bytes = std::vec![0; encoded_len(submit).unwrap()];
         encode(submit, &mut bytes).unwrap();
         assert!(validate_no_shaders(&bytes, |_| None).is_err());
+        let rejection = diagnose_rejected_packet(&bytes).unwrap();
+        assert_eq!(rejection.kind, RejectedPacketKind::Type4);
+        assert_eq!(rejection.word_offset, 0);
+        assert_eq!(rejection.selector, 0x800);
+        assert_eq!(rejection.payload_len, 1);
+        assert_eq!(rejection.first_value, Some(1));
+    }
+
+    #[test]
+    fn stale_userspace_sp_update_value_is_identified_without_allowing_it() {
+        let pm4 = [type4(super::SP_UPDATE_CNTL, 1).unwrap(), 0x000f_ffff];
+        let submit = Submit {
+            pm4: &pm4,
+            resources: &[],
+            relocations: &[],
+        };
+        let mut bytes = std::vec![0; encoded_len(submit).unwrap()];
+        encode(submit, &mut bytes).unwrap();
+
+        assert_eq!(
+            validate_no_shaders(&bytes, |_| None),
+            Err("qcom-adreno-a618: unsafe PM4 register value")
+        );
+        let rejection = diagnose_rejected_packet(&bytes).unwrap();
+        assert_eq!(rejection.kind, RejectedPacketKind::Type4);
+        assert_eq!(rejection.selector, super::SP_UPDATE_CNTL);
+        assert_eq!(rejection.first_value, Some(0x000f_ffff));
     }
 
     #[test]

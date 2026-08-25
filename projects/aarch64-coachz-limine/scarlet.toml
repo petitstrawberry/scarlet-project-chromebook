@@ -83,6 +83,15 @@ kind = "copy"
 source = "firmware/rootfs"
 to = "/system/scarlet"
 
+# The generic Scarlet bundle is intentionally backend-neutral and keeps its
+# Adreno crates pinned to a published git revision.  During CoachZ driver
+# development, rebuild the binaries that actually submit A6xx commands against
+# this checkout so userspace and the in-tree kernel validator cannot drift.
+[[images.rootfs.layers]]
+kind = "script"
+source = "tools/build-coachz-sgfx-userspace.sh"
+to = "/system/scarlet/bin"
+
 [images.boot]
 format = "limine-uefi"
 output = ".scarlet/images/esp-aarch64-coachz.img"
