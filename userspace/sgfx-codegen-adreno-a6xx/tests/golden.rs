@@ -189,8 +189,6 @@ fn clear_is_a_golden_address_free_stream() {
             0x702c_0001,
             3,
             0x7026_8000,
-            0x7046_0001,
-            0x1d,
             0x7026_8000,
         ]
     );
@@ -273,8 +271,6 @@ fn copy_is_a_golden_two_relocation_stream() {
             0x702c_0001,
             3,
             0x7026_8000,
-            0x7046_0001,
-            0x1d,
             0x7026_8000,
         ]
     );

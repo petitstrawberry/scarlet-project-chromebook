@@ -17,7 +17,6 @@ const CP_SET_VISIBILITY_OVERRIDE: u8 = 0x64;
 const CP_REG_WRITE: u8 = 0x6d;
 
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
-const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
@@ -411,7 +410,7 @@ fn validate_type7(
         (opcode::EVENT_WRITE, 1)
             if matches!(
                 payload[0],
-                EVENT_CCU_INVALIDATE_COLOR | EVENT_CCU_FLUSH_COLOR_TS | EVENT_CACHE_INVALIDATE
+                EVENT_CCU_INVALIDATE_COLOR | EVENT_CACHE_INVALIDATE
             ) =>
         {
             Ok(())
@@ -1522,6 +1521,22 @@ mod tests {
     #[test]
     fn event_packet_cannot_smuggle_a_fence_address() {
         let pm4 = [type7(opcode::EVENT_WRITE, 3).unwrap(), 0x1d, 0, 0];
+        let submit = Submit {
+            pm4: &pm4,
+            resources: &[],
+            relocations: &[],
+        };
+        let mut bytes = std::vec![0; encoded_len(submit).unwrap()];
+        encode(submit, &mut bytes).unwrap();
+        assert!(validate_no_shaders(&bytes, |_| None).is_err());
+    }
+
+    #[test]
+    fn timestamped_ccu_flush_without_an_address_is_rejected() {
+        // A6xx CCU_FLUSH_COLOR_TS is a four-dword CP_EVENT_WRITE operation.
+        // The old userspace emitter sent only this selector, which is framed
+        // PM4 but illegal SQE input.
+        let pm4 = [type7(opcode::EVENT_WRITE, 1).unwrap(), 0x1d];
         let submit = Submit {
             pm4: &pm4,
             resources: &[],

@@ -56,6 +56,30 @@ const GMEM_SIZE: u64 = 512 * 1024;
 const GPU_TIMEOUT_US: u64 = 1_000_000;
 const GPU_QUIESCE_TIMEOUT_US: u64 = 10_000;
 const CP_INDIRECT_BUFFER: u8 = 0x3f;
+const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
+const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
+const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
+const CP_EVENT_WRITE_IRQ: u32 = 1 << 31;
+
+fn completion_events(fence_address: u64, sequence: u32) -> Result<[u32; 10], &'static str> {
+    let ccu_fence_address = fence_address
+        .checked_add(4)
+        .ok_or("qcom-adreno-a618: completion fence address overflows")?;
+    let header = type7(opcode::EVENT_WRITE, 4)
+        .map_err(|_| "qcom-adreno-a618: failed to encode kernel fence")?;
+    Ok([
+        header,
+        EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP,
+        ccu_fence_address as u32,
+        (ccu_fence_address >> 32) as u32,
+        sequence,
+        header,
+        EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP | CP_EVENT_WRITE_IRQ,
+        fence_address as u32,
+        (fence_address >> 32) as u32,
+        sequence,
+    ])
+}
 
 const CP_PROTECT: [u32; 32] = [
     protect_readonly(0x00000, 0x04ff),
@@ -659,15 +683,12 @@ impl A618Core {
         hardware.fence_sequence = hardware.fence_sequence.wrapping_add(1).max(1);
         let sequence = hardware.fence_sequence;
         hardware.fence.as_words_mut()[0] = 0;
+        hardware.fence.as_words_mut()[1] = 0;
         hardware.fence.clean_for_device();
-        let event = [
-            type7(opcode::EVENT_WRITE, 4)
-                .map_err(|_| "qcom-adreno-a618: failed to encode kernel fence")?,
-            4 | (1 << 31),
-            hardware.fence.dma_addr() as u32,
-            (hardware.fence.dma_addr() >> 32) as u32,
-            sequence,
-        ];
+        // Both events are timestamped A6xx events and therefore require the
+        // complete four-dword payload.  Keep the CCU completion in a separate
+        // word so only the final UCHE/cache event can satisfy the CPU fence.
+        let event = completion_events(hardware.fence.dma_addr(), sequence)?;
         let mut ring = Vec::new();
         ring.try_reserve_exact(words.len() + event.len())
             .map_err(|_| "qcom-adreno-a618: kernel fence command allocation failed")?;
@@ -1469,7 +1490,10 @@ pub(crate) fn remove(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::A618Core;
+    use super::{
+        A618Core, CP_EVENT_WRITE_IRQ, CP_EVENT_WRITE_TIMESTAMP, EVENT_CACHE_FLUSH_TS,
+        EVENT_CCU_FLUSH_COLOR_TS, completion_events,
+    };
 
     #[test]
     fn checks_a630_sqe_version_after_the_linux_firmware_host_header() {
@@ -1481,5 +1505,25 @@ mod tests {
         ];
         assert!(!A618Core::sqe_version_is_secure(&firmware_prefix));
         assert!(A618Core::sqe_version_is_secure(&firmware_prefix[4..]));
+    }
+
+    #[test]
+    fn completion_events_use_addressed_timestamp_packets() {
+        let events = completion_events(0x1_2345_6000, 7).unwrap();
+        assert_eq!(
+            events[1],
+            EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP
+        );
+        assert_eq!(events[2], 0x2345_6004);
+        assert_eq!(events[3], 1);
+        assert_eq!(events[4], 7);
+        assert_eq!(events[5], events[0]);
+        assert_eq!(
+            events[6],
+            EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP | CP_EVENT_WRITE_IRQ
+        );
+        assert_eq!(events[7], 0x2345_6000);
+        assert_eq!(events[8], 1);
+        assert_eq!(events[9], 7);
     }
 }

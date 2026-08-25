@@ -22,7 +22,6 @@ const CP_SET_VISIBILITY_OVERRIDE: u8 = 0x64;
 const CP_REG_WRITE: u8 = 0x6d;
 
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
-const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
@@ -566,7 +565,13 @@ impl Emitter {
     }
 
     fn submission_end(&mut self) -> Result<(), CompileError> {
-        self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_FLUSH_COLOR_TS])?;
+        // CCU_FLUSH_COLOR_TS is a timestamped A6xx event.  Its legal
+        // CP_EVENT_WRITE form has four payload dwords, including a writable
+        // address and a sequence value.  The trusted kernel transport owns
+        // that completion allocation and appends the correctly addressed CCU
+        // flush before its final cache/fence event.  Emitting the event here
+        // with only its event selector makes SQE raise
+        // CP_ILLEGAL_INSTR_ERROR after it has consumed the user IB.
         self.wait_for_idle()
     }
 
