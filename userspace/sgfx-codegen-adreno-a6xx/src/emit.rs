@@ -915,7 +915,12 @@ impl Emitter {
             destination_offset,
             destination_required_size,
             Access::WRITE,
-        )
+        )?;
+        // CP memory writes execute asynchronously with respect to following
+        // graphics work.  The uploaded buffer may be consumed as vertex data
+        // later in this same submission, so make the copy visible before any
+        // such read.  WAIT_FOR_IDLE does not order CP_MEMCPY writes.
+        self.packet7(opcode::WAIT_MEM_WRITES, &[])
     }
 
     fn add_generated(

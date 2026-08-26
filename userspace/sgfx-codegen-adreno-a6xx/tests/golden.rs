@@ -1,4 +1,4 @@
-use adreno_a6xx_pm4::{Header, Packets};
+use adreno_a6xx_pm4::{Header, Packets, opcode};
 use adreno_a6xx_shader_pack::ShaderVariant;
 use sgfx_codegen_adreno_a6xx::{
     Access, Capabilities, CompileError, CompileInput, ImageMeta, ImageModifier, ObjectId,
@@ -458,6 +458,24 @@ fn aligned_upload_becomes_generated_object_and_symbolic_memcpy() {
     assert_eq!(artifact.fixups.len(), 2);
     assert!(matches!(artifact.fixups[0].object, ObjectRef::Generated(_)));
     assert_eq!(artifact.fixups[1].object, ObjectRef::External(VERTICES));
+
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let memcpy = packets
+        .iter()
+        .position(|packet| matches!(packet.header, Header::Type7 { opcode: 0x75, .. }))
+        .unwrap();
+    assert!(matches!(
+        packets.get(memcpy + 1),
+        Some(packet)
+            if packet.header
+                == (Header::Type7 {
+                    opcode: opcode::WAIT_MEM_WRITES,
+                    count: 0,
+                })
+                && packet.payload.is_empty()
+    ));
 }
 
 #[test]

@@ -152,6 +152,9 @@ struct RingFailureSnapshot {
     wptr: u32,
     target_wptr: u32,
     status: u32,
+    status1: u32,
+    status2: u32,
+    status3: u32,
     cp_interrupt: u32,
     cp_hw_fault: u32,
     cp_protect_status: u32,
@@ -159,7 +162,13 @@ struct RingFailureSnapshot {
     ib1_remaining: u32,
     ib2_base: u64,
     ib2_remaining: u32,
-    fence: Option<(u32, u32)>,
+    roq_rb: u32,
+    roq_ib1: u32,
+    roq_ib2: u32,
+    roq_sds: u32,
+    roq_mrb: u32,
+    roq_vsd: u32,
+    fence: Option<(u32, u32, u32)>,
 }
 
 struct HardwareState {
@@ -528,7 +537,7 @@ impl A618Core {
         command_words: usize,
         target_wptr: u32,
         interrupt: u32,
-        fence: Option<(u32, u32)>,
+        fence: Option<(u32, u32, u32)>,
     ) -> RingFailureSnapshot {
         let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
         RingFailureSnapshot {
@@ -540,6 +549,9 @@ impl A618Core {
             wptr: self.registers.read(CP_RB_WPTR),
             target_wptr,
             status: self.registers.read(RBBM_STATUS),
+            status1: self.registers.read(RBBM_STATUS1),
+            status2: self.registers.read(RBBM_STATUS2),
+            status3: self.registers.read(RBBM_STATUS3),
             cp_interrupt,
             cp_hw_fault: if cp_interrupt != 0 {
                 self.registers.read(CP_HW_FAULT)
@@ -555,6 +567,12 @@ impl A618Core {
             ib1_remaining: self.registers.read(CP_IB1_REM_SIZE),
             ib2_base: self.registers.read64(CP_IB2_BASE),
             ib2_remaining: self.registers.read(CP_IB2_REM_SIZE),
+            roq_rb: self.registers.read(CP_ROQ_RB_STATUS),
+            roq_ib1: self.registers.read(CP_ROQ_IB1_STATUS),
+            roq_ib2: self.registers.read(CP_ROQ_IB2_STATUS),
+            roq_sds: self.registers.read(CP_ROQ_SDS_STATUS),
+            roq_mrb: self.registers.read(CP_ROQ_MRB_STATUS),
+            roq_vsd: self.registers.read(CP_ROQ_VSD_STATUS),
             fence,
         }
     }
@@ -582,7 +600,16 @@ impl A618Core {
             snapshot.wptr,
             snapshot.target_wptr,
         );
-        early_println!("[a618] status={:#010x}", snapshot.status);
+        early_println!(
+            "[a618] status={:#010x} status1={:#010x} status2={:#010x} status3={:#010x}",
+            snapshot.status,
+            snapshot.status1,
+            snapshot.status2,
+            snapshot.status3,
+        );
+        if snapshot.status3 & RBBM_STATUS3_SMMU_STALLED_ON_FAULT != 0 {
+            early_println!("[a618] SMMU stalled on fault");
+        }
         if snapshot.cp_interrupt != 0 {
             early_println!(
                 "[a618] cp fault={:#010x} protect={:#010x}",
@@ -600,8 +627,25 @@ impl A618Core {
             snapshot.ib2_base,
             snapshot.ib2_remaining,
         );
-        if let Some((actual, expected)) = snapshot.fence {
-            early_println!("[a618] fence actual={:#x} expected={:#x}", actual, expected,);
+        early_println!(
+            "[a618] roq rb={:#010x} ib1={:#010x} ib2={:#010x}",
+            snapshot.roq_rb,
+            snapshot.roq_ib1,
+            snapshot.roq_ib2,
+        );
+        early_println!(
+            "[a618] roq sds={:#010x} mrb={:#010x} vsd={:#010x}",
+            snapshot.roq_sds,
+            snapshot.roq_mrb,
+            snapshot.roq_vsd,
+        );
+        if let Some((actual, ccu, expected)) = snapshot.fence {
+            early_println!(
+                "[a618] fence actual={:#x} ccu={:#x} expected={:#x}",
+                actual,
+                ccu,
+                expected,
+            );
         }
     }
 
@@ -613,7 +657,7 @@ impl A618Core {
         command_words: usize,
         target_wptr: u32,
         interrupt: u32,
-        fence: Option<(u32, u32)>,
+        fence: Option<(u32, u32, u32)>,
     ) {
         let snapshot = self.capture_ring_failure(
             reason,
@@ -701,7 +745,9 @@ impl A618Core {
         let mut observed_interrupts = 0;
         loop {
             hardware.fence.invalidate_from_device();
-            let fence_value = hardware.fence.as_words().first().copied().unwrap_or(0);
+            let fence_words = hardware.fence.as_words();
+            let fence_value = fence_words.first().copied().unwrap_or(0);
+            let ccu_fence_value = fence_words.get(1).copied().unwrap_or(0);
             if fence_value == sequence
                 && self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
@@ -731,7 +777,7 @@ impl A618Core {
                         command_words,
                         target_wptr,
                         observed_interrupts,
-                        Some((fence_value, sequence)),
+                        Some((fence_value, ccu_fence_value, sequence)),
                     );
                     return Err(if cp_interrupt & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
                         "qcom-adreno-a618: CP illegal instruction during synchronous submit"
@@ -748,7 +794,7 @@ impl A618Core {
                     command_words,
                     target_wptr,
                     observed_interrupts,
-                    Some((fence_value, sequence)),
+                    Some((fence_value, ccu_fence_value, sequence)),
                 );
                 return Err("qcom-adreno-a618: synchronous GPU fence timed out");
             }

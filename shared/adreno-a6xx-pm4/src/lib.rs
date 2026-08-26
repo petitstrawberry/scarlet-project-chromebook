@@ -194,6 +194,8 @@ impl<'a> Iterator for Packets<'a> {
 
 /// Common A6xx type-7 opcodes used by the trusted kernel stream builder.
 pub mod opcode {
+    /// Wait until preceding asynchronous command-processor memory writes complete.
+    pub const WAIT_MEM_WRITES: u8 = 0x12;
     /// Wait until preceding work is idle.
     pub const WAIT_FOR_IDLE: u8 = 0x26;
     /// A6xx blit operation.

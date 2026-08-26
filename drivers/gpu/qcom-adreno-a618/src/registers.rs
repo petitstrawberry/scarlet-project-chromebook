@@ -209,6 +209,10 @@ pub(crate) const RBBM_INT_FATAL_MASK: u32 = RBBM_INT_CP_AHB_ERROR
     | RBBM_INT_UCHE_OOB_ACCESS
     | RBBM_INT_UCHE_TRAP_INTR;
 pub(crate) const RBBM_STATUS: usize = 0x0210;
+pub(crate) const RBBM_STATUS1: usize = 0x0211;
+pub(crate) const RBBM_STATUS2: usize = 0x0212;
+pub(crate) const RBBM_STATUS3: usize = 0x0213;
+pub(crate) const RBBM_STATUS3_SMMU_STALLED_ON_FAULT: u32 = 1 << 24;
 /// Bit 0 in the upstream A6XX XML; it may remain set while CP queues are idle.
 pub(crate) const RBBM_STATUS_CP_AHB_BUSY_CX_MASTER: u32 = 0x0000_0001;
 pub(crate) const RBBM_SW_RESET_CMD: usize = 0x0043;
@@ -255,6 +259,12 @@ pub(crate) const CP_IB1_BASE: usize = 0x0928;
 pub(crate) const CP_IB1_REM_SIZE: usize = 0x092a;
 pub(crate) const CP_IB2_BASE: usize = 0x092b;
 pub(crate) const CP_IB2_REM_SIZE: usize = 0x092d;
+pub(crate) const CP_ROQ_RB_STATUS: usize = 0x0939;
+pub(crate) const CP_ROQ_IB1_STATUS: usize = 0x093a;
+pub(crate) const CP_ROQ_IB2_STATUS: usize = 0x093b;
+pub(crate) const CP_ROQ_SDS_STATUS: usize = 0x093c;
+pub(crate) const CP_ROQ_MRB_STATUS: usize = 0x093d;
+pub(crate) const CP_ROQ_VSD_STATUS: usize = 0x093e;
 
 pub(crate) const UCHE_ADDR_MODE_CNTL: usize = 0x0e00;
 pub(crate) const UCHE_WRITE_RANGE_MAX: usize = 0x0e05;

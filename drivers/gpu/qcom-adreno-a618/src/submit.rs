@@ -568,6 +568,7 @@ fn validate_type7(
     addresses: &mut Vec<AddressField>,
 ) -> Result<(), &'static str> {
     match (opcode_value, payload.len()) {
+        (opcode::WAIT_MEM_WRITES, 0) => Ok(()),
         (opcode::WAIT_FOR_IDLE, 0) => Ok(()),
         (opcode::EVENT_WRITE, 1)
             if matches!(
@@ -659,6 +660,47 @@ fn validate_type7(
         }
         _ => Err("qcom-adreno-a618: PM4 opcode is not allowlisted"),
     }
+}
+
+/// Require every asynchronous CP memory copy to be ordered before the next
+/// packet can consume its destination.  Userspace currently uses CP_MEMCPY for
+/// per-frame vertex uploads, so accepting an unpaired copy would permit a
+/// deterministic GPU data race even though each packet is individually safe.
+fn validate_memcpy_barriers(words: &[u32]) -> Result<(), &'static str> {
+    let mut require_wait = false;
+    for packet in Packets::new(words) {
+        let packet = packet.map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
+        if require_wait {
+            match packet.header {
+                Header::Type7 {
+                    opcode: opcode_value,
+                    count,
+                } if opcode_value == opcode::WAIT_MEM_WRITES
+                    && count == 0
+                    && packet.payload.is_empty() =>
+                {
+                    require_wait = false;
+                    continue;
+                }
+                _ => {
+                    return Err(
+                        "qcom-adreno-a618: CP_MEMCPY must be followed by CP_WAIT_MEM_WRITES",
+                    );
+                }
+            }
+        }
+        require_wait = matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: CP_MEMCPY,
+                ..
+            }
+        );
+    }
+    if require_wait {
+        return Err("qcom-adreno-a618: CP_MEMCPY must be followed by CP_WAIT_MEM_WRITES");
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1380,6 +1422,7 @@ fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressFiel
     if addresses.len() != decoded.relocation_len() {
         return Err("qcom-adreno-a618: every GPU address must have one relocation");
     }
+    validate_memcpy_barriers(&words)?;
     validate_a2d_sequences(&words, &mut addresses)?;
     validate_3d_sequences(&words, &mut addresses)?;
     for (index, address) in addresses.iter().enumerate() {
@@ -1902,7 +1945,15 @@ mod tests {
 
     #[test]
     fn memcpy_requires_two_authorized_kernel_relocations() {
-        let pm4 = [type7(0x75, 5).unwrap(), 4, 0, 0, 0, 0];
+        let pm4 = [
+            type7(0x75, 5).unwrap(),
+            4,
+            0,
+            0,
+            0,
+            0,
+            type7(opcode::WAIT_MEM_WRITES, 0).unwrap(),
+        ];
         let resources = [
             Resource {
                 attachment_token: 1,
@@ -1962,6 +2013,44 @@ mod tests {
         .unwrap();
         assert_eq!(&words[2..4], &[0, 2]);
         assert_eq!(&words[4..6], &[32, 3]);
+    }
+
+    #[test]
+    fn codegen_memcpy_without_wait_mem_writes_is_rejected() {
+        let buffers = [ResourceMeta {
+            id: BUFFER,
+            size: 64,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::COPY_DST,
+            },
+        }];
+        let data = [1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let operations = [Operation::WriteBuffer {
+            destination: BUFFER,
+            offset: 16,
+            data: &data,
+        }];
+        let mut artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &buffers,
+            pipelines: &[],
+            operations: &operations,
+        })
+        .unwrap();
+        let wait_word = artifact
+            .words
+            .iter()
+            .position(|word| {
+                adreno_a6xx_pm4::decode_header(*word)
+                    == Ok(Header::Type7 {
+                        opcode: opcode::WAIT_MEM_WRITES,
+                        count: 0,
+                    })
+            })
+            .unwrap();
+        artifact.words.remove(wait_word);
+
+        assert!(accept_codegen(&artifact).is_err());
     }
 
     #[test]
@@ -2124,7 +2213,7 @@ mod tests {
                 id: BUFFER,
                 size: 120,
                 kind: ResourceKind::Buffer {
-                    usage: BufferUsage::VERTEX,
+                    usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
                 },
             },
         ];
@@ -2178,6 +2267,48 @@ mod tests {
         })
         .unwrap();
         assert!(accept_codegen(&artifact).is_ok());
+
+        // SWS writes its reused quad buffer and consumes it as vertex data in
+        // one submit.  Keep the exact CP-write -> cache-invalidate -> draw
+        // transition accepted as a unit, not merely as isolated operations.
+        let upload_bytes = [0_u8; 120];
+        let mut upload_then_draw = operations.to_vec();
+        upload_then_draw.insert(
+            0,
+            Operation::WriteBuffer {
+                destination: BUFFER,
+                offset: 0,
+                data: &upload_bytes,
+            },
+        );
+        let upload_draw_artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &upload_then_draw,
+        })
+        .unwrap();
+        assert!(accept_codegen(&upload_draw_artifact).is_ok());
+        let upload_draw_packets = Packets::new(&upload_draw_artifact.words)
+            .collect::<Result<std::vec::Vec<_>, _>>()
+            .unwrap();
+        let packet_index = |wanted_opcode: u8, wanted_event: Option<u32>| {
+            upload_draw_packets
+                .iter()
+                .position(|packet| {
+                    matches!(
+                        packet.header,
+                        Header::Type7 { opcode, .. } if opcode == wanted_opcode
+                    ) && wanted_event.is_none_or(|event| packet.payload.first() == Some(&event))
+                })
+                .unwrap()
+        };
+        let memcpy = packet_index(super::CP_MEMCPY, None);
+        let wait = packet_index(opcode::WAIT_MEM_WRITES, None);
+        let invalidate = packet_index(opcode::EVENT_WRITE, Some(super::EVENT_CACHE_INVALIDATE));
+        let draw = packet_index(super::CP_DRAW_INDX_OFFSET, None);
+        assert_eq!(wait, memcpy + 1);
+        assert!(wait < invalidate && invalidate < draw);
 
         // A real frame normally clears the target before its first 3D draw.
         // The A2D marker from that clear must not make the following canonical
