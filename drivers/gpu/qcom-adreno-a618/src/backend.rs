@@ -33,7 +33,7 @@ use scarlet::{
     time, vm,
 };
 
-use adreno_a6xx_pm4::{opcode, type7};
+use adreno_a6xx_pm4::{opcode, type4, type7};
 use adreno_a6xx_shader_pack::{PACK_SIZE, SHADER_ALIGNMENT, SHADER_SIZE, ShaderVariant, copy_pack};
 
 use crate::{
@@ -57,18 +57,23 @@ const GPU_TIMEOUT_US: u64 = 1_000_000;
 const GPU_QUIESCE_TIMEOUT_US: u64 = 10_000;
 const CP_INDIRECT_BUFFER: u8 = 0x3f;
 const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
+const CP_EVENT_WRITE_IRQ: u32 = 1 << 31;
 // Linux's A6xx hardware initialization uses the complete 49-bit UCHE address
 // range.  Limiting this to a mapped trap page silently puts every later
 // shader, vertex, and texture allocation into L2-bypass mode.
 const UCHE_CACHED_WRITE_RANGE_MAX: u64 = 0x0001_ffff_ffff_ffc0;
 const UCHE_UNMAPPED_TRAP_BASE: u64 = 0x0001_ffff_ffff_f000;
 
-fn completion_event(fence_address: u64, sequence: u32) -> Result<[u32; 5], &'static str> {
-    let header = type7(opcode::EVENT_WRITE, 4)
+fn completion_commands(fence_address: u64, sequence: u32) -> Result<[u32; 7], &'static str> {
+    let scratch_header = type4(CP_SCRATCH_2 as u32, 1)
+        .map_err(|_| "qcom-adreno-a618: failed to encode kernel scratch write")?;
+    let event_header = type7(opcode::EVENT_WRITE, 4)
         .map_err(|_| "qcom-adreno-a618: failed to encode kernel fence")?;
     Ok([
-        header,
-        EVENT_CACHE_FLUSH_TS,
+        scratch_header,
+        sequence,
+        event_header,
+        EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ,
         fence_address as u32,
         (fence_address >> 32) as u32,
         sequence,
@@ -162,6 +167,7 @@ struct RingFailureSnapshot {
     roq_sds: u32,
     roq_mrb: u32,
     roq_vsd: u32,
+    scratch2: u32,
     fence: Option<(u32, u32)>,
 }
 
@@ -570,6 +576,7 @@ impl A618Core {
             roq_sds: self.registers.read(CP_ROQ_SDS_STATUS),
             roq_mrb: self.registers.read(CP_ROQ_MRB_STATUS),
             roq_vsd: self.registers.read(CP_ROQ_VSD_STATUS),
+            scratch2: self.registers.read(CP_SCRATCH_2),
             fence,
         }
     }
@@ -636,6 +643,7 @@ impl A618Core {
             snapshot.roq_mrb,
             snapshot.roq_vsd,
         );
+        early_println!("[a618] scratch2={:#x}", snapshot.scratch2);
         if let Some((actual, expected)) = snapshot.fence {
             early_println!("[a618] fence actual={:#x} expected={:#x}", actual, expected,);
         }
@@ -720,17 +728,18 @@ impl A618Core {
         let sequence = hardware.fence_sequence;
         hardware.fence.as_words_mut()[0] = 0;
         hardware.fence.clean_for_device();
-        // A5xx/A6xx Freedreno retires a submit with one addressed
-        // CACHE_FLUSH_TS packet.  Rendering streams already perform their CCU
-        // clean/invalidate sequence before this kernel-owned fence.  Keeping a
-        // second timestamped CCU event here needlessly makes completion depend
-        // on an extra asynchronous event after every sysmem draw.
-        let event = completion_event(hardware.fence.dma_addr(), sequence)?;
+        // Match Linux A6xx submit retirement exactly: publish the sequence in
+        // CP_SCRATCH(2), then use one addressed CACHE_FLUSH_TS with its IRQ bit
+        // set.  The interrupt line remains masked because Scarlet polls status;
+        // the bit is nevertheless part of the hardware timestamp/writeback
+        // contract. Rendering streams already retire their CCU state before
+        // this kernel-owned fence, so no second CCU timestamp belongs here.
+        let completion = completion_commands(hardware.fence.dma_addr(), sequence)?;
         let mut ring = Vec::new();
-        ring.try_reserve_exact(words.len() + event.len())
+        ring.try_reserve_exact(words.len() + completion.len())
             .map_err(|_| "qcom-adreno-a618: kernel fence command allocation failed")?;
         ring.extend_from_slice(words);
-        ring.extend_from_slice(&event);
+        ring.extend_from_slice(&completion);
         let target_wptr = self.write_ring(hardware, &ring)?;
         let start = time::current_time();
         let mut observed_interrupts = 0;
@@ -1535,7 +1544,10 @@ pub(crate) fn remove(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{A618Core, EVENT_CACHE_FLUSH_TS, completion_event};
+    use adreno_a6xx_pm4::{opcode, type4, type7};
+
+    use super::{A618Core, CP_EVENT_WRITE_IRQ, EVENT_CACHE_FLUSH_TS, completion_commands};
+    use crate::registers::CP_SCRATCH_2;
 
     #[test]
     fn checks_a630_sqe_version_after_the_linux_firmware_host_header() {
@@ -1550,11 +1562,14 @@ mod tests {
     }
 
     #[test]
-    fn completion_event_matches_the_a6xx_freedreno_fence_packet() {
-        let event = completion_event(0x1_2345_6000, 7).unwrap();
-        assert_eq!(event[1], EVENT_CACHE_FLUSH_TS);
-        assert_eq!(event[2], 0x2345_6000);
-        assert_eq!(event[3], 1);
-        assert_eq!(event[4], 7);
+    fn completion_commands_match_the_linux_a6xx_fence_sequence() {
+        let commands = completion_commands(0x1_2345_6000, 7).unwrap();
+        assert_eq!(commands[0], type4(CP_SCRATCH_2 as u32, 1).unwrap());
+        assert_eq!(commands[1], 7);
+        assert_eq!(commands[2], type7(opcode::EVENT_WRITE, 4).unwrap());
+        assert_eq!(commands[3], EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
+        assert_eq!(commands[4], 0x2345_6000);
+        assert_eq!(commands[5], 1);
+        assert_eq!(commands[6], 7);
     }
 }
