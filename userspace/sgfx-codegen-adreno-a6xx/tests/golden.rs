@@ -198,7 +198,7 @@ fn clear_is_a_golden_address_free_stream() {
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.fixups.len(), 2);
+    assert_eq!(artifact.fixups.len(), 3);
     assert_eq!(artifact.fixups[1].object, ObjectRef::External(TARGET));
     assert_eq!(artifact.fixups[1].access, Access::WRITE);
     assert_eq!(
@@ -251,6 +251,13 @@ fn clear_is_a_golden_address_free_stream() {
             0x702c_0001,
             3,
             0x7026_8000,
+            0x7046_0004,
+            0x4000_001d,
+            0,
+            0,
+            2,
+            0x7046_0001,
+            0x19,
             0x7026_8000,
         ]
     );
@@ -275,7 +282,7 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.fixups.len(), 3);
+    assert_eq!(artifact.fixups.len(), 4);
     assert_eq!(artifact.fixups[1].object, ObjectRef::External(SOURCE));
     assert_eq!(artifact.fixups[1].access, Access::READ);
     assert_eq!(artifact.fixups[2].object, ObjectRef::External(TARGET));
@@ -339,6 +346,13 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
             0x702c_0001,
             3,
             0x7026_8000,
+            0x7046_0004,
+            0x4000_001d,
+            0,
+            0,
+            2,
+            0x7046_0001,
+            0x19,
             0x7026_8000,
         ]
     );
@@ -381,7 +395,7 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
     assert_eq!(artifact.generated_objects.len(), 1);
-    assert_eq!(artifact.fixups.len(), 7);
+    assert_eq!(artifact.fixups.len(), 8);
     let canonical: Vec<_> = artifact
         .fixups
         .iter()
@@ -418,6 +432,15 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
         matches!(packet.header, Header::Type7 { opcode: 0x6d, .. })
             && packet.payload == [2, 0x8801, 0x10]
     }));
+    for (opcode, expected) in [(0x1d, 0), (0x23, 1)] {
+        assert!(
+            packets.iter().any(|packet| {
+                matches!(packet.header, Header::Type7 { opcode: actual, .. } if actual == opcode)
+                    && packet.payload == [expected]
+            }),
+            "missing canonical A618 IB2 policy opcode {opcode:#x}"
+        );
+    }
     let shader_preloads: Vec<_> = packets
         .iter()
         .filter(|packet| {
@@ -476,7 +499,7 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
         (0x8802, &[0, 4, 0]),
         (0x9200, &[0, 0, 0, 0, 0, 0, 0, 0]),
         (0x9208, &[0, 0, 0, 0, 0, 0, 0, 0]),
-        (0x9306, &[1]),
+        (0x9306, &[0]),
         (0x8000, &[0x80]),
         (0x8006, &[0x0007_fdff]),
         (0x9108, &[3]),

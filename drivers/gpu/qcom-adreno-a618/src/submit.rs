@@ -4,7 +4,7 @@
 
 use alloc::vec::Vec;
 
-use adreno_a6xx_pm4::{Header, Packets, opcode};
+use adreno_a6xx_pm4::{Header, Packet, Packets, opcode};
 use adreno_a6xx_shader_pack::{
     PipelineVariant, ShaderMeta, ShaderVariant, link_meta, pipeline_state_meta, shader_meta,
 };
@@ -15,6 +15,8 @@ use adreno_a6xx_submit_wire::{
 const CP_MEMCPY: u8 = 0x75;
 const CP_SET_VISIBILITY_OVERRIDE: u8 = 0x64;
 const CP_REG_WRITE: u8 = 0x6d;
+const CP_SKIP_IB2_ENABLE_GLOBAL: u8 = 0x1d;
+const CP_SKIP_IB2_ENABLE_LOCAL: u8 = 0x23;
 
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
@@ -452,7 +454,7 @@ fn validate_type4(
             1,
         ) => exact(payload, &[0]),
         (VFD_MODE_CNTL, 1) => exact(payload, &[3]),
-        (VPC_SO_OVERRIDE, 1) => exact(payload, &[1]),
+        (VPC_SO_OVERRIDE, 1) => exact(payload, &[0]),
         (PC_MODE_CNTL, 1) => exact(payload, &[0x1f]),
         (SP_MODE_CNTL, 1) => exact(payload, &[5]),
         (TPL1_MODE_CNTL, 1) => exact(payload, &[0xa2]),
@@ -588,6 +590,8 @@ fn validate_type7(
             address_field(addresses, packet_word + 2, ACCESS_WRITE, false, Some(4))
         }
         (opcode::SET_MARKER, 1) if matches!(payload[0], 1 | 12) => Ok(()),
+        (CP_SKIP_IB2_ENABLE_GLOBAL, 1) => exact(payload, &[0]),
+        (CP_SKIP_IB2_ENABLE_LOCAL, 1) => exact(payload, &[1]),
         (CP_SET_VISIBILITY_OVERRIDE, 1) => exact(payload, &[1]),
         (CP_REG_WRITE, 3) => exact(payload, &[2, RB_RENDER_CNTL, 0x10]),
         (opcode::BLIT, 1) => exact(payload, &[3]),
@@ -750,6 +754,76 @@ fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
     }
     if clean_pending {
         return Err("qcom-adreno-a618: CCU color clean is missing its invalidation");
+    }
+    Ok(())
+}
+
+/// A618 can consume the complete IB while a misplaced WFI remains parked in
+/// front of dirty color-cache retirement. Pin every rendering operation to
+/// the upstream ordering instead of accepting the packets independently.
+fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
+    let packets = Packets::new(words)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "qcom-adreno-a618: malformed PM4 retirement stream")?;
+    let is_clean = |packet: &Packet<'_>| {
+        matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: opcode::EVENT_WRITE,
+                count: 4,
+            }
+        ) && packet.payload.first() == Some(&(EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP))
+    };
+    let is_invalidate = |packet: &Packet<'_>| {
+        matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: opcode::EVENT_WRITE,
+                count: 1,
+            }
+        ) && packet.payload == [EVENT_CCU_INVALIDATE_COLOR]
+    };
+    let is_wfi = |packet: &Packet<'_>| {
+        matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: opcode::WAIT_FOR_IDLE,
+                count: 0,
+            }
+        )
+    };
+
+    for (index, packet) in packets.iter().enumerate() {
+        let retirement = if matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: CP_DRAW_INDX_OFFSET,
+                ..
+            }
+        ) {
+            packets.get(index + 1..index + 4)
+        } else if matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: opcode::BLIT,
+                ..
+            }
+        ) {
+            if !packets.get(index + 1).is_some_and(is_wfi) {
+                return Err("qcom-adreno-a618: A2D blit is not idle before retirement");
+            }
+            packets.get(index + 2..index + 5)
+        } else {
+            continue;
+        };
+        let Some(retirement) = retirement else {
+            return Err("qcom-adreno-a618: rendering operation lacks CCU retirement");
+        };
+        if !is_clean(&retirement[0]) || !is_invalidate(&retirement[1]) || !is_wfi(&retirement[2]) {
+            return Err(
+                "qcom-adreno-a618: rendering operation must clean and invalidate CCU before WFI",
+            );
+        }
     }
     Ok(())
 }
@@ -1031,6 +1105,8 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
         // BLIT2D marker in this segment.  What controls the draw is the final
         // marker, which must select direct rendering.
         && last_marker == Some(1)
+        && type7_count(CP_SKIP_IB2_ENABLE_GLOBAL, &[0]) == 1
+        && type7_count(CP_SKIP_IB2_ENABLE_LOCAL, &[1]) == 1
         && type7_count(CP_SET_VISIBILITY_OVERRIDE, &[1]) == 1
         && type7_count(CP_REG_WRITE, &[2, RB_RENDER_CNTL, 0x10]) == 1
         && reg(SP_UPDATE_CNTL) == Some(&[0x0000_00ff])
@@ -1044,7 +1120,7 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
         && reg(SP_WINDOW_OFFSET) == Some(&[0])
         && reg(TPL1_WINDOW_OFFSET) == Some(&[0])
         && reg(GRAS_SC_SCREEN_SCISSOR_CNTL) == Some(&[0])
-        && reg(VPC_SO_OVERRIDE) == Some(&[1])
+        && reg(VPC_SO_OVERRIDE) == Some(&[0])
         && reg(PC_STEREO_RENDERING_CNTL) == Some(&[0])
         && reg(SP_VS_CNTL_0) == Some(&[vs.sp_vs_cntl_0])
         && reg(SP_VS_CONST_CONFIG) == Some(&[vs.sp_vs_const_config, 0, 0, 0])
@@ -1475,6 +1551,7 @@ fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressFiel
     }
     validate_memcpy_barriers(&words)?;
     validate_ccu_transitions(&words)?;
+    validate_render_retirement(&words)?;
     validate_a2d_sequences(&words, &mut addresses)?;
     validate_3d_sequences(&words, &mut addresses)?;
     for (index, address) in addresses.iter().enumerate() {
@@ -2375,6 +2452,44 @@ mod tests {
         .unwrap();
         assert!(accept_codegen(&artifact).is_ok());
 
+        // Keep the crucial A618 sysmem retirement order pinned independently
+        // from relocation validation.  The old stream was valid packetized
+        // PM4 but parked WFI in front of the CCU clean and never wrote the
+        // trusted fence.
+        let (retirement_start, retirement_wfi) = {
+            let packets = Packets::new(&artifact.words)
+                .collect::<Result<std::vec::Vec<_>, _>>()
+                .unwrap();
+            let draw = packets
+                .iter()
+                .position(|packet| {
+                    matches!(
+                        packet.header,
+                        Header::Type7 {
+                            opcode: super::CP_DRAW_INDX_OFFSET,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            (
+                packets[draw + 1].word_offset as usize,
+                packets[draw + 3].word_offset as usize,
+            )
+        };
+        let mut idle_before_retirement = artifact.words.clone();
+        let clean_and_invalidate =
+            idle_before_retirement[retirement_start..retirement_wfi].to_vec();
+        let wfi = idle_before_retirement[retirement_wfi];
+        idle_before_retirement.splice(
+            retirement_start..retirement_wfi + 1,
+            core::iter::once(wfi).chain(clean_and_invalidate),
+        );
+        assert_eq!(
+            super::validate_render_retirement(&idle_before_retirement),
+            Err("qcom-adreno-a618: rendering operation must clean and invalidate CCU before WFI")
+        );
+
         // SWS writes its reused quad buffer and consumes it as vertex data in
         // one submit.  Keep the exact CP-write -> cache-invalidate -> draw
         // transition accepted as a unit, not merely as isolated operations.
@@ -2857,10 +2972,31 @@ mod tests {
                 // These were all accepted or emitted by earlier bring-up
                 // revisions.  Keep the kernel boundary pinned to Mesa's A618
                 // encodings so a userspace regression cannot revive them.
-                let mut stream_out_enabled = artifact.clone();
+                let mut stream_out_disabled = artifact.clone();
                 let stream_out = packet_for(super::VPC_SO_OVERRIDE);
-                stream_out_enabled.words[stream_out.word_offset as usize + 1] = 0;
-                assert!(accept_codegen(&stream_out_enabled).is_err());
+                stream_out_disabled.words[stream_out.word_offset as usize + 1] = 1;
+                assert!(accept_codegen(&stream_out_disabled).is_err());
+
+                let packet7_for = |wanted| {
+                    Packets::new(&artifact.words)
+                        .filter_map(Result::ok)
+                        .find(|packet| {
+                            matches!(
+                                packet.header,
+                                Header::Type7 { opcode, .. } if opcode == wanted
+                            )
+                        })
+                        .unwrap()
+                };
+                let mut global_ib2_skip = artifact.clone();
+                let global = packet7_for(super::CP_SKIP_IB2_ENABLE_GLOBAL);
+                global_ib2_skip.words[global.word_offset as usize + 1] = 1;
+                assert!(accept_codegen(&global_ib2_skip).is_err());
+
+                let mut local_ib2_skip_disabled = artifact.clone();
+                let local = packet7_for(super::CP_SKIP_IB2_ENABLE_LOCAL);
+                local_ib2_skip_disabled.words[local.word_offset as usize + 1] = 0;
+                assert!(accept_codegen(&local_ib2_skip_disabled).is_err());
 
                 let mut old_ps_config = artifact.clone();
                 let ps_config = packet_for(super::SP_PS_CONFIG);
