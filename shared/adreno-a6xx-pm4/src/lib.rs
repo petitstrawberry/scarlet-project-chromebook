@@ -196,6 +196,8 @@ impl<'a> Iterator for Packets<'a> {
 pub mod opcode {
     /// Wait until preceding asynchronous command-processor memory writes complete.
     pub const WAIT_MEM_WRITES: u8 = 0x12;
+    /// Synchronize the parser front-end with the micro-engine.
+    pub const WAIT_FOR_ME: u8 = 0x13;
     /// Wait until preceding work is idle.
     pub const WAIT_FOR_IDLE: u8 = 0x26;
     /// A6xx blit operation.

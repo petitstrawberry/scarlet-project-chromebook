@@ -82,16 +82,21 @@ fn completion_commands(fence_address: u64, sequence: u32) -> Result<[u32; 7], &'
     ])
 }
 
-fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 8], &'static str> {
+fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 10], &'static str> {
     let event_header = type7(opcode::EVENT_WRITE, 1)
         .map_err(|_| "qcom-adreno-a618: failed to encode kernel CCU invalidate")?;
     let indirect_header = type7(CP_INDIRECT_BUFFER, 3)
         .map_err(|_| "qcom-adreno-a618: failed to encode kernel indirect buffer")?;
+    let wait_mem_writes_header = type7(opcode::WAIT_MEM_WRITES, 0)
+        .map_err(|_| "qcom-adreno-a618: failed to encode kernel memory-write barrier")?;
+    let wait_for_me_header = type7(opcode::WAIT_FOR_ME, 0)
+        .map_err(|_| "qcom-adreno-a618: failed to encode kernel ME barrier")?;
 
     // Linux's A6xx submit path unconditionally invalidates both CCUs before
-    // entering a userspace IB.  This trusted preamble is required even for a
-    // CP_MEMCPY-only IB: without it, one cold upload can retire while the next
-    // identical upload consumes its IB but never reaches the kernel fence.
+    // entering a userspace IB.  After the IB, serialize asynchronous CP memory
+    // writes and then make the parser wait for the micro-engine.  Mesa uses the
+    // same WAIT_MEM_WRITES -> WAIT_FOR_ME order before a following memory
+    // signal; without the front-end barrier, CACHE_FLUSH_TS can overtake the ME.
     Ok([
         event_header,
         EVENT_CCU_INVALIDATE_DEPTH,
@@ -101,6 +106,8 @@ fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 8]
         command_address as u32,
         (command_address >> 32) as u32,
         word_count,
+        wait_mem_writes_header,
+        wait_for_me_header,
     ])
 }
 
@@ -182,6 +189,7 @@ struct RingFailureSnapshot {
     cp_hw_fault: u32,
     cp_protect_status: u32,
     ib1_base: u64,
+    ib1_translation: Option<usize>,
     ib1_remaining: u32,
     ib2_base: u64,
     ib2_remaining: u32,
@@ -192,6 +200,9 @@ struct RingFailureSnapshot {
     roq_mrb: u32,
     roq_vsd: u32,
     scratch2: u32,
+    fence_dma: u64,
+    fence_paddr: usize,
+    fence_translation: Option<usize>,
     fence: Option<(u32, u32)>,
 }
 
@@ -559,6 +570,7 @@ impl A618Core {
 
     fn capture_ring_failure(
         &self,
+        hardware: &HardwareState,
         reason: &'static str,
         sequence: u32,
         command_words: usize,
@@ -567,6 +579,7 @@ impl A618Core {
         fence: Option<(u32, u32)>,
     ) -> RingFailureSnapshot {
         let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
+        let ib1_base = self.registers.read64(CP_IB1_BASE);
         RingFailureSnapshot {
             reason,
             sequence,
@@ -590,7 +603,12 @@ impl A618Core {
             } else {
                 0
             },
-            ib1_base: self.registers.read64(CP_IB1_BASE),
+            ib1_base,
+            ib1_translation: self
+                .dma_context
+                .iommu
+                .as_ref()
+                .and_then(|attachment| attachment.domain.iova_to_phys(ib1_base)),
             ib1_remaining: self.registers.read(CP_IB1_REM_SIZE),
             ib2_base: self.registers.read64(CP_IB2_BASE),
             ib2_remaining: self.registers.read(CP_IB2_REM_SIZE),
@@ -601,6 +619,13 @@ impl A618Core {
             roq_mrb: self.registers.read(CP_ROQ_MRB_STATUS),
             roq_vsd: self.registers.read(CP_ROQ_VSD_STATUS),
             scratch2: self.registers.read(CP_SCRATCH_2),
+            fence_dma: hardware.fence.dma_addr(),
+            fence_paddr: hardware.fence.paddr(),
+            fence_translation: self
+                .dma_context
+                .iommu
+                .as_ref()
+                .and_then(|attachment| attachment.domain.iova_to_phys(hardware.fence.dma_addr())),
             fence,
         }
     }
@@ -646,8 +671,9 @@ impl A618Core {
             );
         }
         early_println!(
-            "[a618] ib1={:#x} rem={:#x}",
+            "[a618] ib1={:#x} translated={:#x} rem={:#x}",
             snapshot.ib1_base,
+            snapshot.ib1_translation.unwrap_or(0),
             snapshot.ib1_remaining,
         );
         early_println!(
@@ -668,6 +694,12 @@ impl A618Core {
             snapshot.roq_vsd,
         );
         early_println!("[a618] scratch2={:#x}", snapshot.scratch2);
+        early_println!(
+            "[a618] fence dma={:#x} paddr={:#x} translated={:#x}",
+            snapshot.fence_dma,
+            snapshot.fence_paddr,
+            snapshot.fence_translation.unwrap_or(0),
+        );
         if let Some((actual, expected)) = snapshot.fence {
             early_println!("[a618] fence actual={:#x} expected={:#x}", actual, expected,);
         }
@@ -684,6 +716,7 @@ impl A618Core {
         fence: Option<(u32, u32)>,
     ) {
         let snapshot = self.capture_ring_failure(
+            hardware,
             reason,
             sequence,
             command_words,
@@ -1604,5 +1637,7 @@ mod tests {
         assert_eq!(commands[5], 0x2345_6000);
         assert_eq!(commands[6], 1);
         assert_eq!(commands[7], 0x123);
+        assert_eq!(commands[8], type7(opcode::WAIT_MEM_WRITES, 0).unwrap());
+        assert_eq!(commands[9], type7(opcode::WAIT_FOR_ME, 0).unwrap());
     }
 }
