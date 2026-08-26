@@ -126,7 +126,6 @@ fn assert_ccu_clean_before_every_color_invalidate(
     const EVENT_WRITE_4: u32 = 0x7046_0004;
     const CCU_CLEAN_COLOR_TIMESTAMP: u32 = 0x4000_001d;
     const CCU_CLEAN_DEPTH_TIMESTAMP: u32 = 0x4000_001c;
-    const CACHE_CLEAN_TIMESTAMP: u32 = 0x4000_0004;
     const CCU_INVALIDATE_COLOR: u32 = 0x19;
     const CCU_INVALIDATE_DEPTH: u32 = 0x18;
 
@@ -149,7 +148,7 @@ fn assert_ccu_clean_before_every_color_invalidate(
             (words[0] == EVENT_WRITE_4
                 && matches!(
                     words[1],
-                    CCU_CLEAN_COLOR_TIMESTAMP | CCU_CLEAN_DEPTH_TIMESTAMP | CACHE_CLEAN_TIMESTAMP
+                    CCU_CLEAN_COLOR_TIMESTAMP | CCU_CLEAN_DEPTH_TIMESTAMP
                 )
                 && words[2] == 0
                 && words[3] == 0
@@ -226,7 +225,7 @@ fn clear_is_a_golden_address_free_stream() {
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.fixups.len(), 5);
+    assert_eq!(artifact.fixups.len(), 4);
     assert_eq!(artifact.fixups[1].object, ObjectRef::External(TARGET));
     assert_eq!(artifact.fixups[1].access, Access::WRITE);
     assert_eq!(
@@ -293,11 +292,6 @@ fn clear_is_a_golden_address_free_stream() {
             0x19,
             0x7046_0001,
             0x18,
-            0x7046_0004,
-            0x4000_0004,
-            0,
-            0,
-            4,
             0x7026_8000,
         ]
     );
@@ -322,7 +316,7 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.fixups.len(), 6);
+    assert_eq!(artifact.fixups.len(), 5);
     assert_eq!(artifact.fixups[1].object, ObjectRef::External(SOURCE));
     assert_eq!(artifact.fixups[1].access, Access::READ);
     assert_eq!(artifact.fixups[2].object, ObjectRef::External(TARGET));
@@ -400,11 +394,6 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
             0x19,
             0x7046_0001,
             0x18,
-            0x7046_0004,
-            0x4000_0004,
-            0,
-            0,
-            4,
             0x7026_8000,
         ]
     );
@@ -447,7 +436,7 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
     assert_eq!(artifact.generated_objects.len(), 1);
-    assert_eq!(artifact.fixups.len(), 10);
+    assert_eq!(artifact.fixups.len(), 9);
     let canonical: Vec<_> = artifact
         .fixups
         .iter()

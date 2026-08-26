@@ -23,7 +23,6 @@ const CP_REG_WRITE: u8 = 0x6d;
 const CP_SKIP_IB2_ENABLE_GLOBAL: u8 = 0x1d;
 const CP_SKIP_IB2_ENABLE_LOCAL: u8 = 0x23;
 
-const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
 const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_FLUSH_DEPTH_TS: u32 = 0x1c;
@@ -804,17 +803,15 @@ impl Emitter {
     }
 
     fn submission_end(&mut self) -> Result<(), CompileError> {
-        // Match fd6_emit_sysmem_fini()/fd6_emit_flushes() on A6xx.  A color
-        // clean alone is not a complete sysmem epilogue: depth CCU state and
-        // the general cache must retire before WFI and before the kernel's
-        // trusted CACHE_FLUSH_TS fence. FD6_INVALIDATE_CCHE is an A7xx+
-        // operation; emitting the general CACHE_INVALIDATE event here on
-        // A618 is not part of fd6_emit_sysmem_fini().
+        // Retire both CCUs before returning to the trusted ring.  The final
+        // general CACHE_FLUSH_TS is deliberately kernel-owned: issuing one
+        // here and another for the kernel fence leaves the second event
+        // permanently pending on CoachZ even though the IB and CCUs drained.
+        // FD6_INVALIDATE_CCHE is an A7xx+ operation and does not belong here.
         self.timestamped_cache_event(EVENT_CCU_FLUSH_COLOR_TS)?;
         self.timestamped_cache_event(EVENT_CCU_FLUSH_DEPTH_TS)?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_COLOR])?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_DEPTH])?;
-        self.timestamped_cache_event(EVENT_CACHE_FLUSH_TS)?;
         self.wait_for_idle()
     }
 

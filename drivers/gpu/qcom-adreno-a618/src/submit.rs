@@ -18,7 +18,6 @@ const CP_REG_WRITE: u8 = 0x6d;
 const CP_SKIP_IB2_ENABLE_GLOBAL: u8 = 0x1d;
 const CP_SKIP_IB2_ENABLE_LOCAL: u8 = 0x23;
 
-const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
 const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_FLUSH_DEPTH_TS: u32 = 0x1c;
@@ -589,7 +588,6 @@ fn validate_type7(
             if [
                 EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP,
                 EVENT_CCU_FLUSH_DEPTH_TS | CP_EVENT_WRITE_TIMESTAMP,
-                EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP,
             ]
             .contains(&payload[0])
                 && payload[1..3] == [0, 0]
@@ -827,13 +825,12 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
         )
     };
     let is_sysmem_retirement = |retirement: &[Packet<'_>]| {
-        retirement.len() == 6
+        retirement.len() == 5
             && is_timestamped(&retirement[0], EVENT_CCU_FLUSH_COLOR_TS)
             && is_timestamped(&retirement[1], EVENT_CCU_FLUSH_DEPTH_TS)
             && is_plain_event(&retirement[2], EVENT_CCU_INVALIDATE_COLOR)
             && is_plain_event(&retirement[3], EVENT_CCU_INVALIDATE_DEPTH)
-            && is_timestamped(&retirement[4], EVENT_CACHE_FLUSH_TS)
-            && is_wfi(&retirement[5])
+            && is_wfi(&retirement[4])
     };
 
     for (index, packet) in packets.iter().enumerate() {
@@ -844,7 +841,7 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
                 ..
             }
         ) {
-            packets.get(index + 1..index + 7)
+            packets.get(index + 1..index + 6)
         } else if matches!(
             packet.header,
             Header::Type7 {
@@ -855,7 +852,7 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
             if !packets.get(index + 1).is_some_and(is_wfi) {
                 return Err("qcom-adreno-a618: A2D blit is not idle before retirement");
             }
-            packets.get(index + 2..index + 8)
+            packets.get(index + 2..index + 7)
         } else {
             continue;
         };
@@ -2116,6 +2113,22 @@ mod tests {
     }
 
     #[test]
+    fn userspace_cannot_duplicate_the_kernel_cache_fence() {
+        let pm4 = [type7(opcode::EVENT_WRITE, 4).unwrap(), 0x4000_0004, 0, 0, 1];
+        let submit = Submit {
+            pm4: &pm4,
+            resources: &[],
+            relocations: &[],
+        };
+        let mut bytes = std::vec![0; encoded_len(submit).unwrap()];
+        encode(submit, &mut bytes).unwrap();
+        assert_eq!(
+            validate_no_shaders(&bytes, |_| None),
+            Err("qcom-adreno-a618: PM4 opcode is not allowlisted")
+        );
+    }
+
+    #[test]
     fn color_invalidate_without_an_addressed_clean_is_rejected() {
         let pm4 = [
             type7(opcode::EVENT_WRITE, 1).unwrap(),
@@ -2517,7 +2530,7 @@ mod tests {
                 .unwrap();
             (
                 packets[draw + 1].word_offset as usize,
-                packets[draw + 6].word_offset as usize,
+                packets[draw + 5].word_offset as usize,
             )
         };
         let mut idle_before_retirement = artifact.words.clone();
@@ -2695,7 +2708,7 @@ mod tests {
     }
 
     #[test]
-    fn sws_first_cursor_frame_has_the_complete_530_word_sysmem_stream() {
+    fn sws_first_cursor_frame_leaves_the_general_cache_fence_to_the_kernel() {
         const PIPELINE: PipelineId = PipelineId::new(11);
         let resources = [
             image(TARGET, TextureUsage::RENDER_ATTACHMENT),
@@ -2774,9 +2787,9 @@ mod tests {
 
         // This is the exact command shape reported by the first SWS cursor
         // frame on CoachZ: quad upload, target clear, one sampled draw, and
-        // sysmem retirement.  Pinning the dword count makes later hardware
-        // logs directly comparable to this host-validated stream.
-        assert_eq!(artifact.words.len(), 530);
+        // CCU retirement. The trusted kernel ring appends the only general
+        // cache-clean event, so the validated userspace IB is 520 dwords.
+        assert_eq!(artifact.words.len(), 520);
         assert!(accept_codegen(&artifact).is_ok());
     }
 
