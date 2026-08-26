@@ -124,9 +124,11 @@ fn assert_ccu_clean_before_every_color_invalidate(
     artifact: &sgfx_codegen_adreno_a6xx::RelocatablePm4,
 ) {
     const EVENT_WRITE_4: u32 = 0x7046_0004;
-    const EVENT_WRITE_1: u32 = 0x7046_0001;
     const CCU_CLEAN_COLOR_TIMESTAMP: u32 = 0x4000_001d;
+    const CCU_CLEAN_DEPTH_TIMESTAMP: u32 = 0x4000_001c;
+    const CACHE_CLEAN_TIMESTAMP: u32 = 0x4000_0004;
     const CCU_INVALIDATE_COLOR: u32 = 0x19;
+    const CCU_INVALIDATE_DEPTH: u32 = 0x18;
 
     let timestamp_objects = artifact
         .generated_objects
@@ -139,31 +141,25 @@ fn assert_ccu_clean_before_every_color_invalidate(
     assert_eq!(timestamp.bytes, [0; 4]);
     assert_eq!(timestamp.access, Access::WRITE);
 
-    let clean_positions = artifact
+    let timestamp_positions = artifact
         .words
-        .windows(7)
+        .windows(5)
         .enumerate()
         .filter_map(|(position, words)| {
             (words[0] == EVENT_WRITE_4
-                && words[1] == CCU_CLEAN_COLOR_TIMESTAMP
+                && matches!(
+                    words[1],
+                    CCU_CLEAN_COLOR_TIMESTAMP | CCU_CLEAN_DEPTH_TIMESTAMP | CACHE_CLEAN_TIMESTAMP
+                )
                 && words[2] == 0
                 && words[3] == 0
-                && words[4] != 0
-                && words[5] == EVENT_WRITE_1
-                && words[6] == CCU_INVALIDATE_COLOR)
+                && words[4] != 0)
                 .then_some(position)
         })
         .collect::<Vec<_>>();
-    assert!(!clean_positions.is_empty());
+    assert!(!timestamp_positions.is_empty());
 
-    let invalidation_count = artifact
-        .words
-        .windows(2)
-        .filter(|words| words[0] == EVENT_WRITE_1 && words[1] == CCU_INVALIDATE_COLOR)
-        .count();
-    assert_eq!(clean_positions.len(), invalidation_count);
-
-    for position in clean_positions {
+    for position in timestamp_positions {
         let fixup = artifact
             .fixups
             .iter()
@@ -172,6 +168,38 @@ fn assert_ccu_clean_before_every_color_invalidate(
         assert_eq!(fixup.object, ObjectRef::Generated(timestamp.id));
         assert_eq!(fixup.required_size, 4);
         assert_eq!(fixup.access, Access::WRITE);
+    }
+
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (index, packet) in packets.iter().enumerate() {
+        if !matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: 0x46,
+                count: 1
+            }
+        ) {
+            continue;
+        }
+        if packet.payload == [CCU_INVALIDATE_COLOR] {
+            let immediately_clean = packets.get(index.wrapping_sub(1)).is_some_and(|previous| {
+                previous.payload.first() == Some(&CCU_CLEAN_COLOR_TIMESTAMP)
+            });
+            let clean_before_depth = index >= 2
+                && packets[index - 2].payload.first() == Some(&CCU_CLEAN_COLOR_TIMESTAMP)
+                && packets[index - 1].payload.first() == Some(&CCU_CLEAN_DEPTH_TIMESTAMP);
+            assert!(immediately_clean || clean_before_depth);
+        } else if packet.payload == [CCU_INVALIDATE_DEPTH] {
+            assert!(index >= 2);
+            assert_eq!(packets[index - 2].payload.len(), 4);
+            assert_eq!(
+                packets[index - 2].payload.first(),
+                Some(&CCU_CLEAN_DEPTH_TIMESTAMP)
+            );
+            assert_eq!(packets[index - 1].payload, [CCU_INVALIDATE_COLOR]);
+        }
     }
 }
 
@@ -198,7 +226,7 @@ fn clear_is_a_golden_address_free_stream() {
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.fixups.len(), 3);
+    assert_eq!(artifact.fixups.len(), 5);
     assert_eq!(artifact.fixups[1].object, ObjectRef::External(TARGET));
     assert_eq!(artifact.fixups[1].access, Access::WRITE);
     assert_eq!(
@@ -256,8 +284,22 @@ fn clear_is_a_golden_address_free_stream() {
             0,
             0,
             2,
+            0x7046_0004,
+            0x4000_001c,
+            0,
+            0,
+            3,
             0x7046_0001,
             0x19,
+            0x7046_0001,
+            0x18,
+            0x7046_0004,
+            0x4000_0004,
+            0,
+            0,
+            4,
+            0x7046_0001,
+            0x31,
             0x7026_8000,
         ]
     );
@@ -282,7 +324,7 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.fixups.len(), 4);
+    assert_eq!(artifact.fixups.len(), 6);
     assert_eq!(artifact.fixups[1].object, ObjectRef::External(SOURCE));
     assert_eq!(artifact.fixups[1].access, Access::READ);
     assert_eq!(artifact.fixups[2].object, ObjectRef::External(TARGET));
@@ -351,8 +393,22 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
             0,
             0,
             2,
+            0x7046_0004,
+            0x4000_001c,
+            0,
+            0,
+            3,
             0x7046_0001,
             0x19,
+            0x7046_0001,
+            0x18,
+            0x7046_0004,
+            0x4000_0004,
+            0,
+            0,
+            4,
+            0x7046_0001,
+            0x31,
             0x7026_8000,
         ]
     );
@@ -395,7 +451,7 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
     assert_eq!(artifact.generated_objects.len(), 1);
-    assert_eq!(artifact.fixups.len(), 8);
+    assert_eq!(artifact.fixups.len(), 10);
     let canonical: Vec<_> = artifact
         .fixups
         .iter()

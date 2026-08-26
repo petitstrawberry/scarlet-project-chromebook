@@ -23,7 +23,10 @@ const CP_REG_WRITE: u8 = 0x6d;
 const CP_SKIP_IB2_ENABLE_GLOBAL: u8 = 0x1d;
 const CP_SKIP_IB2_ENABLE_LOCAL: u8 = 0x23;
 
+const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
+const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
+const EVENT_CCU_FLUSH_DEPTH_TS: u32 = 0x1c;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
@@ -715,7 +718,7 @@ impl Emitter {
         self.preload_shader(CP_LOAD_STATE6_FRAG, 12, fs.sp_ps_instr_size, variant)
     }
 
-    fn clean_color_cache(&mut self) -> Result<(), CompileError> {
+    fn timestamped_cache_event(&mut self, event: u32) -> Result<(), CompileError> {
         let timestamp = match self.ccu_timestamp {
             Some(timestamp) => timestamp,
             None => {
@@ -731,9 +734,13 @@ impl Emitter {
         };
         self.event_sequence = self.event_sequence.wrapping_add(1).max(1);
         self.push_word(type7(opcode::EVENT_WRITE, 4).map_err(|_| CompileError::InvalidPm4)?)?;
-        self.push_word(EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP)?;
+        self.push_word(event | CP_EVENT_WRITE_TIMESTAMP)?;
         self.address_words(ObjectRef::Generated(timestamp), 0, 4, Access::WRITE)?;
         self.push_word(self.event_sequence)
+    }
+
+    fn clean_color_cache(&mut self) -> Result<(), CompileError> {
+        self.timestamped_cache_event(EVENT_CCU_FLUSH_COLOR_TS)
     }
 
     fn invalidate_submission_caches(&mut self) -> Result<(), CompileError> {
@@ -797,14 +804,17 @@ impl Emitter {
     }
 
     fn submission_end(&mut self) -> Result<(), CompileError> {
-        // A6xx sysmem retirement must make dirty color data available before
-        // waiting for the pipeline to become idle.  Putting WFI first can
-        // strand A618 with every visible block idle while the CP waits for a
-        // color-cache transition that is still queued behind it.  The kernel
-        // appends a second trusted clean plus CACHE_FLUSH_TS fence after this
-        // user-owned clean/invalidate/WFI sequence.
-        self.clean_color_cache()?;
+        // Match fd6_emit_sysmem_fini()/fd6_emit_flushes() on A6xx.  A color
+        // clean alone is not a complete sysmem epilogue: depth CCU state and
+        // the general cache must retire before WFI and before the kernel's
+        // trusted CACHE_FLUSH_TS fence.  Otherwise A618 can drain the IB and
+        // ring while never reaching the externally visible fence write.
+        self.timestamped_cache_event(EVENT_CCU_FLUSH_COLOR_TS)?;
+        self.timestamped_cache_event(EVENT_CCU_FLUSH_DEPTH_TS)?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_COLOR])?;
+        self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_DEPTH])?;
+        self.timestamped_cache_event(EVENT_CACHE_FLUSH_TS)?;
+        self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])?;
         self.wait_for_idle()
     }
 

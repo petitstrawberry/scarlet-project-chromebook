@@ -18,7 +18,10 @@ const CP_REG_WRITE: u8 = 0x6d;
 const CP_SKIP_IB2_ENABLE_GLOBAL: u8 = 0x1d;
 const CP_SKIP_IB2_ENABLE_LOCAL: u8 = 0x23;
 
+const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
+const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
+const EVENT_CCU_FLUSH_DEPTH_TS: u32 = 0x1c;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
@@ -577,13 +580,18 @@ fn validate_type7(
         (opcode::EVENT_WRITE, 1)
             if matches!(
                 payload[0],
-                EVENT_CCU_INVALIDATE_COLOR | EVENT_CACHE_INVALIDATE
+                EVENT_CCU_INVALIDATE_COLOR | EVENT_CCU_INVALIDATE_DEPTH | EVENT_CACHE_INVALIDATE
             ) =>
         {
             Ok(())
         }
         (opcode::EVENT_WRITE, 4)
-            if payload[0] == EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP
+            if [
+                EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP,
+                EVENT_CCU_FLUSH_DEPTH_TS | CP_EVENT_WRITE_TIMESTAMP,
+                EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP,
+            ]
+            .contains(&payload[0])
                 && payload[1..3] == [0, 0]
                 && payload[3] != 0 =>
         {
@@ -716,44 +724,70 @@ fn validate_memcpy_barriers(words: &[u32]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// A6xx cannot invalidate a color CCU that may still contain dirty data.
-/// Require the exact addressed clean used by Freedreno immediately before
-/// every color invalidation; individually valid event packets are not enough.
+/// A6xx cannot invalidate a CCU that may still contain dirty data.  Accept
+/// only the two sequences emitted by this dialect: color clean/invalidate at
+/// submission start, or the complete sysmem color+depth retirement chain.
 fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
-    let mut clean_pending = false;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Transition {
+        Idle,
+        ColorClean,
+        ColorAndDepthClean,
+        DepthInvalidatePending,
+    }
+
+    let mut transition = Transition::Idle;
     for packet in Packets::new(words) {
         let packet = packet.map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
-        let clean = matches!(
-            packet.header,
-            Header::Type7 {
-                opcode: opcode::EVENT_WRITE,
-                count: 4,
-            }
-        ) && packet.payload.first()
-            == Some(&(EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP));
-        let invalidate = matches!(
-            packet.header,
-            Header::Type7 {
-                opcode: opcode::EVENT_WRITE,
-                count: 1,
-            }
-        ) && packet.payload == [EVENT_CCU_INVALIDATE_COLOR];
+        let timestamped = |event| {
+            matches!(
+                packet.header,
+                Header::Type7 {
+                    opcode: opcode::EVENT_WRITE,
+                    count: 4,
+                }
+            ) && packet.payload.first() == Some(&(event | CP_EVENT_WRITE_TIMESTAMP))
+        };
+        let plain = |event| {
+            matches!(
+                packet.header,
+                Header::Type7 {
+                    opcode: opcode::EVENT_WRITE,
+                    count: 1,
+                }
+            ) && packet.payload == [event]
+        };
+        let color_clean = timestamped(EVENT_CCU_FLUSH_COLOR_TS);
+        let depth_clean = timestamped(EVENT_CCU_FLUSH_DEPTH_TS);
+        let color_invalidate = plain(EVENT_CCU_INVALIDATE_COLOR);
+        let depth_invalidate = plain(EVENT_CCU_INVALIDATE_DEPTH);
+        let is_ccu_transition = color_clean || depth_clean || color_invalidate || depth_invalidate;
 
-        if clean_pending {
-            if !invalidate {
-                return Err(
-                    "qcom-adreno-a618: CCU color clean must immediately precede invalidation",
-                );
+        transition = match (
+            transition,
+            color_clean,
+            depth_clean,
+            color_invalidate,
+            depth_invalidate,
+        ) {
+            (Transition::Idle, true, false, false, false) => Transition::ColorClean,
+            (Transition::ColorClean, false, true, false, false) => Transition::ColorAndDepthClean,
+            (Transition::ColorClean, false, false, true, false) => Transition::Idle,
+            (Transition::ColorAndDepthClean, false, false, true, false) => {
+                Transition::DepthInvalidatePending
             }
-            clean_pending = false;
-        } else if clean {
-            clean_pending = true;
-        } else if invalidate {
-            return Err("qcom-adreno-a618: dirty CCU color invalidation is forbidden");
-        }
+            (Transition::DepthInvalidatePending, false, false, false, true) => Transition::Idle,
+            (Transition::Idle, false, false, false, false) => Transition::Idle,
+            _ if is_ccu_transition => {
+                return Err("qcom-adreno-a618: invalid CCU clean/invalidate ordering");
+            }
+            _ => {
+                return Err("qcom-adreno-a618: CCU clean/invalidate sequence is not contiguous");
+            }
+        };
     }
-    if clean_pending {
-        return Err("qcom-adreno-a618: CCU color clean is missing its invalidation");
+    if transition != Transition::Idle {
+        return Err("qcom-adreno-a618: CCU clean is missing its matching invalidation");
     }
     Ok(())
 }
@@ -765,23 +799,23 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
     let packets = Packets::new(words)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "qcom-adreno-a618: malformed PM4 retirement stream")?;
-    let is_clean = |packet: &Packet<'_>| {
+    let is_timestamped = |packet: &Packet<'_>, event| {
         matches!(
             packet.header,
             Header::Type7 {
                 opcode: opcode::EVENT_WRITE,
                 count: 4,
             }
-        ) && packet.payload.first() == Some(&(EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP))
+        ) && packet.payload.first() == Some(&(event | CP_EVENT_WRITE_TIMESTAMP))
     };
-    let is_invalidate = |packet: &Packet<'_>| {
+    let is_plain_event = |packet: &Packet<'_>, event| {
         matches!(
             packet.header,
             Header::Type7 {
                 opcode: opcode::EVENT_WRITE,
                 count: 1,
             }
-        ) && packet.payload == [EVENT_CCU_INVALIDATE_COLOR]
+        ) && packet.payload == [event]
     };
     let is_wfi = |packet: &Packet<'_>| {
         matches!(
@@ -792,6 +826,16 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
             }
         )
     };
+    let is_sysmem_retirement = |retirement: &[Packet<'_>]| {
+        retirement.len() == 7
+            && is_timestamped(&retirement[0], EVENT_CCU_FLUSH_COLOR_TS)
+            && is_timestamped(&retirement[1], EVENT_CCU_FLUSH_DEPTH_TS)
+            && is_plain_event(&retirement[2], EVENT_CCU_INVALIDATE_COLOR)
+            && is_plain_event(&retirement[3], EVENT_CCU_INVALIDATE_DEPTH)
+            && is_timestamped(&retirement[4], EVENT_CACHE_FLUSH_TS)
+            && is_plain_event(&retirement[5], EVENT_CACHE_INVALIDATE)
+            && is_wfi(&retirement[6])
+    };
 
     for (index, packet) in packets.iter().enumerate() {
         let retirement = if matches!(
@@ -801,7 +845,7 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
                 ..
             }
         ) {
-            packets.get(index + 1..index + 4)
+            packets.get(index + 1..index + 8)
         } else if matches!(
             packet.header,
             Header::Type7 {
@@ -812,16 +856,16 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
             if !packets.get(index + 1).is_some_and(is_wfi) {
                 return Err("qcom-adreno-a618: A2D blit is not idle before retirement");
             }
-            packets.get(index + 2..index + 5)
+            packets.get(index + 2..index + 9)
         } else {
             continue;
         };
         let Some(retirement) = retirement else {
-            return Err("qcom-adreno-a618: rendering operation lacks CCU retirement");
+            return Err("qcom-adreno-a618: rendering operation lacks sysmem retirement");
         };
-        if !is_clean(&retirement[0]) || !is_invalidate(&retirement[1]) || !is_wfi(&retirement[2]) {
+        if !is_sysmem_retirement(retirement) {
             return Err(
-                "qcom-adreno-a618: rendering operation must clean and invalidate CCU before WFI",
+                "qcom-adreno-a618: rendering operation lacks the complete A6xx sysmem epilogue",
             );
         }
     }
@@ -2087,12 +2131,12 @@ mod tests {
         encode(submit, &mut bytes).unwrap();
         assert_eq!(
             validate_no_shaders(&bytes, |_| None),
-            Err("qcom-adreno-a618: dirty CCU color invalidation is forbidden")
+            Err("qcom-adreno-a618: invalid CCU clean/invalidate ordering")
         );
     }
 
     #[test]
-    fn addressed_color_clean_must_immediately_precede_invalidation() {
+    fn addressed_ccu_clean_sequence_must_be_contiguous() {
         let pm4 = [
             type7(opcode::EVENT_WRITE, 4).unwrap(),
             super::EVENT_CCU_FLUSH_COLOR_TS | super::CP_EVENT_WRITE_TIMESTAMP,
@@ -2123,7 +2167,7 @@ mod tests {
                 allowed_access: ACCESS_WRITE,
                 linear_image: None,
             })),
-            Err("qcom-adreno-a618: CCU color clean must immediately precede invalidation")
+            Err("qcom-adreno-a618: CCU clean/invalidate sequence is not contiguous")
         );
     }
 
@@ -2474,7 +2518,7 @@ mod tests {
                 .unwrap();
             (
                 packets[draw + 1].word_offset as usize,
-                packets[draw + 3].word_offset as usize,
+                packets[draw + 7].word_offset as usize,
             )
         };
         let mut idle_before_retirement = artifact.words.clone();
@@ -2487,7 +2531,7 @@ mod tests {
         );
         assert_eq!(
             super::validate_render_retirement(&idle_before_retirement),
-            Err("qcom-adreno-a618: rendering operation must clean and invalidate CCU before WFI")
+            Err("qcom-adreno-a618: rendering operation lacks the complete A6xx sysmem epilogue")
         );
 
         // SWS writes its reused quad buffer and consumes it as vertex data in
@@ -2652,7 +2696,7 @@ mod tests {
     }
 
     #[test]
-    fn sws_first_cursor_frame_is_accepted_as_the_observed_506_word_stream() {
+    fn sws_first_cursor_frame_has_the_complete_534_word_sysmem_stream() {
         const PIPELINE: PipelineId = PipelineId::new(11);
         let resources = [
             image(TARGET, TextureUsage::RENDER_ATTACHMENT),
@@ -2733,7 +2777,7 @@ mod tests {
         // frame on CoachZ: quad upload, target clear, one sampled draw, and
         // sysmem retirement.  Pinning the dword count makes later hardware
         // logs directly comparable to this host-validated stream.
-        assert_eq!(artifact.words.len(), 506);
+        assert_eq!(artifact.words.len(), 534);
         assert!(accept_codegen(&artifact).is_ok());
     }
 
