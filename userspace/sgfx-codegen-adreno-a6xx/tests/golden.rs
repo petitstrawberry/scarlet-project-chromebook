@@ -1,9 +1,9 @@
 use adreno_a6xx_pm4::{Header, Packets, opcode};
 use adreno_a6xx_shader_pack::ShaderVariant;
 use sgfx_codegen_adreno_a6xx::{
-    Access, Capabilities, CompileError, CompileInput, ImageMeta, ImageModifier, ObjectId,
-    ObjectRef, Operation, PipelineId, PipelineMeta, PlaneLayout, RenderPass, ResourceKind,
-    ResourceMeta, compile,
+    Access, Capabilities, CompileError, CompileInput, GeneratedObjectKind, ImageMeta,
+    ImageModifier, ObjectId, ObjectRef, Operation, PipelineId, PipelineMeta, PlaneLayout,
+    RenderPass, ResourceKind, ResourceMeta, compile,
 };
 use sgfx_core::ir::{
     AddressMode, BlendState, BufferUsage, Color, CullMode, DrawUniforms, Extent2D, FilterMode,
@@ -120,6 +120,61 @@ fn assert_well_formed(artifact: &sgfx_codegen_adreno_a6xx::RelocatablePm4) {
     }
 }
 
+fn assert_ccu_clean_before_every_color_invalidate(
+    artifact: &sgfx_codegen_adreno_a6xx::RelocatablePm4,
+) {
+    const EVENT_WRITE_4: u32 = 0x7046_0004;
+    const EVENT_WRITE_1: u32 = 0x7046_0001;
+    const CCU_CLEAN_COLOR_TIMESTAMP: u32 = 0x4000_001d;
+    const CCU_INVALIDATE_COLOR: u32 = 0x19;
+
+    let timestamp_objects = artifact
+        .generated_objects
+        .iter()
+        .filter(|object| object.kind == GeneratedObjectKind::CcuTimestamp)
+        .collect::<Vec<_>>();
+    assert_eq!(timestamp_objects.len(), 1);
+    let timestamp = timestamp_objects[0];
+    assert_eq!(timestamp.alignment, 64);
+    assert_eq!(timestamp.bytes, [0; 4]);
+    assert_eq!(timestamp.access, Access::WRITE);
+
+    let clean_positions = artifact
+        .words
+        .windows(7)
+        .enumerate()
+        .filter_map(|(position, words)| {
+            (words[0] == EVENT_WRITE_4
+                && words[1] == CCU_CLEAN_COLOR_TIMESTAMP
+                && words[2] == 0
+                && words[3] == 0
+                && words[4] != 0
+                && words[5] == EVENT_WRITE_1
+                && words[6] == CCU_INVALIDATE_COLOR)
+                .then_some(position)
+        })
+        .collect::<Vec<_>>();
+    assert!(!clean_positions.is_empty());
+
+    let invalidation_count = artifact
+        .words
+        .windows(2)
+        .filter(|words| words[0] == EVENT_WRITE_1 && words[1] == CCU_INVALIDATE_COLOR)
+        .count();
+    assert_eq!(clean_positions.len(), invalidation_count);
+
+    for position in clean_positions {
+        let fixup = artifact
+            .fixups
+            .iter()
+            .find(|fixup| fixup.word_offset as usize == position + 2)
+            .expect("CCU clean timestamp address has a relocation");
+        assert_eq!(fixup.object, ObjectRef::Generated(timestamp.id));
+        assert_eq!(fixup.required_size, 4);
+        assert_eq!(fixup.access, Access::WRITE);
+    }
+}
+
 #[test]
 fn clear_is_a_golden_address_free_stream() {
     let resources = resources();
@@ -142,12 +197,18 @@ fn clear_is_a_golden_address_free_stream() {
     .unwrap();
 
     assert_well_formed(&artifact);
-    assert_eq!(artifact.fixups.len(), 1);
-    assert_eq!(artifact.fixups[0].object, ObjectRef::External(TARGET));
-    assert_eq!(artifact.fixups[0].access, Access::WRITE);
+    assert_ccu_clean_before_every_color_invalidate(&artifact);
+    assert_eq!(artifact.fixups.len(), 2);
+    assert_eq!(artifact.fixups[1].object, ObjectRef::External(TARGET));
+    assert_eq!(artifact.fixups[1].access, Access::WRITE);
     assert_eq!(
         artifact.words.as_slice(),
         &[
+            0x7046_0004,
+            0x4000_001d,
+            0,
+            0,
+            1,
             0x7046_0001,
             0x19,
             0x7046_0001,
@@ -196,7 +257,7 @@ fn clear_is_a_golden_address_free_stream() {
 }
 
 #[test]
-fn copy_is_a_golden_two_relocation_stream() {
+fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
     let resources = resources();
     let operations = [Operation::CopyTextureToTexture {
         source: SOURCE,
@@ -213,14 +274,20 @@ fn copy_is_a_golden_two_relocation_stream() {
     .unwrap();
 
     assert_well_formed(&artifact);
-    assert_eq!(artifact.fixups.len(), 2);
-    assert_eq!(artifact.fixups[0].object, ObjectRef::External(SOURCE));
-    assert_eq!(artifact.fixups[0].access, Access::READ);
-    assert_eq!(artifact.fixups[1].object, ObjectRef::External(TARGET));
-    assert_eq!(artifact.fixups[1].access, Access::WRITE);
+    assert_ccu_clean_before_every_color_invalidate(&artifact);
+    assert_eq!(artifact.fixups.len(), 3);
+    assert_eq!(artifact.fixups[1].object, ObjectRef::External(SOURCE));
+    assert_eq!(artifact.fixups[1].access, Access::READ);
+    assert_eq!(artifact.fixups[2].object, ObjectRef::External(TARGET));
+    assert_eq!(artifact.fixups[2].access, Access::WRITE);
     assert_eq!(
         artifact.words.as_slice(),
         &[
+            0x7046_0004,
+            0x4000_001d,
+            0,
+            0,
+            1,
             0x7046_0001,
             0x19,
             0x7046_0001,
@@ -312,8 +379,9 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
     })
     .unwrap();
     assert_well_formed(&artifact);
-    assert_eq!(artifact.generated_objects.len(), 0);
-    assert_eq!(artifact.fixups.len(), 6);
+    assert_ccu_clean_before_every_color_invalidate(&artifact);
+    assert_eq!(artifact.generated_objects.len(), 1);
+    assert_eq!(artifact.fixups.len(), 7);
     let canonical: Vec<_> = artifact
         .fixups
         .iter()
@@ -689,6 +757,7 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
         })
         .unwrap();
         assert_well_formed(&artifact);
+        assert_ccu_clean_before_every_color_invalidate(&artifact);
         if textured {
             let packets = Packets::new(&artifact.words)
                 .collect::<Result<Vec<_>, _>>()
@@ -721,7 +790,7 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
             };
             assert_eq!(&sampler_state.payload[3..], &expected_sampler);
         }
-        assert_eq!(artifact.generated_objects.len(), 0);
+        assert_eq!(artifact.generated_objects.len(), 1);
         assert_eq!(
             artifact
                 .fixups

@@ -175,9 +175,10 @@ mod tests {
     use alloc::vec;
 
     use sgfx_codegen_adreno_a6xx::{
-        Access, AddressEncoding, Capabilities, CompileInput, ImageMeta, ImageModifier, ObjectId,
-        ObjectRef, Operation, PipelineId, PipelineMeta, PlaneLayout, RelocatablePm4, RenderPass,
-        ResourceAccess, ResourceKind, ResourceMeta, SymbolicAddress, compile,
+        Access, AddressEncoding, Capabilities, CompileInput, GeneratedObjectKind, ImageMeta,
+        ImageModifier, ObjectId, ObjectRef, Operation, PipelineId, PipelineMeta, PlaneLayout,
+        RelocatablePm4, RenderPass, ResourceAccess, ResourceKind, ResourceMeta, SymbolicAddress,
+        compile,
     };
     use sgfx_core::ir::{
         AddressMode, BlendState, BufferUsage, Color, CullMode, DrawUniforms, Extent2D, FilterMode,
@@ -352,30 +353,35 @@ mod tests {
             operations: &operations,
         })
         .unwrap();
-        let bytes = encode(
-            &compiled,
-            &[
-                BoundObject {
-                    object: ObjectRef::External(target),
-                    attachment_token: 10,
-                    allocation_offset: 0,
-                    size: 1024,
-                },
-                BoundObject {
-                    object: ObjectRef::External(texture),
-                    attachment_token: 11,
-                    allocation_offset: 0,
-                    size: 1024,
-                },
-                BoundObject {
-                    object: ObjectRef::External(vertices),
-                    attachment_token: 12,
-                    allocation_offset: 0,
-                    size: 48,
-                },
-            ],
-        )
-        .unwrap();
+        let mut bindings = vec![
+            BoundObject {
+                object: ObjectRef::External(target),
+                attachment_token: 10,
+                allocation_offset: 0,
+                size: 1024,
+            },
+            BoundObject {
+                object: ObjectRef::External(texture),
+                attachment_token: 11,
+                allocation_offset: 0,
+                size: 1024,
+            },
+            BoundObject {
+                object: ObjectRef::External(vertices),
+                attachment_token: 12,
+                allocation_offset: 0,
+                size: 48,
+            },
+        ];
+        for generated in &compiled.generated_objects {
+            bindings.push(BoundObject {
+                object: ObjectRef::Generated(generated.id),
+                attachment_token: 100 + u64::from(generated.id.raw()),
+                allocation_offset: 0,
+                size: generated.bytes.len() as u64,
+            });
+        }
+        let bytes = encode(&compiled, &bindings).unwrap();
         let decoded = adreno_a6xx_submit_wire::decode(&bytes).unwrap();
         let relocations: alloc::vec::Vec<_> = (0..decoded.relocation_len())
             .map(|index| decoded.relocation(index).unwrap())
@@ -388,7 +394,7 @@ mod tests {
                     adreno_a6xx_submit_wire::RelocationSource::CanonicalShader(_)
                 ))
                 .count(),
-            2
+            4
         );
         assert_eq!(
             relocations
@@ -402,5 +408,20 @@ mod tests {
             relocation.source,
             adreno_a6xx_submit_wire::RelocationSource::Attachment(_)
         ) && relocation.required_size == 1024));
+        let ccu_timestamp = compiled
+            .generated_objects
+            .iter()
+            .find(|object| object.kind == GeneratedObjectKind::CcuTimestamp)
+            .expect("one compiler-owned CCU timestamp");
+        assert!(relocations.iter().any(|relocation| {
+            matches!(
+                relocation.source,
+                adreno_a6xx_submit_wire::RelocationSource::Attachment(index)
+                    if decoded.resource(index as usize).is_some_and(|resource| {
+                        resource.attachment_token == 100 + u64::from(ccu_timestamp.id.raw())
+                    })
+            ) && relocation.required_size == 4
+                && relocation.access == adreno_a6xx_submit_wire::ACCESS_WRITE
+        }));
     }
 }

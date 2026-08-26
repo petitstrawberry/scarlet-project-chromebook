@@ -21,8 +21,10 @@ const CP_LOAD_STATE6_FRAG: u8 = 0x34;
 const CP_SET_VISIBILITY_OVERRIDE: u8 = 0x64;
 const CP_REG_WRITE: u8 = 0x6d;
 
+const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
+const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
 // Mesa fd6_format_table maps PIPE_FORMAT_B8G8R8A8_UNORM to WXYZ (1).
@@ -213,6 +215,8 @@ pub(crate) struct Emitter {
     fixups: Vec<SymbolicAddress>,
     accesses: Vec<ResourceAccess>,
     generated_objects: Vec<GeneratedObject>,
+    ccu_timestamp: Option<GeneratedObjectId>,
+    event_sequence: u32,
     max_words: usize,
 }
 
@@ -223,6 +227,8 @@ impl Emitter {
             fixups: Vec::new(),
             accesses: Vec::new(),
             generated_objects: Vec::new(),
+            ccu_timestamp: None,
+            event_sequence: 0,
             max_words: max_words as usize,
         }
     }
@@ -707,7 +713,33 @@ impl Emitter {
         self.preload_shader(CP_LOAD_STATE6_FRAG, 12, fs.sp_ps_instr_size, variant)
     }
 
+    fn clean_color_cache(&mut self) -> Result<(), CompileError> {
+        let timestamp = match self.ccu_timestamp {
+            Some(timestamp) => timestamp,
+            None => {
+                let timestamp = self.add_generated(
+                    &[0; 4],
+                    64,
+                    Access::WRITE,
+                    GeneratedObjectKind::CcuTimestamp,
+                )?;
+                self.ccu_timestamp = Some(timestamp);
+                timestamp
+            }
+        };
+        self.event_sequence = self.event_sequence.wrapping_add(1).max(1);
+        self.push_word(type7(opcode::EVENT_WRITE, 4).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.push_word(EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP)?;
+        self.address_words(ObjectRef::Generated(timestamp), 0, 4, Access::WRITE)?;
+        self.push_word(self.event_sequence)
+    }
+
     fn invalidate_submission_caches(&mut self) -> Result<(), CompileError> {
+        // Freedreno's A6xx cache contract is strict here: invalidating a CCU
+        // that may still contain dirty color data does not work.  A command
+        // buffer can contain clear -> draw, copy -> draw, or multiple draws,
+        // so every color invalidation must first complete an addressed clean.
+        self.clean_color_cache()?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_COLOR])?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])?;
         Ok(())
@@ -758,13 +790,9 @@ impl Emitter {
     }
 
     fn submission_end(&mut self) -> Result<(), CompileError> {
-        // CCU_FLUSH_COLOR_TS is a timestamped A6xx event.  Its legal
-        // CP_EVENT_WRITE form has four payload dwords, including a writable
-        // address and a sequence value.  The trusted kernel transport owns
-        // that completion allocation and appends the correctly addressed CCU
-        // flush before its final cache/fence event.  Emitting the event here
-        // with only its event selector makes SQE raise
-        // CP_ILLEGAL_INSTR_ERROR after it has consumed the user IB.
+        // The kernel transport appends the final addressed CCU clean and
+        // cache/fence event.  This WFI retires the operation itself; cache
+        // transition cleans above use compiler-owned writable timestamp words.
         self.wait_for_idle()
     }
 
@@ -1056,6 +1084,8 @@ mod tests {
             ],
             accesses: vec![],
             generated_objects: vec![],
+            ccu_timestamp: None,
+            event_sequence: 0,
             max_words: 3,
         };
 

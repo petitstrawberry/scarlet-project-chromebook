@@ -60,6 +60,11 @@ const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
 const CP_EVENT_WRITE_IRQ: u32 = 1 << 31;
+// Linux's A6xx hardware initialization uses the complete 49-bit UCHE address
+// range.  Limiting this to a mapped trap page silently puts every later
+// shader, vertex, and texture allocation into L2-bypass mode.
+const UCHE_CACHED_WRITE_RANGE_MAX: u64 = 0x0001_ffff_ffff_ffc0;
+const UCHE_UNMAPPED_TRAP_BASE: u64 = 0x0001_ffff_ffff_f000;
 
 fn completion_events(fence_address: u64, sequence: u32) -> Result<[u32; 10], &'static str> {
     let ccu_fence_address = fence_address
@@ -174,7 +179,6 @@ struct RingFailureSnapshot {
 struct HardwareState {
     boot: BootState,
     ring: DmaAllocation,
-    trap: DmaAllocation,
     sqe: Option<DmaAllocation>,
     shader_pack: Option<DmaAllocation>,
     fence: DmaAllocation,
@@ -434,12 +438,9 @@ impl A618Core {
         }
         registers.write(RBBM_VBIF_CLIENT_QOS_CNTL, 3);
         registers.write(RBBM_PERFCTR_GPU_BUSY_MASKED, u32::MAX);
-        registers.write64(
-            UCHE_WRITE_RANGE_MAX,
-            hardware.trap.dma_addr().saturating_add(0xfc0),
-        );
-        registers.write64(UCHE_TRAP_BASE, hardware.trap.dma_addr());
-        registers.write64(UCHE_WRITE_THRU_BASE, hardware.trap.dma_addr());
+        registers.write64(UCHE_WRITE_RANGE_MAX, UCHE_CACHED_WRITE_RANGE_MAX);
+        registers.write64(UCHE_TRAP_BASE, UCHE_UNMAPPED_TRAP_BASE);
+        registers.write64(UCHE_WRITE_THRU_BASE, UCHE_UNMAPPED_TRAP_BASE);
         registers.write64(UCHE_GMEM_RANGE_MIN, GMEM_BASE);
         registers.write64(UCHE_GMEM_RANGE_MAX, GMEM_BASE + GMEM_SIZE - 1);
         registers.write(UCHE_FILTER_CNTL, 0x804);
@@ -452,7 +453,7 @@ impl A618Core {
         registers.write(RBBM_PERFCTR_CNTL, 1);
         registers.write(CP_PERFCTR_CP_SEL_0, 0);
         registers.write(RBBM_INTERFACE_HANG_INT_CNTL, (1 << 30) | 0x1f_ffff);
-        registers.write(UCHE_CLIENT_PF, (1 << 7) | 1);
+        registers.write(UCHE_CLIENT_PF, 1);
         registers.write(CP_PROTECT_CNTL, 1 | (1 << 1) | (1 << 3));
         for (index, value) in CP_PROTECT.iter().enumerate() {
             registers.write(CP_PROTECT_BASE + index, *value);
@@ -466,6 +467,13 @@ impl A618Core {
         registers.write(CP_RB_CNTL, 12 | (2 << 8) | (1 << 27));
         registers.write(CP_RB_WPTR, 0);
         arch::io_wmb();
+        early_println!(
+            "[qcom-adreno-a618] UCHE range-max={:#014x} trap={:#014x} write-through={:#014x} client-pf={:#010x}",
+            registers.read64(UCHE_WRITE_RANGE_MAX),
+            registers.read64(UCHE_TRAP_BASE),
+            registers.read64(UCHE_WRITE_THRU_BASE),
+            registers.read(UCHE_CLIENT_PF),
+        );
     }
 
     fn coachz_no_zap_configuration() -> bool {
@@ -1483,7 +1491,6 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             },
         )?;
         let ring = DmaAllocation::new(&dma_context, RING_SIZE, bidirectional_flags())?;
-        let trap = DmaAllocation::new(&dma_context, PAGE_SIZE, bidirectional_flags())?;
         let fence = DmaAllocation::new(&dma_context, PAGE_SIZE, bidirectional_flags())?;
         let backend_cookie = allocate_monotonic(
             &NEXT_BACKEND_COOKIE,
@@ -1497,7 +1504,6 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             hardware: Mutex::new(HardwareState {
                 boot: BootState::Cold,
                 ring,
-                trap,
                 sqe: None,
                 shader_pack: None,
                 fence,

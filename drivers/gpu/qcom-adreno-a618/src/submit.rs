@@ -16,8 +16,10 @@ const CP_MEMCPY: u8 = 0x75;
 const CP_SET_VISIBILITY_OVERRIDE: u8 = 0x64;
 const CP_REG_WRITE: u8 = 0x6d;
 
+const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
+const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
 const A2D_COLOR_SWAP_WXYZ: u32 = 1 << 10;
@@ -578,6 +580,13 @@ fn validate_type7(
         {
             Ok(())
         }
+        (opcode::EVENT_WRITE, 4)
+            if payload[0] == EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP
+                && payload[1..3] == [0, 0]
+                && payload[3] != 0 =>
+        {
+            address_field(addresses, packet_word + 2, ACCESS_WRITE, false, Some(4))
+        }
         (opcode::SET_MARKER, 1) if matches!(payload[0], 1 | 12) => Ok(()),
         (CP_SET_VISIBILITY_OVERRIDE, 1) => exact(payload, &[1]),
         (CP_REG_WRITE, 3) => exact(payload, &[2, RB_RENDER_CNTL, 0x10]),
@@ -699,6 +708,48 @@ fn validate_memcpy_barriers(words: &[u32]) -> Result<(), &'static str> {
     }
     if require_wait {
         return Err("qcom-adreno-a618: CP_MEMCPY must be followed by CP_WAIT_MEM_WRITES");
+    }
+    Ok(())
+}
+
+/// A6xx cannot invalidate a color CCU that may still contain dirty data.
+/// Require the exact addressed clean used by Freedreno immediately before
+/// every color invalidation; individually valid event packets are not enough.
+fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
+    let mut clean_pending = false;
+    for packet in Packets::new(words) {
+        let packet = packet.map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
+        let clean = matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: opcode::EVENT_WRITE,
+                count: 4,
+            }
+        ) && packet.payload.first()
+            == Some(&(EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP));
+        let invalidate = matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: opcode::EVENT_WRITE,
+                count: 1,
+            }
+        ) && packet.payload == [EVENT_CCU_INVALIDATE_COLOR];
+
+        if clean_pending {
+            if !invalidate {
+                return Err(
+                    "qcom-adreno-a618: CCU color clean must immediately precede invalidation",
+                );
+            }
+            clean_pending = false;
+        } else if clean {
+            clean_pending = true;
+        } else if invalidate {
+            return Err("qcom-adreno-a618: dirty CCU color invalidation is forbidden");
+        }
+    }
+    if clean_pending {
+        return Err("qcom-adreno-a618: CCU color clean is missing its invalidation");
     }
     Ok(())
 }
@@ -1423,6 +1474,7 @@ fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressFiel
         return Err("qcom-adreno-a618: every GPU address must have one relocation");
     }
     validate_memcpy_barriers(&words)?;
+    validate_ccu_transitions(&words)?;
     validate_a2d_sequences(&words, &mut addresses)?;
     validate_3d_sequences(&words, &mut addresses)?;
     for (index, address) in addresses.iter().enumerate() {
@@ -1941,6 +1993,61 @@ mod tests {
         let mut bytes = std::vec![0; encoded_len(submit).unwrap()];
         encode(submit, &mut bytes).unwrap();
         assert!(validate_no_shaders(&bytes, |_| None).is_err());
+    }
+
+    #[test]
+    fn color_invalidate_without_an_addressed_clean_is_rejected() {
+        let pm4 = [
+            type7(opcode::EVENT_WRITE, 1).unwrap(),
+            super::EVENT_CCU_INVALIDATE_COLOR,
+        ];
+        let submit = Submit {
+            pm4: &pm4,
+            resources: &[],
+            relocations: &[],
+        };
+        let mut bytes = std::vec![0; encoded_len(submit).unwrap()];
+        encode(submit, &mut bytes).unwrap();
+        assert_eq!(
+            validate_no_shaders(&bytes, |_| None),
+            Err("qcom-adreno-a618: dirty CCU color invalidation is forbidden")
+        );
+    }
+
+    #[test]
+    fn addressed_color_clean_must_immediately_precede_invalidation() {
+        let pm4 = [
+            type7(opcode::EVENT_WRITE, 4).unwrap(),
+            super::EVENT_CCU_FLUSH_COLOR_TS | super::CP_EVENT_WRITE_TIMESTAMP,
+            0,
+            0,
+            1,
+            type7(opcode::EVENT_WRITE, 1).unwrap(),
+            super::EVENT_CACHE_INVALIDATE,
+            type7(opcode::EVENT_WRITE, 1).unwrap(),
+            super::EVENT_CCU_INVALIDATE_COLOR,
+        ];
+        let bytes = payload(
+            &pm4,
+            Relocation {
+                pm4_word_offset: 2,
+                source: RelocationSource::Attachment(0),
+                resource_offset: 0,
+                required_size: 4,
+                access: ACCESS_WRITE,
+                encoding: AddressEncoding::GpuVa64,
+            },
+        );
+        assert_eq!(
+            validate_no_shaders(&bytes, |token| Some(ResolvedResource {
+                attachment_token: token,
+                gpu_va: 0x1_0000_0000,
+                allocation_size: 0x1000,
+                allowed_access: ACCESS_WRITE,
+                linear_image: None,
+            })),
+            Err("qcom-adreno-a618: CCU color clean must immediately precede invalidation")
+        );
     }
 
     #[test]
