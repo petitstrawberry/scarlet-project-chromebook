@@ -191,6 +191,12 @@ The image to deploy to a USB drive is:
 projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
 ```
 
+The wrapper deliberately invalidates cargo-scarlet's packaging stamps because
+the CoachZ SGFX layer consumes local transitive sources that those stamps do not
+track.  It also verifies that the EFI kernel and all packaged SGFX binaries
+match the artifacts built in the same invocation.  Use the wrapper rather than
+invoking `cargo scarlet image` directly for development images.
+
 It is a GPT disk image for a single USB drive with:
 
 - partition 1, `SCARLET_BOOT`: an EFI System Partition containing:
