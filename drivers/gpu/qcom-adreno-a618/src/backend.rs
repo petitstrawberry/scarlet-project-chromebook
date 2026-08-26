@@ -57,6 +57,8 @@ const GPU_TIMEOUT_US: u64 = 1_000_000;
 const GPU_QUIESCE_TIMEOUT_US: u64 = 10_000;
 const CP_INDIRECT_BUFFER: u8 = 0x3f;
 const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
+const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
+const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const CP_EVENT_WRITE_IRQ: u32 = 1 << 31;
 // Linux's A6xx hardware initialization uses the complete 49-bit UCHE address
 // range.  Limiting this to a mapped trap page silently puts every later
@@ -77,6 +79,28 @@ fn completion_commands(fence_address: u64, sequence: u32) -> Result<[u32; 7], &'
         fence_address as u32,
         (fence_address >> 32) as u32,
         sequence,
+    ])
+}
+
+fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 8], &'static str> {
+    let event_header = type7(opcode::EVENT_WRITE, 1)
+        .map_err(|_| "qcom-adreno-a618: failed to encode kernel CCU invalidate")?;
+    let indirect_header = type7(CP_INDIRECT_BUFFER, 3)
+        .map_err(|_| "qcom-adreno-a618: failed to encode kernel indirect buffer")?;
+
+    // Linux's A6xx submit path unconditionally invalidates both CCUs before
+    // entering a userspace IB.  This trusted preamble is required even for a
+    // CP_MEMCPY-only IB: without it, one cold upload can retire while the next
+    // identical upload consumes its IB but never reaches the kernel fence.
+    Ok([
+        event_header,
+        EVENT_CCU_INVALIDATE_DEPTH,
+        event_header,
+        EVENT_CCU_INVALIDATE_COLOR,
+        indirect_header,
+        command_address as u32,
+        (command_address >> 32) as u32,
+        word_count,
     ])
 }
 
@@ -958,18 +982,10 @@ impl A618Core {
         let word_count = u32::try_from(command.as_words().len()).map_err(|_| {
             GpuBackendSubmitError::Rejected("qcom-adreno-a618: command stream is too large")
         })?;
-        let indirect = [
-            type7(CP_INDIRECT_BUFFER, 3).map_err(|_| {
-                GpuBackendSubmitError::Unavailable(
-                    "qcom-adreno-a618: failed to encode kernel indirect buffer",
-                )
-            })?,
-            command.dma_addr() as u32,
-            (command.dma_addr() >> 32) as u32,
-            word_count,
-        ];
+        let submission = submission_commands(command.dma_addr(), word_count)
+            .map_err(GpuBackendSubmitError::Unavailable)?;
         let mut hardware = self.hardware.lock();
-        self.execute_ring(&mut hardware, &indirect, command.as_words().len())
+        self.execute_ring(&mut hardware, &submission, command.as_words().len())
             .map_err(|error| {
                 self.quiesce_lost(&mut hardware, error);
                 GpuBackendSubmitError::DeviceLost(error)
@@ -1546,7 +1562,11 @@ pub(crate) fn remove(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 mod tests {
     use adreno_a6xx_pm4::{opcode, type4, type7};
 
-    use super::{A618Core, CP_EVENT_WRITE_IRQ, EVENT_CACHE_FLUSH_TS, completion_commands};
+    use super::{
+        A618Core, CP_EVENT_WRITE_IRQ, CP_INDIRECT_BUFFER, EVENT_CACHE_FLUSH_TS,
+        EVENT_CCU_INVALIDATE_COLOR, EVENT_CCU_INVALIDATE_DEPTH, completion_commands,
+        submission_commands,
+    };
     use crate::registers::CP_SCRATCH_2;
 
     #[test]
@@ -1571,5 +1591,18 @@ mod tests {
         assert_eq!(commands[4], 0x2345_6000);
         assert_eq!(commands[5], 1);
         assert_eq!(commands[6], 7);
+    }
+
+    #[test]
+    fn submission_commands_match_the_linux_a6xx_trusted_preamble() {
+        let commands = submission_commands(0x1_2345_6000, 0x123).unwrap();
+        assert_eq!(commands[0], type7(opcode::EVENT_WRITE, 1).unwrap());
+        assert_eq!(commands[1], EVENT_CCU_INVALIDATE_DEPTH);
+        assert_eq!(commands[2], type7(opcode::EVENT_WRITE, 1).unwrap());
+        assert_eq!(commands[3], EVENT_CCU_INVALIDATE_COLOR);
+        assert_eq!(commands[4], type7(CP_INDIRECT_BUFFER, 3).unwrap());
+        assert_eq!(commands[5], 0x2345_6000);
+        assert_eq!(commands[6], 1);
+        assert_eq!(commands[7], 0x123);
     }
 }
