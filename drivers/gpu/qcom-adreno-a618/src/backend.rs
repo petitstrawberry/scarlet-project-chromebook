@@ -60,7 +60,6 @@ const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
 const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
-const CP_EVENT_WRITE_IRQ: u32 = 1 << 31;
 const FENCE_TIMESTAMP_PENDING: u32 = u32::MAX;
 // Linux's A6xx hardware initialization uses the complete 49-bit UCHE address
 // range.  Limiting this to a mapped trap page silently puts every later
@@ -77,7 +76,7 @@ fn completion_commands(fence_address: u64, sequence: u32) -> Result<[u32; 7], &'
         scratch_header,
         sequence,
         event_header,
-        EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP | CP_EVENT_WRITE_IRQ,
+        EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP,
         fence_address as u32,
         (fence_address >> 32) as u32,
         sequence,
@@ -560,6 +559,9 @@ impl A618Core {
         let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
         if interrupt != 0 {
             self.registers.write(RBBM_INT_CLEAR_CMD, interrupt);
+            // Commit the W1C before a following submit can report another
+            // completion or fault through the same shared status register.
+            arch::io_wmb();
         }
         let completion = interrupt & RBBM_INT_COMPLETION_MASK;
         let fatal = (interrupt & !completion) & RBBM_INT_FATAL_MASK;
@@ -792,10 +794,10 @@ impl A618Core {
         hardware.fence.as_words_mut()[0] = FENCE_TIMESTAMP_PENDING;
         hardware.fence.clean_for_device();
         // CP_SCRATCH(2) carries Scarlet's software sequence while the addressed
-        // event writes a hardware timestamp.  Mesa marks A6xx CACHE_FLUSH_TS as
-        // timestamped; using its payload as a software fence works once after a
-        // cold start on CoachZ, then leaves the next cache-clean event pending.
-        // Keep the roles separate and require both signals before retiring.
+        // event writes a hardware timestamp.  This backend polls the DMA fence,
+        // so do not request an IRQ: unlike Linux's interrupt-driven retirement,
+        // Scarlet deliberately keeps RBBM_INT_0_MASK disabled and has no A618
+        // IRQ handler to acknowledge an asserted completion line.
         let completion = completion_commands(hardware.fence.dma_addr(), sequence)?;
         let mut ring = Vec::new();
         ring.try_reserve_exact(words.len() + completion.len())
@@ -808,20 +810,6 @@ impl A618Core {
         loop {
             hardware.fence.invalidate_from_device();
             let fence_value = hardware.fence.read_word_volatile(0).unwrap_or(0);
-            if fence_value != FENCE_TIMESTAMP_PENDING
-                && self.registers.read(CP_SCRATCH_2) == sequence
-                && self.registers.read(CP_RB_RPTR) == target_wptr
-                && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
-            {
-                if sequence == 1 {
-                    early_println!(
-                        "[a618] first submit complete irq={:#010x} timestamp={:#010x}",
-                        observed_interrupts,
-                        fence_value,
-                    );
-                }
-                return Ok(());
-            }
             match self.consume_ring_interrupts() {
                 Ok(interrupt) => observed_interrupts |= interrupt,
                 Err(interrupt) => {
@@ -847,6 +835,22 @@ impl A618Core {
                         "qcom-adreno-a618: GPU fault interrupt during synchronous submit"
                     });
                 }
+            }
+            // Drain any status raised alongside the memory fence before
+            // returning so the next ring kick starts from a clean status word.
+            if fence_value != FENCE_TIMESTAMP_PENDING
+                && self.registers.read(CP_SCRATCH_2) == sequence
+                && self.registers.read(CP_RB_RPTR) == target_wptr
+                && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
+            {
+                if sequence == 1 {
+                    early_println!(
+                        "[a618] first submit complete irq={:#010x} timestamp={:#010x}",
+                        observed_interrupts,
+                        fence_value,
+                    );
+                }
+                return Ok(());
             }
             if time::current_time().saturating_sub(start) >= GPU_TIMEOUT_US {
                 self.record_ring_failure(
@@ -1603,9 +1607,9 @@ mod tests {
     use adreno_a6xx_pm4::{opcode, type4, type7};
 
     use super::{
-        A618Core, CP_EVENT_WRITE_IRQ, CP_EVENT_WRITE_TIMESTAMP, CP_INDIRECT_BUFFER,
-        EVENT_CACHE_FLUSH_TS, EVENT_CCU_INVALIDATE_COLOR, EVENT_CCU_INVALIDATE_DEPTH,
-        completion_commands, submission_commands,
+        A618Core, CP_EVENT_WRITE_TIMESTAMP, CP_INDIRECT_BUFFER, EVENT_CACHE_FLUSH_TS,
+        EVENT_CCU_INVALIDATE_COLOR, EVENT_CCU_INVALIDATE_DEPTH, completion_commands,
+        submission_commands,
     };
     use crate::registers::CP_SCRATCH_2;
 
@@ -1627,10 +1631,7 @@ mod tests {
         assert_eq!(commands[0], type4(CP_SCRATCH_2 as u32, 1).unwrap());
         assert_eq!(commands[1], 7);
         assert_eq!(commands[2], type7(opcode::EVENT_WRITE, 4).unwrap());
-        assert_eq!(
-            commands[3],
-            EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP | CP_EVENT_WRITE_IRQ
-        );
+        assert_eq!(commands[3], EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_TIMESTAMP);
         assert_eq!(commands[4], 0x2345_6000);
         assert_eq!(commands[5], 1);
         assert_eq!(commands[6], 7);
