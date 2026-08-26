@@ -807,14 +807,14 @@ impl Emitter {
         // Match fd6_emit_sysmem_fini()/fd6_emit_flushes() on A6xx.  A color
         // clean alone is not a complete sysmem epilogue: depth CCU state and
         // the general cache must retire before WFI and before the kernel's
-        // trusted CACHE_FLUSH_TS fence.  Otherwise A618 can drain the IB and
-        // ring while never reaching the externally visible fence write.
+        // trusted CACHE_FLUSH_TS fence. FD6_INVALIDATE_CCHE is an A7xx+
+        // operation; emitting the general CACHE_INVALIDATE event here on
+        // A618 is not part of fd6_emit_sysmem_fini().
         self.timestamped_cache_event(EVENT_CCU_FLUSH_COLOR_TS)?;
         self.timestamped_cache_event(EVENT_CCU_FLUSH_DEPTH_TS)?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_COLOR])?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_DEPTH])?;
         self.timestamped_cache_event(EVENT_CACHE_FLUSH_TS)?;
-        self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])?;
         self.wait_for_idle()
     }
 

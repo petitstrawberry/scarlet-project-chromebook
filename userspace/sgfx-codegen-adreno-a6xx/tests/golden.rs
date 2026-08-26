@@ -298,8 +298,6 @@ fn clear_is_a_golden_address_free_stream() {
             0,
             0,
             4,
-            0x7046_0001,
-            0x31,
             0x7026_8000,
         ]
     );
@@ -407,8 +405,6 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
             0,
             0,
             4,
-            0x7046_0001,
-            0x31,
             0x7026_8000,
         ]
     );

@@ -12,6 +12,12 @@ const IMAGE_OBJECT_BASE: u32 = 1;
 const BUFFER_OBJECT_BASE: u32 = 1 << 16;
 const PIPELINE_OBJECT_BASE: u32 = 1 << 24;
 
+#[derive(Clone, Copy)]
+struct GeneratedProgress {
+    offset: u64,
+    expected: u32,
+}
+
 impl ContextResources {
     pub(crate) fn execute<'r, 'data>(
         &mut self,
@@ -187,9 +193,24 @@ impl ContextResources {
             operations: &operations,
         })?;
         let mut bindings = external_bindings;
-        self.materialize_generated(&compiled, &mut bindings)?;
+        let progress = self.materialize_generated(&compiled, &mut bindings)?;
         let payload = wire::encode(&compiled, &bindings)?;
-        queue.submit(&payload)?;
+        if let Err(error) = queue.submit(&payload) {
+            if let Some(progress) = progress {
+                match self.read_scratch_u32(progress.offset) {
+                    Ok(actual) => std::println!(
+                        "[a618-userspace] CCU event progress actual={:#x} expected={:#x}",
+                        actual,
+                        progress.expected,
+                    ),
+                    Err(_) => std::println!(
+                        "[a618-userspace] CCU event progress unavailable expected={:#x}",
+                        progress.expected,
+                    ),
+                }
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -310,9 +331,9 @@ impl ContextResources {
         &mut self,
         compiled: &codegen::RelocatablePm4,
         bindings: &mut Vec<BoundObject>,
-    ) -> Result<(), IrSubmitError> {
+    ) -> Result<Option<GeneratedProgress>, IrSubmitError> {
         if compiled.generated_objects.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut placements = Vec::new();
         placements
@@ -350,6 +371,25 @@ impl ContextResources {
             scratch.write(0, &upload)?;
             (scratch.attachment_token, scratch.logical_size)
         };
+        let progress = compiled
+            .generated_objects
+            .iter()
+            .zip(placements.iter())
+            .find_map(|(generated, (_, offset, _))| {
+                (generated.kind == codegen::GeneratedObjectKind::CcuTimestamp)
+                    .then_some((generated.id, *offset))
+            })
+            .map(|(id, offset)| {
+                let expected = compiled
+                    .fixups
+                    .iter()
+                    .filter(|fixup| fixup.object == codegen::ObjectRef::Generated(id))
+                    .count();
+                u32::try_from(expected)
+                    .map(|expected| GeneratedProgress { offset, expected })
+                    .map_err(|_| IrSubmitError::OutOfMemory)
+            })
+            .transpose()?;
         bindings
             .try_reserve_exact(placements.len())
             .map_err(|_| IrSubmitError::OutOfMemory)?;
@@ -367,7 +407,7 @@ impl ContextResources {
                 size,
             });
         }
-        Ok(())
+        Ok(progress)
     }
 }
 

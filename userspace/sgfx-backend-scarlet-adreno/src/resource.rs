@@ -170,6 +170,33 @@ impl RawBuffer {
         }
         MemoryMappingOps::munmap(address, mapping_len).map_err(|_| HandleError::SystemError(-1))
     }
+
+    pub(crate) fn read_u32(&self, offset: u64) -> HandleResult<u32> {
+        let end = offset
+            .checked_add(core::mem::size_of::<u32>() as u64)
+            .ok_or(HandleError::InvalidParameter)?;
+        if !offset.is_multiple_of(core::mem::align_of::<u32>() as u64) || end > self.logical_size {
+            return Err(HandleError::InvalidParameter);
+        }
+        let mapping_len = usize::try_from(self.raw.allocated_size())
+            .map_err(|_| HandleError::InvalidParameter)?;
+        let source_offset = usize::try_from(offset).map_err(|_| HandleError::InvalidParameter)?;
+        let mapping = self.raw.as_handle().as_memory_mapping()?;
+        let address = mapping
+            .mmap(0, mapping_len, prot::READ, flags::SHARED, 0)
+            .map_err(|_| HandleError::SystemError(-1))?;
+
+        // SAFETY: the kernel returned a readable mapping of `mapping_len`
+        // bytes, the checked range lies within the backing allocation, and
+        // generated timestamp objects are at least four-byte aligned.
+        let value = unsafe {
+            u32::from_le(ptr::read_volatile(
+                (address as *const u8).add(source_offset).cast::<u32>(),
+            ))
+        };
+        MemoryMappingOps::munmap(address, mapping_len).map_err(|_| HandleError::SystemError(-1))?;
+        Ok(value)
+    }
 }
 
 pub(crate) struct ContextResources {
@@ -359,6 +386,13 @@ impl ContextResources {
             self.scratch = Some(replacement);
         }
         self.scratch.as_ref().ok_or(IrSubmitError::OutOfMemory)
+    }
+
+    pub(crate) fn read_scratch_u32(&self, offset: u64) -> HandleResult<u32> {
+        self.scratch
+            .as_ref()
+            .ok_or(HandleError::InvalidParameter)?
+            .read_u32(offset)
     }
 
     pub(crate) fn context_id(&self) -> i32 {
