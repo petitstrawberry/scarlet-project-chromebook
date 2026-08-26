@@ -59,6 +59,8 @@ const CP_INDIRECT_BUFFER: u8 = 0x3f;
 const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
 const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
+const CP_EVENT_WRITE_IRQ: u32 = 1 << 31;
+const RBBM_INT_POLL_MASK: u32 = RBBM_INT_FATAL_MASK | RBBM_INT_CP_CACHE_FLUSH_TS;
 // Linux's A6xx hardware initialization uses the complete 49-bit UCHE address
 // range.  Limiting this to a mapped trap page silently puts every later
 // shader, vertex, and texture allocation into L2-bypass mode.
@@ -74,7 +76,7 @@ fn completion_commands(fence_address: u64, sequence: u32) -> Result<[u32; 7], &'
         scratch_header,
         sequence,
         event_header,
-        EVENT_CACHE_FLUSH_TS,
+        EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ,
         fence_address as u32,
         (fence_address >> 32) as u32,
         sequence,
@@ -414,6 +416,12 @@ impl A618Core {
         let registers = self.registers;
         registers.write(RBBM_INT_0_MASK, 0);
         registers.write(RBBM_INT_CLEAR_CMD, u32::MAX);
+        arch::io_wmb();
+        // Scarlet keeps the platform IRQ disabled and polls the RBBM status,
+        // but A6xx still needs the same internal completion source enabled as
+        // Linux so CACHE_FLUSH_TS can be observed and W1C-acknowledged before
+        // the next submit.
+        registers.write(RBBM_INT_0_MASK, RBBM_INT_POLL_MASK);
         registers.write(RBBM_SECVID_TSB_CNTL, 0);
         registers.write64(RBBM_SECVID_TSB_TRUSTED_BASE, 0);
         registers.write(RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
@@ -787,10 +795,10 @@ impl A618Core {
         let sequence = hardware.fence_sequence;
         hardware.fence.as_words_mut()[0] = 0;
         hardware.fence.clean_for_device();
-        // Match Mesa's polled A6xx fence: CACHE_FLUSH_TS writes the packet's
-        // software sequence to memory.  Bit 30 would replace that payload with
-        // a hardware timestamp; bit 31 would request an IRQ that this polling
-        // backend deliberately keeps masked.
+        // Match Linux's A6xx fence payload and completion source:
+        // CACHE_FLUSH_TS writes the software sequence to memory and raises the
+        // RBBM completion bit. Scarlet polls and W1C-acknowledges that bit while
+        // the corresponding platform interrupt remains disabled at the GIC.
         let completion = completion_commands(hardware.fence.dma_addr(), sequence)?;
         let mut ring = Vec::new();
         ring.try_reserve_exact(words.len() + completion.len())
@@ -832,6 +840,7 @@ impl A618Core {
             // Drain any status raised alongside the memory fence before
             // returning so the next ring kick starts from a clean status word.
             if fence_value == sequence
+                && observed_interrupts & RBBM_INT_CP_CACHE_FLUSH_TS != 0
                 && self.registers.read(CP_SCRATCH_2) == sequence
                 && self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
@@ -1600,8 +1609,9 @@ mod tests {
     use adreno_a6xx_pm4::{opcode, type4, type7};
 
     use super::{
-        A618Core, CP_INDIRECT_BUFFER, EVENT_CACHE_FLUSH_TS, EVENT_CCU_INVALIDATE_COLOR,
-        EVENT_CCU_INVALIDATE_DEPTH, completion_commands, submission_commands,
+        A618Core, CP_EVENT_WRITE_IRQ, CP_INDIRECT_BUFFER, EVENT_CACHE_FLUSH_TS,
+        EVENT_CCU_INVALIDATE_COLOR, EVENT_CCU_INVALIDATE_DEPTH, completion_commands,
+        submission_commands,
     };
     use crate::registers::CP_SCRATCH_2;
 
@@ -1623,7 +1633,7 @@ mod tests {
         assert_eq!(commands[0], type4(CP_SCRATCH_2 as u32, 1).unwrap());
         assert_eq!(commands[1], 7);
         assert_eq!(commands[2], type7(opcode::EVENT_WRITE, 4).unwrap());
-        assert_eq!(commands[3], EVENT_CACHE_FLUSH_TS);
+        assert_eq!(commands[3], EVENT_CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
         assert_eq!(commands[4], 0x2345_6000);
         assert_eq!(commands[5], 1);
         assert_eq!(commands[6], 7);
