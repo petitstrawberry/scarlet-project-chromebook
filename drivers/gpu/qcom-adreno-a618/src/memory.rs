@@ -96,6 +96,19 @@ impl DmaAllocation {
         unsafe { core::slice::from_raw_parts_mut(self.vaddr() as *mut u32, len) }
     }
 
+    /// Read a device-owned word after the caller has invalidated the CPU
+    /// cache.  Volatile access is required because the device can update this
+    /// allocation without a Rust-visible store.
+    pub(crate) fn read_word_volatile(&self, index: usize) -> Option<u32> {
+        let len = self.requested_size / core::mem::size_of::<u32>();
+        if index >= len {
+            return None;
+        }
+        // SAFETY: `index` was checked against the requested allocation and the
+        // page backing is naturally aligned for `u32`.
+        Some(unsafe { ptr::read_volatile((self.vaddr() as *const u32).add(index)) })
+    }
+
     pub(crate) fn clean_for_device(&self) {
         arch::clean_dcache_to_poc_range(self.vaddr(), self.allocation_size());
     }

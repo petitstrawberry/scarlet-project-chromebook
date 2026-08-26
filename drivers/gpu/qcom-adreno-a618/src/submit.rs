@@ -2652,6 +2652,92 @@ mod tests {
     }
 
     #[test]
+    fn sws_first_cursor_frame_is_accepted_as_the_observed_506_word_stream() {
+        const PIPELINE: PipelineId = PipelineId::new(11);
+        let resources = [
+            image(TARGET, TextureUsage::RENDER_ATTACHMENT),
+            image(SOURCE, TextureUsage::SAMPLED),
+            ResourceMeta {
+                id: BUFFER,
+                size: 144,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                },
+            },
+        ];
+        let pipeline = PipelineMeta {
+            id: PIPELINE,
+            descriptor: RenderPipelineDesc::new(
+                TextureFormat::Bgra8Unorm,
+                PrimitiveTopology::TriangleList,
+                VertexBufferLayout::new(
+                    24,
+                    std::vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x2, 16),
+                    ],
+                )
+                .unwrap(),
+                FragmentProgram::Texture(TextureSampleMode::Rgba),
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        };
+        let vertices = [0_u8; 144];
+        let operations = [
+            Operation::WriteBuffer {
+                destination: BUFFER,
+                offset: 0,
+                data: &vertices,
+            },
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: PixelRect::new(0, 0, 16, 16).unwrap(),
+                load: LoadOp::Clear(Color::rgba(0.05, 0.1, 0.2, 1.0).unwrap()),
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            },
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetTexture(SOURCE),
+            Operation::SetSampler(SamplerDesc::new(
+                FilterMode::Linear,
+                FilterMode::Linear,
+                AddressMode::ClampToEdge,
+                AddressMode::ClampToEdge,
+            )),
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::SetScissor(None),
+            Operation::Draw {
+                vertex_count: 6,
+                first_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: core::slice::from_ref(&pipeline),
+            operations: &operations,
+        })
+        .unwrap();
+
+        // This is the exact command shape reported by the first SWS cursor
+        // frame on CoachZ: quad upload, target clear, one sampled draw, and
+        // sysmem retirement.  Pinning the dword count makes later hardware
+        // logs directly comparable to this host-validated stream.
+        assert_eq!(artifact.words.len(), 506);
+        assert!(accept_codegen(&artifact).is_ok());
+    }
+
+    #[test]
     fn full_ui_and_compat_pipeline_matrix_reaches_kernel_validator() {
         let mut alpha = image(ALPHA, TextureUsage::SAMPLED);
         let ResourceKind::Image(alpha_meta) = &mut alpha.kind else {
