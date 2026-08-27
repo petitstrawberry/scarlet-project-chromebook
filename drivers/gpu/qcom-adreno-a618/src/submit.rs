@@ -13,6 +13,11 @@ use adreno_a6xx_submit_wire::{
 };
 
 const CP_MEMCPY: u8 = 0x75;
+const CP_MEM_WRITE: u8 = 0x3d;
+// Must match the bounded chunks emitted by sgfx-codegen-adreno-a6xx. A single
+// 252-dword transfer has stopped the CoachZ A618 command parser; 128 dwords
+// also keeps production texture uploads inside the opaque submit budget.
+const CP_MEMCPY_MAX_DWORDS: u32 = 128;
 const CP_SET_VISIBILITY_OVERRIDE: u8 = 0x64;
 const CP_REG_WRITE: u8 = 0x6d;
 const CP_SKIP_IB2_ENABLE_GLOBAL: u8 = 0x1d;
@@ -23,7 +28,6 @@ const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_FLUSH_DEPTH_TS: u32 = 0x1c;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
-const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
 const A2D_COLOR_SWAP_WXYZ: u32 = 1 << 10;
@@ -154,7 +158,11 @@ const SP_PS_MRT_CNTL: u32 = 0xa98d;
 const SP_PS_OUTPUT_REG: u32 = 0xa98e;
 const SP_PS_MRT_REG: u32 = 0xa996;
 const SP_PS_INITIAL_TEX_LOAD_CNTL: u32 = 0xa99e;
+const SP_PS_INITIAL_TEX_INDEX_CMD: u32 = 0xa9a3;
+const SP_PS_TSIZE: u32 = 0xa9a7;
 const SP_PS_PVT_MEM_STACK_OFFSET: u32 = 0xa9a9;
+const SP_PS_SAMPLER_BASE: u32 = 0xa9e0;
+const SP_PS_TEXMEMOBJ_BASE: u32 = 0xa9e4;
 const SP_PS_CONFIG: u32 = 0xab04;
 const SP_PS_INSTR_SIZE: u32 = 0xab05;
 const SP_MODE_CNTL: u32 = 0xab00;
@@ -551,6 +559,14 @@ fn validate_type4(
             | RB_PS_OUTPUT_MASK,
             _,
         ) if any_shader_payload(register, payload) => Ok(()),
+        (SP_PS_INITIAL_TEX_INDEX_CMD, 1) => exact(payload, &[0]),
+        (SP_PS_TSIZE, 1) if matches!(payload[0], 0 | 1) => Ok(()),
+        (SP_PS_SAMPLER_BASE, 2) => {
+            address_field(addresses, packet_word + 1, ACCESS_READ, false, Some(16))
+        }
+        (SP_PS_TEXMEMOBJ_BASE, 2) => {
+            address_field(addresses, packet_word + 1, ACCESS_READ, false, Some(64))
+        }
         (SP_VS_OUTPUT_CNTL | VPC_VS_CNTL | VPC_PS_CNTL | PC_VS_CNTL, 1) => Ok(()),
         (SP_VS_OUTPUT_REG | SP_VS_VPC_DEST_REG, count) if count <= 2 => Ok(()),
         (VPC_VARYING_LM_TRANSFER_CNTL_DISABLE, 4) => Ok(()),
@@ -578,11 +594,7 @@ fn validate_type7(
             Ok(())
         }
         (opcode::EVENT_WRITE, 4)
-            if [
-                EVENT_CCU_FLUSH_COLOR_TS | CP_EVENT_WRITE_TIMESTAMP,
-                EVENT_CCU_FLUSH_DEPTH_TS | CP_EVENT_WRITE_TIMESTAMP,
-            ]
-            .contains(&payload[0])
+            if [EVENT_CCU_FLUSH_COLOR_TS, EVENT_CCU_FLUSH_DEPTH_TS].contains(&payload[0])
                 && payload[1..3] == [0, 0]
                 && payload[3] != 0 =>
         {
@@ -594,12 +606,35 @@ fn validate_type7(
         (CP_SET_VISIBILITY_OVERRIDE, 1) => exact(payload, &[1]),
         (CP_REG_WRITE, 3) => exact(payload, &[2, RB_RENDER_CNTL, 0x10]),
         (opcode::BLIT, 1) => exact(payload, &[3]),
-        (CP_MEMCPY, 5) if payload[0] != 0 => {
+        (CP_MEMCPY, 5) if matches!(payload[0], 1..=CP_MEMCPY_MAX_DWORDS) => {
             let size = u64::from(payload[0])
                 .checked_mul(4)
                 .ok_or("qcom-adreno-a618: PM4 memcpy size overflows")?;
             address_field(addresses, packet_word + 2, ACCESS_READ, false, Some(size))?;
             address_field(addresses, packet_word + 4, ACCESS_WRITE, false, Some(size))
+        }
+        (CP_MEM_WRITE, 22)
+            if payload[0..2] == [0, 0]
+                && payload[2] == 0x4c00_6880
+                && payload[3] & 0xc000_0000 == 0
+                && payload[3] & 0x7fff != 0
+                && (payload[3] >> 15) & 0x7fff != 0
+                && payload[4] & 0x7f == 0
+                && payload[4] >> 29 == 1
+                && payload[5] & !0x007f_ffff == 0
+                && payload[7] == (1 << 17)
+                && payload[8..18] == [0; 10]
+                && matches!(&payload[18..], [0x920, 0x40, 0, 0] | [0x92a, 0x40, 0x20, 0]) =>
+        {
+            address_field(addresses, packet_word + 1, ACCESS_WRITE, false, Some(80))?;
+            address_field_encoded(
+                addresses,
+                packet_word + 7,
+                ACCESS_READ,
+                false,
+                None,
+                AddressEncoding::GpuVa49TexDescriptor,
+            )
         }
         (CP_LOAD_STATE6_GEOM, 3)
             if payload[0] == ((2 << 16) | (8 << 18) | (1 << 22)) && payload[1..3] == [0, 0] =>
@@ -633,34 +668,16 @@ fn validate_type7(
         {
             Ok(())
         }
-        (CP_LOAD_STATE6_FRAG, 19)
-            if payload[0] == ((1 << 14) | (4 << 18) | (1 << 22))
-                && payload[1..3] == [0, 0]
-                && payload[3] == 0x4c00_6880
-                && payload[4] & 0xc000_0000 == 0
-                && payload[4] & 0x7fff != 0
-                && (payload[4] >> 15) & 0x7fff != 0
-                && payload[5] & 0x7f == 0
-                && payload[5] >> 29 == 1
-                && payload[6] & !0x007f_ffff == 0
-                && payload[8] == (1 << 17)
-                && payload[9..] == [0; 10] =>
+        (CP_LOAD_STATE6_FRAG, 3)
+            if payload[0] == ((2 << 16) | (4 << 18) | (1 << 22)) && payload[1..3] == [0, 0] =>
         {
-            address_field_encoded(
-                addresses,
-                packet_word + 8,
-                ACCESS_READ,
-                false,
-                None,
-                AddressEncoding::GpuVa49TexDescriptor,
-            )
+            address_field(addresses, packet_word + 2, ACCESS_READ, false, Some(16))
         }
-        (CP_LOAD_STATE6_FRAG, 7)
-            if payload[0] == ((4 << 18) | (1 << 22))
-                && payload[1..3] == [0, 0]
-                && matches!(&payload[3..], [0x920, 0x40, 0, 0] | [0x92a, 0x40, 0x20, 0]) =>
+        (CP_LOAD_STATE6_FRAG, 3)
+            if payload[0] == ((1 << 14) | (2 << 16) | (4 << 18) | (1 << 22))
+                && payload[1..3] == [0, 0] =>
         {
-            Ok(())
+            address_field(addresses, packet_word + 2, ACCESS_READ, false, Some(64))
         }
         (CP_DRAW_INDX_OFFSET, 3)
             if payload[0] == 0x84
@@ -696,7 +713,7 @@ fn validate_memcpy_barriers(words: &[u32]) -> Result<(), &'static str> {
                 }
                 _ => {
                     return Err(
-                        "qcom-adreno-a618: CP_MEMCPY must be followed by CP_WAIT_MEM_WRITES",
+                        "qcom-adreno-a618: CP memory write must be followed by CP_WAIT_MEM_WRITES",
                     );
                 }
             }
@@ -704,13 +721,13 @@ fn validate_memcpy_barriers(words: &[u32]) -> Result<(), &'static str> {
         require_wait = matches!(
             packet.header,
             Header::Type7 {
-                opcode: CP_MEMCPY,
+                opcode: CP_MEMCPY | CP_MEM_WRITE,
                 ..
             }
         );
     }
     if require_wait {
-        return Err("qcom-adreno-a618: CP_MEMCPY must be followed by CP_WAIT_MEM_WRITES");
+        return Err("qcom-adreno-a618: CP memory write must be followed by CP_WAIT_MEM_WRITES");
     }
     Ok(())
 }
@@ -730,14 +747,14 @@ fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
     let mut transition = Transition::Idle;
     for packet in Packets::new(words) {
         let packet = packet.map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
-        let timestamped = |event| {
+        let addressed = |event| {
             matches!(
                 packet.header,
                 Header::Type7 {
                     opcode: opcode::EVENT_WRITE,
                     count: 4,
                 }
-            ) && packet.payload.first() == Some(&(event | CP_EVENT_WRITE_TIMESTAMP))
+            ) && packet.payload.first() == Some(&event)
         };
         let plain = |event| {
             matches!(
@@ -748,8 +765,8 @@ fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
                 }
             ) && packet.payload == [event]
         };
-        let color_clean = timestamped(EVENT_CCU_FLUSH_COLOR_TS);
-        let depth_clean = timestamped(EVENT_CCU_FLUSH_DEPTH_TS);
+        let color_clean = addressed(EVENT_CCU_FLUSH_COLOR_TS);
+        let depth_clean = addressed(EVENT_CCU_FLUSH_DEPTH_TS);
         let color_invalidate = plain(EVENT_CCU_INVALIDATE_COLOR);
         let depth_invalidate = plain(EVENT_CCU_INVALIDATE_DEPTH);
         let is_ccu_transition = color_clean || depth_clean || color_invalidate || depth_invalidate;
@@ -790,14 +807,14 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
     let packets = Packets::new(words)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "qcom-adreno-a618: malformed PM4 retirement stream")?;
-    let is_timestamped = |packet: &Packet<'_>, event| {
+    let is_addressed = |packet: &Packet<'_>, event| {
         matches!(
             packet.header,
             Header::Type7 {
                 opcode: opcode::EVENT_WRITE,
                 count: 4,
             }
-        ) && packet.payload.first() == Some(&(event | CP_EVENT_WRITE_TIMESTAMP))
+        ) && packet.payload.first() == Some(&event)
     };
     let is_plain_event = |packet: &Packet<'_>, event| {
         matches!(
@@ -819,8 +836,8 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
     };
     let is_sysmem_retirement = |retirement: &[Packet<'_>]| {
         retirement.len() == 5
-            && is_timestamped(&retirement[0], EVENT_CCU_FLUSH_COLOR_TS)
-            && is_timestamped(&retirement[1], EVENT_CCU_FLUSH_DEPTH_TS)
+            && is_addressed(&retirement[0], EVENT_CCU_FLUSH_COLOR_TS)
+            && is_addressed(&retirement[1], EVENT_CCU_FLUSH_DEPTH_TS)
             && is_plain_event(&retirement[2], EVENT_CCU_INVALIDATE_COLOR)
             && is_plain_event(&retirement[3], EVENT_CCU_INVALIDATE_DEPTH)
             && is_wfi(&retirement[4])
@@ -1243,6 +1260,19 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
             p.first() == Some(&fs.initial_tex_load_cntl)
                 && p.get(1..) == Some(fs.initial_tex_load_cmd)
         })
+        && reg(SP_PS_TSIZE) == Some(&[u32::from(fixed.sampler_dwords.is_some())])
+        && match fixed.sampler_dwords {
+            Some(_) => {
+                reg(SP_PS_INITIAL_TEX_INDEX_CMD) == Some(&[0])
+                    && reg(SP_PS_SAMPLER_BASE).is_some()
+                    && reg(SP_PS_TEXMEMOBJ_BASE).is_some()
+            }
+            None => {
+                reg(SP_PS_INITIAL_TEX_INDEX_CMD).is_none()
+                    && reg(SP_PS_SAMPLER_BASE).is_none()
+                    && reg(SP_PS_TEXMEMOBJ_BASE).is_none()
+            }
+        }
         && reg(VFD_VERTEX_BUFFER_SIZE).is_some_and(|p| p.len() == 2 && p[1] == fixed.stride)
         && reg(VFD_FETCH_INSTR) == Some(fixed.vfd_fetch)
         && reg(VFD_CNTL_0)
@@ -1316,23 +1346,21 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
                 matches!(
                     p.header,
                     Header::Type7 {
-                        opcode: CP_LOAD_STATE6_FRAG,
+                        opcode: CP_MEM_WRITE,
                         ..
                     }
-                ) && p.payload.len() == 7
-                    && p.payload[0] == ((4 << 18) | (1 << 22))
-                    && p.payload[3..] == expected
+                ) && p.payload.len() == 22
+                    && p.payload[18..] == expected
             }),
             None => !packets_in_segment(words, start, end).any(|p| {
                 matches!(
                     p.header,
                     Header::Type7 {
-                        opcode: CP_LOAD_STATE6_FRAG,
+                        opcode: CP_MEM_WRITE,
                         ..
                     }
-                ) && p.payload.len() == 7
-                    && p.payload[0] & (3 << 14) == 0
-                    && p.payload[0] >> 18 & 0xf == 4
+                ) && p.payload.len() == 22
+                    && p.payload[2] == 0x4c00_6880
             }),
         }
 }
@@ -1530,6 +1558,39 @@ fn validate_3d_sequences(
                     pitch_align: Some(descriptor[5] & 0xf),
                     array_pitch: Some(ArrayPitchExpectation {
                         bytes: u64::from(descriptor[6] & 0x7f_ffff) << 12,
+                        alignment: 4096,
+                    }),
+                },
+            )?;
+        }
+        if let Some((descriptor_packet, descriptor)) = packets_in_segment(words, start, end)
+            .find_map(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: CP_MEM_WRITE,
+                        ..
+                    }
+                )
+                .then_some(packet)
+                .filter(|packet| packet.payload.len() == 22 && packet.payload[2] == 0x4c00_6880)
+                .map(|packet| (packet.word_offset, packet.payload))
+            })
+        {
+            let width = descriptor[3] & 0x7fff;
+            let height = (descriptor[3] >> 15) & 0x7fff;
+            let row_pitch = (descriptor[4] >> 7) & 0x3f_ffff;
+            set_image_expectation(
+                addresses,
+                descriptor_packet + 7,
+                ImageExpectation {
+                    row_pitch,
+                    width,
+                    height,
+                    exact_extent: true,
+                    pitch_align: Some(descriptor[4] & 0xf),
+                    array_pitch: Some(ArrayPitchExpectation {
+                        bytes: u64::from(descriptor[5] & 0x7f_ffff) << 12,
                         alignment: 4096,
                     }),
                 },
@@ -1863,8 +1924,9 @@ mod tests {
     };
 
     use super::{
-        LinearImage, RB_A2D_DEST_BUFFER_BASE, RejectedPacketKind, ResolvedResource,
-        diagnose_rejected_packet, relocate_one, validate_and_relocate,
+        CP_MEMCPY, CP_MEMCPY_MAX_DWORDS, LinearImage, RB_A2D_DEST_BUFFER_BASE, RejectedPacketKind,
+        ResolvedResource, diagnose_rejected_packet, relocate_one, validate_and_relocate,
+        validate_type7,
     };
 
     const TARGET: ObjectId = ObjectId::new(0);
@@ -2126,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamped_ccu_flush_without_an_address_is_rejected() {
+    fn addressed_ccu_flush_without_an_address_is_rejected() {
         // A6xx CCU_FLUSH_COLOR_TS is a four-dword CP_EVENT_WRITE operation.
         // The old userspace emitter sent only this selector, which is framed
         // PM4 but illegal SQE input.
@@ -2180,7 +2242,7 @@ mod tests {
     fn addressed_ccu_clean_sequence_must_be_contiguous() {
         let pm4 = [
             type7(opcode::EVENT_WRITE, 4).unwrap(),
-            super::EVENT_CCU_FLUSH_COLOR_TS | super::CP_EVENT_WRITE_TIMESTAMP,
+            super::EVENT_CCU_FLUSH_COLOR_TS,
             0,
             0,
             1,
@@ -2282,6 +2344,33 @@ mod tests {
         .unwrap();
         assert_eq!(&words[2..4], &[0, 2]);
         assert_eq!(&words[4..6], &[32, 3]);
+    }
+
+    #[test]
+    fn memcpy_size_is_bounded_to_the_production_chunk() {
+        let mut addresses = std::vec::Vec::new();
+        assert!(
+            validate_type7(
+                CP_MEMCPY,
+                &[CP_MEMCPY_MAX_DWORDS, 0, 0, 0, 0],
+                0,
+                &mut addresses,
+            )
+            .is_ok()
+        );
+        assert_eq!(addresses.len(), 2);
+
+        addresses.clear();
+        assert_eq!(
+            validate_type7(
+                CP_MEMCPY,
+                &[CP_MEMCPY_MAX_DWORDS + 1, 0, 0, 0, 0],
+                0,
+                &mut addresses,
+            ),
+            Err("qcom-adreno-a618: PM4 opcode is not allowlisted")
+        );
+        assert!(addresses.is_empty());
     }
 
     #[test]
@@ -2818,8 +2907,9 @@ mod tests {
         // frame on CoachZ: quad upload, target clear, one sampled draw, and
         // CCU retirement. The trusted kernel ring appends the only general
         // cache-clean event. Atomic VS/FS program-layout bursts keep the
-        // validated userspace IB at 516 dwords.
-        assert_eq!(artifact.words.len(), 516);
+        // validated userspace IB at 533 dwords, including the indirect sampler
+        // and texture-descriptor state backing required by A618.
+        assert_eq!(artifact.words.len(), 533);
         assert!(accept_codegen(&artifact).is_ok());
     }
 
@@ -3035,7 +3125,7 @@ mod tests {
                 "pipeline case {index} rejected"
             );
             if index == 1 {
-                let sampler = Packets::new(&artifact.words)
+                let sampler_load = Packets::new(&artifact.words)
                     .filter_map(Result::ok)
                     .find(|packet| {
                         matches!(
@@ -3044,20 +3134,29 @@ mod tests {
                                 opcode: super::CP_LOAD_STATE6_FRAG,
                                 ..
                             }
-                        ) && packet.payload.len() == 7
-                            && packet.payload[0] == ((4 << 18) | (1 << 22))
+                        ) && packet.payload.len() == 3
+                            && packet.payload[0] == ((2 << 16) | (4 << 18) | (1 << 22))
                     })
                     .unwrap();
-                let begin = sampler.word_offset as usize;
-                let end = begin + 1 + sampler.payload.len();
+                let begin = sampler_load.word_offset as usize;
+                let end = begin + 1 + sampler_load.payload.len();
                 let duplicate_packet = artifact.words[begin..end].to_vec();
                 let mut hostile = artifact.clone();
                 hostile.words.splice(end..end, duplicate_packet);
+                let mut duplicate_fixup = hostile
+                    .fixups
+                    .iter()
+                    .find(|fixup| fixup.word_offset == sampler_load.word_offset + 2)
+                    .cloned()
+                    .unwrap();
                 for fixup in &mut hostile.fixups {
                     if fixup.word_offset as usize >= end {
-                        fixup.word_offset += 8;
+                        fixup.word_offset += 4;
                     }
                 }
+                duplicate_fixup.word_offset = u32::try_from(end + 2).unwrap();
+                hostile.fixups.push(duplicate_fixup);
+                hostile.fixups.sort_by_key(|fixup| fixup.word_offset);
                 assert!(accept_codegen(&hostile).is_err());
 
                 // The former emitter padded one four-dword ST6_SHADER sampler
@@ -3070,20 +3169,19 @@ mod tests {
                     (4 << 18) | (1 << 22),
                     0,
                     0,
-                    sampler.payload[3],
+                    0x92a,
                 ];
                 old_packet.extend_from_slice(&[0; 15]);
                 padded_sampler.words.splice(begin..end, old_packet);
+                padded_sampler
+                    .fixups
+                    .retain(|fixup| !(begin..end).contains(&(fixup.word_offset as usize)));
                 for fixup in &mut padded_sampler.fixups {
                     if fixup.word_offset as usize >= end {
-                        fixup.word_offset += 12;
+                        fixup.word_offset += 16;
                     }
                 }
                 assert!(accept_codegen(&padded_sampler).is_err());
-
-                let mut missing_mip_disable = artifact.clone();
-                missing_mip_disable.words[begin + 5] = 0;
-                assert!(accept_codegen(&missing_mip_disable).is_err());
 
                 let descriptor = Packets::new(&artifact.words)
                     .filter_map(Result::ok)
@@ -3091,27 +3189,31 @@ mod tests {
                         matches!(
                             packet.header,
                             Header::Type7 {
-                                opcode: super::CP_LOAD_STATE6_FRAG,
+                                opcode: super::CP_MEM_WRITE,
                                 ..
                             }
-                        ) && packet.payload.len() == 19
-                            && packet.payload[0] == ((1 << 14) | (4 << 18) | (1 << 22))
+                        ) && packet.payload.len() == 22
+                            && packet.payload[2] == 0x4c00_6880
                     })
                     .unwrap();
+                let mut missing_mip_disable = artifact.clone();
+                missing_mip_disable.words[descriptor.word_offset as usize + 20] = 0;
+                assert!(accept_codegen(&missing_mip_disable).is_err());
+
                 let mut bad_extent = artifact.clone();
-                bad_extent.words[descriptor.word_offset as usize + 5] += 1;
+                bad_extent.words[descriptor.word_offset as usize + 4] += 1;
                 assert!(accept_codegen(&bad_extent).is_err());
 
                 let mut bad_type = artifact.clone();
-                bad_type.words[descriptor.word_offset as usize + 6] |= 2 << 29;
+                bad_type.words[descriptor.word_offset as usize + 5] |= 2 << 29;
                 assert!(accept_codegen(&bad_type).is_err());
 
                 let mut bad_pitch_align = artifact.clone();
-                bad_pitch_align.words[descriptor.word_offset as usize + 6] |= 1;
+                bad_pitch_align.words[descriptor.word_offset as usize + 5] |= 1;
                 assert!(accept_codegen(&bad_pitch_align).is_err());
 
                 let mut bad_depth = artifact.clone();
-                bad_depth.words[descriptor.word_offset as usize + 9] = 2 << 17;
+                bad_depth.words[descriptor.word_offset as usize + 8] = 2 << 17;
                 assert!(accept_codegen(&bad_depth).is_err());
 
                 let mut bad_range = artifact.clone();

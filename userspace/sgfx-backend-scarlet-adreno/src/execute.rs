@@ -376,7 +376,7 @@ impl ContextResources {
             .iter()
             .zip(placements.iter())
             .find_map(|(generated, (_, offset, _))| {
-                (generated.kind == codegen::GeneratedObjectKind::CcuTimestamp)
+                (generated.kind == codegen::GeneratedObjectKind::CcuSequence)
                     .then_some((generated.id, *offset))
             })
             .map(|(id, offset)| {

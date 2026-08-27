@@ -188,7 +188,7 @@ impl RawBuffer {
 
         // SAFETY: the kernel returned a readable mapping of `mapping_len`
         // bytes, the checked range lies within the backing allocation, and
-        // generated timestamp objects are at least four-byte aligned.
+        // generated CCU sequence objects are at least four-byte aligned.
         let value = unsafe {
             u32::from_le(ptr::read_volatile(
                 (address as *const u8).add(source_offset).cast::<u32>(),

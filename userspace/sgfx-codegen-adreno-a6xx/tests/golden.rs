@@ -124,47 +124,44 @@ fn assert_ccu_clean_before_every_color_invalidate(
     artifact: &sgfx_codegen_adreno_a6xx::RelocatablePm4,
 ) {
     const EVENT_WRITE_4: u32 = 0x7046_0004;
-    const CCU_CLEAN_COLOR_TIMESTAMP: u32 = 0x4000_001d;
-    const CCU_CLEAN_DEPTH_TIMESTAMP: u32 = 0x4000_001c;
+    const CCU_CLEAN_COLOR: u32 = 0x1d;
+    const CCU_CLEAN_DEPTH: u32 = 0x1c;
     const CCU_INVALIDATE_COLOR: u32 = 0x19;
     const CCU_INVALIDATE_DEPTH: u32 = 0x18;
 
-    let timestamp_objects = artifact
+    let sequence_objects = artifact
         .generated_objects
         .iter()
-        .filter(|object| object.kind == GeneratedObjectKind::CcuTimestamp)
+        .filter(|object| object.kind == GeneratedObjectKind::CcuSequence)
         .collect::<Vec<_>>();
-    assert_eq!(timestamp_objects.len(), 1);
-    let timestamp = timestamp_objects[0];
-    assert_eq!(timestamp.alignment, 64);
-    assert_eq!(timestamp.bytes, [0; 4]);
-    assert_eq!(timestamp.access, Access::WRITE);
+    assert_eq!(sequence_objects.len(), 1);
+    let sequence = sequence_objects[0];
+    assert_eq!(sequence.alignment, 64);
+    assert_eq!(sequence.bytes, [0; 4]);
+    assert_eq!(sequence.access, Access::WRITE);
 
-    let timestamp_positions = artifact
+    let sequence_positions = artifact
         .words
         .windows(5)
         .enumerate()
         .filter_map(|(position, words)| {
             (words[0] == EVENT_WRITE_4
-                && matches!(
-                    words[1],
-                    CCU_CLEAN_COLOR_TIMESTAMP | CCU_CLEAN_DEPTH_TIMESTAMP
-                )
+                && matches!(words[1], CCU_CLEAN_COLOR | CCU_CLEAN_DEPTH)
                 && words[2] == 0
                 && words[3] == 0
                 && words[4] != 0)
                 .then_some(position)
         })
         .collect::<Vec<_>>();
-    assert!(!timestamp_positions.is_empty());
+    assert!(!sequence_positions.is_empty());
 
-    for position in timestamp_positions {
+    for position in sequence_positions {
         let fixup = artifact
             .fixups
             .iter()
             .find(|fixup| fixup.word_offset as usize == position + 2)
-            .expect("CCU clean timestamp address has a relocation");
-        assert_eq!(fixup.object, ObjectRef::Generated(timestamp.id));
+            .expect("addressed CCU clean has a sequence relocation");
+        assert_eq!(fixup.object, ObjectRef::Generated(sequence.id));
         assert_eq!(fixup.required_size, 4);
         assert_eq!(fixup.access, Access::WRITE);
     }
@@ -183,20 +180,17 @@ fn assert_ccu_clean_before_every_color_invalidate(
             continue;
         }
         if packet.payload == [CCU_INVALIDATE_COLOR] {
-            let immediately_clean = packets.get(index.wrapping_sub(1)).is_some_and(|previous| {
-                previous.payload.first() == Some(&CCU_CLEAN_COLOR_TIMESTAMP)
-            });
+            let immediately_clean = packets
+                .get(index.wrapping_sub(1))
+                .is_some_and(|previous| previous.payload.first() == Some(&CCU_CLEAN_COLOR));
             let clean_before_depth = index >= 2
-                && packets[index - 2].payload.first() == Some(&CCU_CLEAN_COLOR_TIMESTAMP)
-                && packets[index - 1].payload.first() == Some(&CCU_CLEAN_DEPTH_TIMESTAMP);
+                && packets[index - 2].payload.first() == Some(&CCU_CLEAN_COLOR)
+                && packets[index - 1].payload.first() == Some(&CCU_CLEAN_DEPTH);
             assert!(immediately_clean || clean_before_depth);
         } else if packet.payload == [CCU_INVALIDATE_DEPTH] {
             assert!(index >= 2);
             assert_eq!(packets[index - 2].payload.len(), 4);
-            assert_eq!(
-                packets[index - 2].payload.first(),
-                Some(&CCU_CLEAN_DEPTH_TIMESTAMP)
-            );
+            assert_eq!(packets[index - 2].payload.first(), Some(&CCU_CLEAN_DEPTH));
             assert_eq!(packets[index - 1].payload, [CCU_INVALIDATE_COLOR]);
         }
     }
@@ -232,7 +226,7 @@ fn clear_is_a_golden_address_free_stream() {
         artifact.words.as_slice(),
         &[
             0x7046_0004,
-            0x4000_001d,
+            0x1d,
             0,
             0,
             1,
@@ -279,12 +273,12 @@ fn clear_is_a_golden_address_free_stream() {
             3,
             0x7026_8000,
             0x7046_0004,
-            0x4000_001d,
+            0x1d,
             0,
             0,
             2,
             0x7046_0004,
-            0x4000_001c,
+            0x1c,
             0,
             0,
             3,
@@ -298,7 +292,7 @@ fn clear_is_a_golden_address_free_stream() {
 }
 
 #[test]
-fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
+fn copy_is_a_golden_stream_with_ccu_sequence_and_two_surfaces() {
     let resources = resources();
     let operations = [Operation::CopyTextureToTexture {
         source: SOURCE,
@@ -325,7 +319,7 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
         artifact.words.as_slice(),
         &[
             0x7046_0004,
-            0x4000_001d,
+            0x1d,
             0,
             0,
             1,
@@ -381,12 +375,12 @@ fn copy_is_a_golden_stream_with_ccu_timestamp_and_two_surfaces() {
             3,
             0x7026_8000,
             0x7046_0004,
-            0x4000_001d,
+            0x1d,
             0,
             0,
             2,
             0x7046_0004,
-            0x4000_001c,
+            0x1c,
             0,
             0,
             3,
@@ -611,6 +605,66 @@ fn aligned_upload_becomes_generated_object_and_symbolic_memcpy() {
 }
 
 #[test]
+fn large_upload_is_split_into_bounded_ordered_memcpy_chunks() {
+    const UPLOAD_DWORDS: usize = 252;
+    let resources = [ResourceMeta {
+        id: VERTICES,
+        size: (UPLOAD_DWORDS * 4) as u64,
+        kind: ResourceKind::Buffer {
+            usage: BufferUsage::COPY_DST,
+        },
+    }];
+    let data = [0x5a; UPLOAD_DWORDS * 4];
+    let operations = [Operation::WriteBuffer {
+        destination: VERTICES,
+        offset: 0,
+        data: &data,
+    }];
+    let artifact = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 4096),
+        resources: &resources,
+        pipelines: &[],
+        operations: &operations,
+    })
+    .unwrap();
+
+    assert_well_formed(&artifact);
+    assert_eq!(artifact.generated_objects.len(), 1);
+    assert_eq!(artifact.fixups.len(), 4);
+    assert_eq!(artifact.accesses.len(), 2);
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let memcpy_indices: Vec<_> = packets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, packet)| {
+            matches!(packet.header, Header::Type7 { opcode: 0x75, .. }).then_some(index)
+        })
+        .collect();
+    assert_eq!(memcpy_indices.len(), 2);
+    assert_eq!(
+        memcpy_indices
+            .iter()
+            .map(|index| packets[*index].payload[0])
+            .collect::<Vec<_>>(),
+        [128, 124],
+    );
+    for index in memcpy_indices {
+        assert!(matches!(
+            packets.get(index + 1),
+            Some(packet)
+                if packet.header
+                    == (Header::Type7 {
+                        opcode: opcode::WAIT_MEM_WRITES,
+                        count: 0,
+                    })
+                    && packet.payload.is_empty()
+        ));
+    }
+}
+
+#[test]
 fn logical_sample_uploads_are_converted_to_physical_bgra_rows() {
     for (logical_format, source, expected) in [
         (
@@ -826,35 +880,61 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
             let packets = Packets::new(&artifact.words)
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
-            let texture_state = packets
+            let state_object = artifact
+                .generated_objects
+                .iter()
+                .find(|object| object.kind == GeneratedObjectKind::TextureState)
+                .expect("one generated FS texture-state object");
+            assert_eq!(state_object.alignment, 64);
+            assert_eq!(state_object.bytes, [0; 80]);
+            assert_eq!(state_object.access, Access::READ | Access::WRITE);
+
+            let state_write = packets
                 .iter()
                 .find(|packet| {
-                    matches!(packet.header, Header::Type7 { opcode: 0x34, .. })
-                        && packet.payload.len() == 19
-                        && (packet.payload[0] >> 14) & 0x3 == 1
-                        && (packet.payload[0] >> 18) & 0xf == 4
-                        && (packet.payload[0] >> 22) & 0x3ff == 1
+                    matches!(packet.header, Header::Type7 { opcode: 0x3d, .. })
+                        && packet.payload.len() == 22
+                        && packet.payload[2] == 0x4c00_6880
                 })
-                .expect("one 16-dword FS texture descriptor");
-            assert_eq!(texture_state.payload.len(), 3 + 16);
-            let sampler_state = packets
-                .iter()
-                .find(|packet| {
-                    matches!(packet.header, Header::Type7 { opcode: 0x34, .. })
-                        && packet.payload.len() == 7
-                        && (packet.payload[0] >> 14) & 0x3 == 0
-                        && (packet.payload[0] >> 18) & 0xf == 4
-                        && (packet.payload[0] >> 22) & 0x3ff == 1
-                })
-                .expect("one four-dword FS sampler descriptor");
+                .expect("one CP_MEM_WRITE texture-state materialization");
             let expected_sampler = if stride == 24 {
                 [0x92a, 0x40, 0x20, 0]
             } else {
                 [0x920, 0x40, 0, 0]
             };
-            assert_eq!(&sampler_state.payload[3..], &expected_sampler);
+            assert_eq!(&state_write.payload[18..], &expected_sampler);
+            assert!(artifact.fixups.iter().any(|fixup| {
+                fixup.word_offset == state_write.word_offset + 1
+                    && fixup.object == ObjectRef::Generated(state_object.id)
+                    && fixup.required_size == 80
+                    && fixup.access == Access::WRITE
+            }));
+
+            for (state_type, offset, size) in [(0, 64, 16), (1, 0, 64)] {
+                let load = packets
+                    .iter()
+                    .find(|packet| {
+                        matches!(packet.header, Header::Type7 { opcode: 0x34, .. })
+                            && packet.payload.len() == 3
+                            && (packet.payload[0] >> 14) & 0x3 == state_type
+                            && (packet.payload[0] >> 16) & 0x3 == 2
+                            && (packet.payload[0] >> 18) & 0xf == 4
+                            && (packet.payload[0] >> 22) & 0x3ff == 1
+                    })
+                    .expect("one indirect FS texture-state load");
+                assert!(artifact.fixups.iter().any(|fixup| {
+                    fixup.word_offset == load.word_offset + 2
+                        && fixup.object == ObjectRef::Generated(state_object.id)
+                        && fixup.object_offset == offset
+                        && fixup.required_size == size
+                        && fixup.access == Access::READ
+                }));
+            }
         }
-        assert_eq!(artifact.generated_objects.len(), 1);
+        assert_eq!(
+            artifact.generated_objects.len(),
+            if textured { 2 } else { 1 }
+        );
         assert_eq!(
             artifact
                 .fixups
@@ -864,6 +944,135 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
             4
         );
     }
+}
+
+#[test]
+fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
+    const TARGET_SIZE: u64 = 2_160 * 1_440 * 4;
+    const TEXTURE_SIZE: u64 = 256 * 256 * 4;
+    const QUAD_BYTES: u64 = 6 * 24;
+
+    let resources = [
+        ResourceMeta {
+            id: TARGET,
+            size: TARGET_SIZE,
+            kind: ResourceKind::Image(ImageMeta {
+                format: TextureFormat::Bgra8Unorm,
+                storage_format: TextureFormat::Bgra8Unorm,
+                extent: Extent2D::new(2_160, 1_440).unwrap(),
+                usage: TextureUsage::RENDER_ATTACHMENT,
+                modifier: ImageModifier::Linear,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    stride: 2_160 * 4,
+                    size: TARGET_SIZE,
+                }],
+            }),
+        },
+        ResourceMeta {
+            id: SOURCE,
+            size: TEXTURE_SIZE,
+            kind: ResourceKind::Image(ImageMeta {
+                format: TextureFormat::Bgra8Unorm,
+                storage_format: TextureFormat::Bgra8Unorm,
+                extent: Extent2D::new(256, 256).unwrap(),
+                usage: TextureUsage::SAMPLED | TextureUsage::COPY_DST,
+                modifier: ImageModifier::Linear,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    stride: 256 * 4,
+                    size: TEXTURE_SIZE,
+                }],
+            }),
+        },
+        ResourceMeta {
+            id: VERTICES,
+            size: QUAD_BYTES * 4,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+            },
+        },
+    ];
+    let layout = VertexBufferLayout::new(
+        24,
+        vec![
+            VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+            VertexAttribute::new(1, VertexFormat::Float32x2, 16),
+        ],
+    )
+    .unwrap();
+    let pipelines = [
+        FragmentProgram::Solid,
+        FragmentProgram::Texture(TextureSampleMode::Rgba),
+        FragmentProgram::Texture(TextureSampleMode::RgbIgnoreAlpha),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, fragment)| PipelineMeta {
+        id: PipelineId::new(index as u32),
+        descriptor: RenderPipelineDesc::new(
+            TextureFormat::Bgra8Unorm,
+            PrimitiveTopology::TriangleList,
+            layout.clone(),
+            fragment,
+            BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+            RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        )
+        .unwrap(),
+    })
+    .collect::<Vec<_>>();
+    let vertices = vec![0; (QUAD_BYTES * 4) as usize];
+    let mut operations = vec![
+        Operation::WriteBuffer {
+            destination: VERTICES,
+            offset: 0,
+            data: &vertices,
+        },
+        Operation::BeginRenderPass(RenderPass {
+            target: TARGET,
+            area: rect(0, 0, 2_160, 1_440),
+            load: LoadOp::Clear(Color::rgba(0.08, 0.1, 0.14, 1.0).unwrap()),
+            store: StoreOp::Store,
+            depth: None,
+        }),
+    ];
+    for (index, pipeline) in [0_u32, 1, 0, 2].into_iter().enumerate() {
+        operations.push(Operation::SetVertexBuffer {
+            buffer: VERTICES,
+            offset: index as u64 * QUAD_BYTES,
+        });
+        operations.push(Operation::SetPipeline(PipelineId::new(pipeline)));
+        if pipeline != 0 {
+            operations.push(Operation::SetTexture(SOURCE));
+            operations.push(Operation::SetSampler(SamplerDesc::new(
+                FilterMode::Linear,
+                FilterMode::Linear,
+                AddressMode::ClampToEdge,
+                AddressMode::ClampToEdge,
+            )));
+        }
+        operations.push(Operation::SetUniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+        )));
+        operations.push(Operation::SetScissor(None));
+        operations.push(Operation::Draw {
+            vertex_count: 6,
+            first_vertex: 0,
+        });
+    }
+    operations.push(Operation::EndRenderPass);
+
+    let artifact = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 4096),
+        resources: &resources,
+        pipelines: &pipelines,
+        operations: &operations,
+    })
+    .unwrap();
+    assert_well_formed(&artifact);
+    assert_ccu_clean_before_every_color_invalidate(&artifact);
+    assert_eq!(artifact.words.len(), 1_838);
 }
 
 #[test]
@@ -1027,7 +1236,7 @@ fn coachz_cube_first_frame_uses_upstream_shader_program_bursts() {
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.words.len(), 487);
+    assert_eq!(artifact.words.len(), 496);
     assert_eq!(artifact.generated_objects.len(), 2);
     let packets = Packets::new(&artifact.words)
         .collect::<Result<Vec<_>, _>>()

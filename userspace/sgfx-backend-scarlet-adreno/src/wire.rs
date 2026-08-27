@@ -265,6 +265,66 @@ mod tests {
     }
 
     #[test]
+    fn production_256_square_texture_upload_fits_the_submit_transport() {
+        const WIDTH: u32 = 256;
+        const HEIGHT: u32 = 256;
+        const STRIDE: u32 = WIDTH * 4;
+        const SIZE: usize = STRIDE as usize * HEIGHT as usize;
+
+        let texture = ObjectId::new(0);
+        let resources = [ResourceMeta {
+            id: texture,
+            size: SIZE as u64,
+            kind: ResourceKind::Image(ImageMeta {
+                format: TextureFormat::Bgra8Unorm,
+                storage_format: TextureFormat::Bgra8Unorm,
+                extent: Extent2D::new(WIDTH, HEIGHT).unwrap(),
+                usage: TextureUsage::COPY_DST | TextureUsage::SAMPLED,
+                modifier: ImageModifier::Linear,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    stride: STRIDE,
+                    size: SIZE as u64,
+                }],
+            }),
+        }];
+        let pixels = vec![0x5a; SIZE];
+        let operations = [Operation::WriteTexture {
+            destination: texture,
+            area: PixelRect::new(0, 0, WIDTH, HEIGHT).unwrap(),
+            bytes_per_row: STRIDE,
+            data: &pixels,
+        }];
+        let compiled = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &[],
+            operations: &operations,
+        })
+        .unwrap();
+        let mut bindings = vec![BoundObject {
+            object: ObjectRef::External(texture),
+            attachment_token: 10,
+            allocation_offset: 0,
+            size: SIZE as u64,
+        }];
+        for generated in &compiled.generated_objects {
+            bindings.push(BoundObject {
+                object: ObjectRef::Generated(generated.id),
+                attachment_token: 100 + u64::from(generated.id.raw()),
+                allocation_offset: 0,
+                size: generated.bytes.len() as u64,
+            });
+        }
+
+        let encoded = encode(&compiled, &bindings).expect("production texture upload wire");
+        assert_eq!(compiled.fixups.len(), 1_024);
+        assert_eq!(compiled.accesses.len(), 257);
+        assert_eq!(encoded.len(), 55_392);
+        assert!(encoded.len() <= adreno_a6xx_submit_wire::MAX_SUBMIT_SIZE);
+    }
+
+    #[test]
     fn production_wire_encodes_textured_draw_shader_and_descriptor_sources() {
         let target = ObjectId::new(0);
         let texture = ObjectId::new(1);
@@ -408,17 +468,17 @@ mod tests {
             relocation.source,
             adreno_a6xx_submit_wire::RelocationSource::Attachment(_)
         ) && relocation.required_size == 1024));
-        let ccu_timestamp = compiled
+        let ccu_sequence = compiled
             .generated_objects
             .iter()
-            .find(|object| object.kind == GeneratedObjectKind::CcuTimestamp)
-            .expect("one compiler-owned CCU timestamp");
+            .find(|object| object.kind == GeneratedObjectKind::CcuSequence)
+            .expect("one compiler-owned CCU sequence word");
         assert!(relocations.iter().any(|relocation| {
             matches!(
                 relocation.source,
                 adreno_a6xx_submit_wire::RelocationSource::Attachment(index)
                     if decoded.resource(index as usize).is_some_and(|resource| {
-                        resource.attachment_token == 100 + u64::from(ccu_timestamp.id.raw())
+                        resource.attachment_token == 100 + u64::from(ccu_sequence.id.raw())
                     })
             ) && relocation.required_size == 4
                 && relocation.access == adreno_a6xx_submit_wire::ACCESS_WRITE

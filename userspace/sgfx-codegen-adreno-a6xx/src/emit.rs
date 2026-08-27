@@ -15,6 +15,12 @@ use crate::model::{
 };
 
 const CP_MEMCPY: u8 = 0x75;
+const CP_MEM_WRITE: u8 = 0x3d;
+// A single 252-dword transfer has stalled the CoachZ A618 command parser. Keep
+// copies well below that observed failure size, while making a 256x256 BGRA
+// upload fit the 64 KiB submit wire. The kernel validator enforces the same
+// limit and a memory-write barrier orders every chunk.
+const CP_MEMCPY_MAX_DWORDS: u32 = 128;
 const CP_DRAW_INDX_OFFSET: u8 = 0x38;
 const CP_LOAD_STATE6_GEOM: u8 = 0x32;
 const CP_LOAD_STATE6_FRAG: u8 = 0x34;
@@ -28,7 +34,6 @@ const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_FLUSH_DEPTH_TS: u32 = 0x1c;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
-const CP_EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
 // Mesa fd6_format_table maps PIPE_FORMAT_B8G8R8A8_UNORM to WXYZ (1).
@@ -165,6 +170,10 @@ const SP_PS_MRT_CNTL: u32 = 0xa98d;
 const SP_PS_OUTPUT_REG: u32 = 0xa98e;
 const SP_PS_MRT_REG: u32 = 0xa996;
 const SP_PS_INITIAL_TEX_LOAD_CNTL: u32 = 0xa99e;
+const SP_PS_INITIAL_TEX_INDEX_CMD: u32 = 0xa9a3;
+const SP_PS_TSIZE: u32 = 0xa9a7;
+const SP_PS_SAMPLER_BASE: u32 = 0xa9e0;
+const SP_PS_TEXMEMOBJ_BASE: u32 = 0xa9e4;
 const SP_PS_CONFIG: u32 = 0xab04;
 const SP_PS_INSTR_SIZE: u32 = 0xab05;
 const SP_MODE_CNTL: u32 = 0xab00;
@@ -215,7 +224,7 @@ pub(crate) struct Emitter {
     fixups: Vec<SymbolicAddress>,
     accesses: Vec<ResourceAccess>,
     generated_objects: Vec<GeneratedObject>,
-    ccu_timestamp: Option<GeneratedObjectId>,
+    ccu_sequence: Option<GeneratedObjectId>,
     event_sequence: u32,
     max_words: usize,
 }
@@ -227,7 +236,7 @@ impl Emitter {
             fixups: Vec::new(),
             accesses: Vec::new(),
             generated_objects: Vec::new(),
-            ccu_timestamp: None,
+            ccu_sequence: None,
             event_sequence: 0,
             max_words: max_words as usize,
         }
@@ -285,21 +294,36 @@ impl Emitter {
         if matches!(object, ObjectRef::CanonicalShader(_)) {
             return Ok(());
         }
-        if let Some(existing) = self
-            .accesses
-            .iter_mut()
-            .find(|entry| entry.object == object && entry.offset == offset && entry.size == size)
-        {
-            existing.access = existing.access | access;
-            return Ok(());
+        let mut merged_offset = offset;
+        let mut merged_end = offset.checked_add(size).ok_or(CompileError::Overflow)?;
+        let mut index = 0;
+        while index < self.accesses.len() {
+            let existing = self.accesses[index];
+            let existing_end = existing
+                .offset
+                .checked_add(existing.size)
+                .ok_or(CompileError::Overflow)?;
+            if existing.object == object
+                && existing.access == access
+                && existing.offset <= merged_end
+                && merged_offset <= existing_end
+            {
+                merged_offset = merged_offset.min(existing.offset);
+                merged_end = merged_end.max(existing_end);
+                self.accesses.remove(index);
+            } else {
+                index += 1;
+            }
         }
         self.accesses
             .try_reserve(1)
             .map_err(|_| CompileError::OutOfMemory)?;
         self.accesses.push(ResourceAccess {
             object,
-            offset,
-            size,
+            offset: merged_offset,
+            size: merged_end
+                .checked_sub(merged_offset)
+                .ok_or(CompileError::Overflow)?,
             access,
         });
         Ok(())
@@ -378,12 +402,27 @@ impl Emitter {
         )
     }
 
-    fn texture_descriptor(&mut self, texture: Surface) -> Result<(), CompileError> {
+    fn load_indirect(
+        &mut self,
+        opcode: u8,
+        block: u32,
+        state_type: u32,
+        units: u32,
+        object: ObjectRef,
+        object_offset: u64,
+        required_size: u64,
+    ) -> Result<(), CompileError> {
+        self.push_word(type7(opcode, 3).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.push_word((state_type << 14) | (2 << 16) | (block << 18) | (units << 22))?;
+        self.address_words(object, object_offset, required_size, Access::READ)
+    }
+
+    fn texture_descriptor_prefix(texture: Surface) -> Result<[u32; 4], CompileError> {
         // A6XX_TEX_MEMOBJ, single-level explicit-layout linear 2D BGRA8,
         // identity view swizzle.  Freedreno assigns explicit linear BGRA8 a
         // 64-byte minimum pitch alignment (PITCHALIGN encoding zero); a wider
         // incidental stride alignment must not change the descriptor.
-        let descriptor = [
+        Ok([
             0x4c00_6880,
             texture.width | (texture.height << 15),
             (texture.stride << 7) | (1 << 29),
@@ -395,10 +434,10 @@ impl Emitter {
                     >> 12,
             )
             .map_err(|_| CompileError::Overflow)?,
-        ];
-        self.push_word(type7(CP_LOAD_STATE6_FRAG, 19).map_err(|_| CompileError::InvalidPm4)?)?;
-        self.extend_words(&[(1 << 14) | (4 << 18) | (1 << 22), 0, 0])?;
-        self.extend_words(&descriptor)?;
+        ])
+    }
+
+    fn texture_descriptor_address(&mut self, texture: Surface) -> Result<(), CompileError> {
         let word_offset = u32::try_from(self.words.len()).map_err(|_| CompileError::Overflow)?;
         self.extend_words(&[0, 1 << 17])?; // BASE placeholder + DEPTH=1.
         self.fixups
@@ -417,8 +456,56 @@ impl Emitter {
             texture.plane_offset,
             texture.plane_size,
             Access::READ,
+        )
+    }
+
+    fn texture_state_backing(
+        &mut self,
+        texture: Surface,
+        sampler: [u32; 4],
+    ) -> Result<GeneratedObjectId, CompileError> {
+        // Sampler pre-dispatch dereferences the SP base registers even when
+        // CP_LOAD_STATE6 also receives direct state.  Materialize the exact
+        // Mesa layout (16 descriptor dwords followed by four sampler dwords)
+        // in a 64-byte aligned GPU-visible object.  The texture IOVA remains a
+        // kernel relocation inside CP_MEM_WRITE data; userspace never learns
+        // or forges the final GPU address.
+        let state = self.add_generated(
+            &[0; 80],
+            64,
+            Access::READ | Access::WRITE,
+            GeneratedObjectKind::TextureState,
         )?;
-        self.extend_words(&[0; 10])
+        let descriptor = Self::texture_descriptor_prefix(texture)?;
+        self.push_word(type7(CP_MEM_WRITE, 22).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.address_words(ObjectRef::Generated(state), 0, 80, Access::WRITE)?;
+        self.extend_words(&descriptor)?;
+        self.texture_descriptor_address(texture)?;
+        self.extend_words(&[0; 10])?;
+        self.extend_words(&sampler)?;
+        self.packet7(opcode::WAIT_MEM_WRITES, &[])?;
+        // The descriptor and sampler are consumed indirectly through the SP
+        // base registers below.  WAIT_MEM_WRITES orders the CP store itself,
+        // but it does not make an earlier cached state-block lookup observe
+        // the newly written backing object.  Invalidate that cache before the
+        // indirect CP_LOAD_STATE6 packets dereference it.
+        self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])?;
+        self.wait_for_idle()?;
+        self.address_register(
+            SP_PS_SAMPLER_BASE,
+            ObjectRef::Generated(state),
+            64,
+            16,
+            Access::READ,
+        )?;
+        self.address_register(
+            SP_PS_TEXMEMOBJ_BASE,
+            ObjectRef::Generated(state),
+            0,
+            64,
+            Access::READ,
+        )?;
+        Ok(state)
     }
 
     pub(crate) fn draw(&mut self, draw: DrawState) -> Result<(), CompileError> {
@@ -565,7 +652,6 @@ impl Emitter {
         self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms)?;
         self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
         if let Some(texture) = draw.texture {
-            self.texture_descriptor(texture)?;
             // ST6_SHADER sampler units are four dwords each. Texture
             // descriptors use sixteen dwords under ST6_CONSTANTS, but padding
             // a sampler to that size makes CP_LOAD_STATE6 consume an invalid
@@ -577,7 +663,25 @@ impl Emitter {
                 // clamp-to-edge, nearest min/mag, no mip chain
                 [0x920, 0x40, 0, 0]
             };
-            self.load_direct(CP_LOAD_STATE6_FRAG, 4, 0, 1, &sampler)?;
+            let state = self.texture_state_backing(texture, sampler)?;
+            self.load_indirect(
+                CP_LOAD_STATE6_FRAG,
+                4,
+                0,
+                1,
+                ObjectRef::Generated(state),
+                64,
+                16,
+            )?;
+            self.load_indirect(
+                CP_LOAD_STATE6_FRAG,
+                4,
+                1,
+                1,
+                ObjectRef::Generated(state),
+                0,
+                64,
+            )?;
         }
         self.wait_for_idle()?;
         self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, draw.vertex_count])?;
@@ -612,6 +716,16 @@ impl Emitter {
             SP_PS_INITIAL_TEX_LOAD_CNTL,
             &[&[fs.initial_tex_load_cntl], fs.initial_tex_load_cmd].concat(),
         )?;
+        if !fs.initial_tex_load_cmd.is_empty() {
+            // IR3 lowered the texture operation into sampler pre-dispatch.
+            // A6xx still needs the parallel sampler/texture index mapping and
+            // the number of active FS texture descriptors.  Both IDs are zero
+            // for the canonical single-texture SGFX programs.
+            self.packet4(SP_PS_INITIAL_TEX_INDEX_CMD, &[0])?;
+            self.packet4(SP_PS_TSIZE, &[1])?;
+        } else {
+            self.packet4(SP_PS_TSIZE, &[0])?;
+        }
         self.packet4(SP_REG_PROG_ID_0, &fs.sp_reg_prog_id)?;
         self.packet4(SP_PS_OUTPUT_CNTL, &[fs.sp_ps_output_cntl])?;
         self.packet4(SP_PS_OUTPUT_REG, fs.sp_ps_output_reg)?;
@@ -715,29 +829,33 @@ impl Emitter {
         self.extend_words(&[0; 4])
     }
 
-    fn timestamped_cache_event(&mut self, event: u32) -> Result<(), CompileError> {
-        let timestamp = match self.ccu_timestamp {
-            Some(timestamp) => timestamp,
+    fn addressed_cache_event(&mut self, event: u32) -> Result<(), CompileError> {
+        let sequence = match self.ccu_sequence {
+            Some(sequence) => sequence,
             None => {
-                let timestamp = self.add_generated(
+                let sequence = self.add_generated(
                     &[0; 4],
                     64,
                     Access::WRITE,
-                    GeneratedObjectKind::CcuTimestamp,
+                    GeneratedObjectKind::CcuSequence,
                 )?;
-                self.ccu_timestamp = Some(timestamp);
-                timestamp
+                self.ccu_sequence = Some(sequence);
+                sequence
             }
         };
         self.event_sequence = self.event_sequence.wrapping_add(1).max(1);
         self.push_word(type7(opcode::EVENT_WRITE, 4).map_err(|_| CompileError::InvalidPm4)?)?;
-        self.push_word(event | CP_EVENT_WRITE_TIMESTAMP)?;
-        self.address_words(ObjectRef::Generated(timestamp), 0, 4, Access::WRITE)?;
+        // A6xx writes the packet's last dword to memory after this event
+        // completes. Bit 30 instead selects a hardware timestamp and is only
+        // appropriate for trace timestamps; Freedreno leaves it clear for
+        // addressed CCU clean/flush sequencing.
+        self.push_word(event)?;
+        self.address_words(ObjectRef::Generated(sequence), 0, 4, Access::WRITE)?;
         self.push_word(self.event_sequence)
     }
 
     fn clean_color_cache(&mut self) -> Result<(), CompileError> {
-        self.timestamped_cache_event(EVENT_CCU_FLUSH_COLOR_TS)
+        self.addressed_cache_event(EVENT_CCU_FLUSH_COLOR_TS)
     }
 
     fn invalidate_submission_caches(&mut self) -> Result<(), CompileError> {
@@ -806,8 +924,8 @@ impl Emitter {
         // here and another for the kernel fence leaves the second event
         // permanently pending on CoachZ even though the IB and CCUs drained.
         // FD6_INVALIDATE_CCHE is an A7xx+ operation and does not belong here.
-        self.timestamped_cache_event(EVENT_CCU_FLUSH_COLOR_TS)?;
-        self.timestamped_cache_event(EVENT_CCU_FLUSH_DEPTH_TS)?;
+        self.addressed_cache_event(EVENT_CCU_FLUSH_COLOR_TS)?;
+        self.addressed_cache_event(EVENT_CCU_FLUSH_DEPTH_TS)?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_COLOR])?;
         self.packet7(opcode::EVENT_WRITE, &[EVENT_CCU_INVALIDATE_DEPTH])?;
         self.wait_for_idle()
@@ -946,26 +1064,47 @@ impl Emitter {
             return Err(CompileError::UnsupportedFeature);
         }
         let generated = self.add_generated(bytes, 64, Access::READ, GeneratedObjectKind::Upload)?;
-        let dwords = u32::try_from(bytes.len() / 4).map_err(|_| CompileError::Overflow)?;
-        self.push_word(type7(CP_MEMCPY, 5).map_err(|_| CompileError::InvalidPm4)?)?;
-        self.push_word(dwords)?;
-        self.address_words(
-            ObjectRef::Generated(generated),
-            0,
-            bytes.len() as u64,
-            Access::READ,
-        )?;
-        self.address_words(
-            ObjectRef::External(destination),
-            destination_offset,
-            destination_required_size,
-            Access::WRITE,
-        )?;
-        // CP memory writes execute asynchronously with respect to following
-        // graphics work.  The uploaded buffer may be consumed as vertex data
-        // later in this same submission, so make the copy visible before any
-        // such read.  WAIT_FOR_IDLE does not order CP_MEMCPY writes.
-        self.packet7(opcode::WAIT_MEM_WRITES, &[])
+        let upload_size = u64::try_from(bytes.len()).map_err(|_| CompileError::Overflow)?;
+        if upload_size > destination_required_size {
+            return Err(CompileError::OutOfBounds);
+        }
+        let total_dwords = u32::try_from(bytes.len() / 4).map_err(|_| CompileError::Overflow)?;
+        let mut copied_dwords = 0_u32;
+        while copied_dwords < total_dwords {
+            let chunk_dwords = (total_dwords - copied_dwords).min(CP_MEMCPY_MAX_DWORDS);
+            let chunk_offset = u64::from(copied_dwords)
+                .checked_mul(4)
+                .ok_or(CompileError::Overflow)?;
+            let chunk_size = u64::from(chunk_dwords)
+                .checked_mul(4)
+                .ok_or(CompileError::Overflow)?;
+            let chunk_destination = destination_offset
+                .checked_add(chunk_offset)
+                .ok_or(CompileError::Overflow)?;
+
+            self.push_word(type7(CP_MEMCPY, 5).map_err(|_| CompileError::InvalidPm4)?)?;
+            self.push_word(chunk_dwords)?;
+            self.address_words(
+                ObjectRef::Generated(generated),
+                chunk_offset,
+                chunk_size,
+                Access::READ,
+            )?;
+            self.address_words(
+                ObjectRef::External(destination),
+                chunk_destination,
+                chunk_size,
+                Access::WRITE,
+            )?;
+            // CP memory writes execute asynchronously with respect to both the
+            // next chunk and following graphics work. WAIT_FOR_IDLE does not
+            // order CP_MEMCPY writes.
+            self.packet7(opcode::WAIT_MEM_WRITES, &[])?;
+            copied_dwords = copied_dwords
+                .checked_add(chunk_dwords)
+                .ok_or(CompileError::Overflow)?;
+        }
+        Ok(())
     }
 
     fn add_generated(
@@ -1101,7 +1240,7 @@ mod tests {
             ],
             accesses: vec![],
             generated_objects: vec![],
-            ccu_timestamp: None,
+            ccu_sequence: None,
             event_sequence: 0,
             max_words: 3,
         };

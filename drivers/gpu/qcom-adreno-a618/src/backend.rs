@@ -60,6 +60,7 @@ const CP_INDIRECT_BUFFER: u8 = 0x3f;
 const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
 const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
+const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 const CP_EVENT_WRITE_IRQ: u32 = 1 << 31;
 const RBBM_INT_POLL_MASK: u32 = RBBM_INT_FATAL_MASK | RBBM_INT_CP_CACHE_FLUSH_TS;
 // Linux's A6xx hardware initialization uses the complete 49-bit UCHE address
@@ -84,7 +85,7 @@ fn completion_commands(fence_address: u64, sequence: u32) -> Result<[u32; 7], &'
     ])
 }
 
-fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 10], &'static str> {
+fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 12], &'static str> {
     let event_header = type7(opcode::EVENT_WRITE, 1)
         .map_err(|_| "qcom-adreno-a618: failed to encode kernel CCU invalidate")?;
     let indirect_header = type7(CP_INDIRECT_BUFFER, 3)
@@ -94,12 +95,17 @@ fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 10
     let wait_for_me_header = type7(opcode::WAIT_FOR_ME, 0)
         .map_err(|_| "qcom-adreno-a618: failed to encode kernel ME barrier")?;
 
-    // Linux's A6xx submit path unconditionally invalidates both CCUs before
-    // entering a userspace IB.  After the IB, serialize asynchronous CP memory
-    // writes and then make the parser wait for the micro-engine.  Mesa uses the
-    // same WAIT_MEM_WRITES -> WAIT_FOR_ME order before a following memory
-    // signal; without the front-end barrier, CACHE_FLUSH_TS can overtake the ME.
+    // Linux emits CACHE_INVALIDATE after a page-table switch and before the
+    // next userspace IB, then unconditionally invalidates both CCUs.  Scarlet's
+    // command mappings can reuse an IOVA after the previous process exits, so
+    // the UCHE invalidate is required even though the SMMU TLB was invalidated
+    // on the CPU side.  After the IB, serialize asynchronous CP memory writes
+    // and then make the parser wait for the micro-engine.  Mesa uses the same
+    // WAIT_MEM_WRITES -> WAIT_FOR_ME order before a following memory signal;
+    // without the front-end barrier, CACHE_FLUSH_TS can overtake the ME.
     Ok([
+        event_header,
+        EVENT_CACHE_INVALIDATE,
         event_header,
         EVENT_CCU_INVALIDATE_DEPTH,
         event_header,
@@ -1699,8 +1705,8 @@ mod tests {
 
     use super::{
         A618Core, CP_EVENT_WRITE_IRQ, CP_INDIRECT_BUFFER, EVENT_CACHE_FLUSH_TS,
-        EVENT_CCU_INVALIDATE_COLOR, EVENT_CCU_INVALIDATE_DEPTH, completion_commands,
-        submission_commands,
+        EVENT_CACHE_INVALIDATE, EVENT_CCU_INVALIDATE_COLOR, EVENT_CCU_INVALIDATE_DEPTH,
+        completion_commands, submission_commands,
     };
     use crate::registers::CP_SCRATCH_2;
 
@@ -1732,14 +1738,16 @@ mod tests {
     fn submission_commands_match_the_linux_a6xx_trusted_preamble() {
         let commands = submission_commands(0x1_2345_6000, 0x123).unwrap();
         assert_eq!(commands[0], type7(opcode::EVENT_WRITE, 1).unwrap());
-        assert_eq!(commands[1], EVENT_CCU_INVALIDATE_DEPTH);
+        assert_eq!(commands[1], EVENT_CACHE_INVALIDATE);
         assert_eq!(commands[2], type7(opcode::EVENT_WRITE, 1).unwrap());
-        assert_eq!(commands[3], EVENT_CCU_INVALIDATE_COLOR);
-        assert_eq!(commands[4], type7(CP_INDIRECT_BUFFER, 3).unwrap());
-        assert_eq!(commands[5], 0x2345_6000);
-        assert_eq!(commands[6], 1);
-        assert_eq!(commands[7], 0x123);
-        assert_eq!(commands[8], type7(opcode::WAIT_MEM_WRITES, 0).unwrap());
-        assert_eq!(commands[9], type7(opcode::WAIT_FOR_ME, 0).unwrap());
+        assert_eq!(commands[3], EVENT_CCU_INVALIDATE_DEPTH);
+        assert_eq!(commands[4], type7(opcode::EVENT_WRITE, 1).unwrap());
+        assert_eq!(commands[5], EVENT_CCU_INVALIDATE_COLOR);
+        assert_eq!(commands[6], type7(CP_INDIRECT_BUFFER, 3).unwrap());
+        assert_eq!(commands[7], 0x2345_6000);
+        assert_eq!(commands[8], 1);
+        assert_eq!(commands[9], 0x123);
+        assert_eq!(commands[10], type7(opcode::WAIT_MEM_WRITES, 0).unwrap());
+        assert_eq!(commands[11], type7(opcode::WAIT_FOR_ME, 0).unwrap());
     }
 }
