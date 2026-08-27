@@ -1543,7 +1543,11 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             },
         )?;
         let ring = DmaAllocation::new(&dma_context, RING_SIZE, bidirectional_flags())?;
-        let fence = DmaAllocation::new(&dma_context, PAGE_SIZE, bidirectional_flags())?;
+        // Linux keeps the A6xx completion word in an MSM_BO_WC memptr page.
+        // Mirror that CPU attribute so consecutive device writes cannot be
+        // hidden behind a stale WB direct-map cache line.
+        let fence =
+            DmaAllocation::new_cpu_noncacheable(&dma_context, PAGE_SIZE, bidirectional_flags())?;
         let backend_cookie = allocate_monotonic(
             &NEXT_BACKEND_COOKIE,
             "qcom-adreno-a618: backend cookie space exhausted",
