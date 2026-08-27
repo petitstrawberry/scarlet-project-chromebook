@@ -138,8 +138,6 @@ const SP_VS_OUTPUT_CNTL: u32 = 0xa802;
 const SP_VS_OUTPUT_REG: u32 = 0xa803;
 const SP_VS_VPC_DEST_REG: u32 = 0xa813;
 const SP_VS_PROGRAM_COUNTER_OFFSET: u32 = 0xa81b;
-const SP_VS_BASE: u32 = 0xa81c;
-const SP_VS_PVT_MEM_PARAM: u32 = 0xa81e;
 const SP_VS_CONFIG: u32 = 0xa823;
 const SP_VS_INSTR_SIZE: u32 = 0xa824;
 const SP_VS_PVT_MEM_STACK_OFFSET: u32 = 0xa825;
@@ -148,8 +146,6 @@ const SP_DS_CONFIG: u32 = 0xa863;
 const SP_GS_CONFIG: u32 = 0xa894;
 const SP_PS_CNTL_0: u32 = 0xa980;
 const SP_PS_PROGRAM_COUNTER_OFFSET: u32 = 0xa982;
-const SP_PS_BASE: u32 = 0xa983;
-const SP_PS_PVT_MEM_PARAM: u32 = 0xa985;
 const SP_BLEND_CNTL: u32 = 0xa989;
 const SP_SRGB_CNTL: u32 = 0xa98a;
 const SP_PS_OUTPUT_MASK: u32 = 0xa98b;
@@ -448,9 +444,7 @@ fn validate_type4(
             | PC_CNTL
             | PC_STEREO_RENDERING_CNTL
             | SP_SRGB_CNTL
-            | SP_VS_PROGRAM_COUNTER_OFFSET
             | SP_VS_PVT_MEM_STACK_OFFSET
-            | SP_PS_PROGRAM_COUNTER_OFFSET
             | SP_PS_PVT_MEM_STACK_OFFSET
             | SP_GFX_USIZE,
             1,
@@ -463,7 +457,12 @@ fn validate_type4(
         (RB_MODE_CNTL, 1) => exact(payload, &[0x10]),
         (SP_UPDATE_CNTL, 1) => exact(payload, &[0x0000_00ff]),
         (SP_HS_CONFIG | SP_DS_CONFIG | SP_GS_CONFIG, 1) => exact(payload, &[0]),
-        (SP_VS_PVT_MEM_PARAM | SP_PS_PVT_MEM_PARAM, 4) => exact(payload, &[0; 4]),
+        (SP_VS_PROGRAM_COUNTER_OFFSET, 7) if payload[0] == 0 && payload[3..] == [0; 4] => {
+            canonical_address_field(addresses, packet_word + 2, ShaderVariant::VsStride16Pos2)
+        }
+        (SP_PS_PROGRAM_COUNTER_OFFSET, 7) if payload[0] == 0 && payload[3..] == [0; 4] => {
+            canonical_address_field(addresses, packet_word + 2, ShaderVariant::FsSolid)
+        }
         (SP_LB_PARAM_LIMIT, 1) => exact(payload, &[7]),
         (GRAS_CL_CNTL, 1) => exact(payload, &[0x80]),
         (GRAS_CL_GUARDBAND_CLIP_ADJ, 1) if payload[0] & !(0x1ff | (0x1ff << 10)) == 0 => Ok(()),
@@ -557,12 +556,6 @@ fn validate_type4(
         (VPC_VARYING_LM_TRANSFER_CNTL_DISABLE, 4) => Ok(()),
         (VPC_VS_CLIP_CULL_CNTL | VPC_VS_CLIP_CULL_CNTL_V2, 1) => exact(payload, &[0x00ff_ff00]),
         (VPC_VS_SIV_CNTL | VPC_VS_SIV_CNTL_V2, 1) => exact(payload, &[0x0000_ffff]),
-        (SP_VS_BASE, 2) => {
-            canonical_address_field(addresses, packet_word + 1, ShaderVariant::VsStride16Pos2)
-        }
-        (SP_PS_BASE, 2) => {
-            canonical_address_field(addresses, packet_word + 1, ShaderVariant::FsSolid)
-        }
         _ => Err("qcom-adreno-a618: PM4 register write is not allowlisted"),
     }
 }
@@ -1099,6 +1092,42 @@ fn segment_reg<'a>(
     found
 }
 
+/// Find the upstream A6xx shader-program layout burst and return the packet
+/// offset plus the address field within it. FIRST_EXEC_OFFSET, OBJ_START,
+/// PVT_MEM_PARAM, PVT_MEM_ADDR, and PVT_MEM_SIZE must be programmed together;
+/// accepting the older split form exposes a partially updated SP layout.
+fn segment_shader_program_layout(
+    words: &[u32],
+    start: u32,
+    end: u32,
+    first_exec_register: u32,
+) -> Option<(u32, u32)> {
+    let mut found = None;
+    for packet in Packets::new(words).filter_map(Result::ok) {
+        if packet.word_offset < start || packet.word_offset >= end {
+            continue;
+        }
+        if !matches!(
+            packet.header,
+            Header::Type4 {
+                register,
+                count: 7,
+            } if register == first_exec_register
+        ) {
+            continue;
+        }
+        if packet.payload.len() != 7
+            || packet.payload[0] != 0
+            || packet.payload[3..] != [0; 4]
+            || found.is_some()
+        {
+            return None;
+        }
+        found = Some((packet.word_offset, packet.word_offset + 2));
+    }
+    found
+}
+
 fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: PipelineVariant) -> bool {
     let link = link_meta(variant);
     let fixed = pipeline_state_meta(variant);
@@ -1201,11 +1230,9 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
         && reg(SP_VS_CONFIG) == Some(&[vs.sp_vs_config])
         && reg(SP_PS_INSTR_SIZE) == Some(&[fs.sp_ps_instr_size])
         && reg(SP_PS_CONFIG) == Some(&[fs.sp_ps_config])
-        && reg(SP_VS_PROGRAM_COUNTER_OFFSET) == Some(&[0])
-        && reg(SP_VS_PVT_MEM_PARAM) == Some(&[0, 0, 0, 0])
+        && segment_shader_program_layout(words, start, end, SP_VS_PROGRAM_COUNTER_OFFSET).is_some()
         && reg(SP_VS_PVT_MEM_STACK_OFFSET) == Some(&[0])
-        && reg(SP_PS_PROGRAM_COUNTER_OFFSET) == Some(&[0])
-        && reg(SP_PS_PVT_MEM_PARAM) == Some(&[0, 0, 0, 0])
+        && segment_shader_program_layout(words, start, end, SP_PS_PROGRAM_COUNTER_OFFSET).is_some()
         && reg(SP_PS_PVT_MEM_STACK_OFFSET) == Some(&[0])
         && reg(SP_REG_PROG_ID_0) == Some(&fs.sp_reg_prog_id)
         && reg(SP_PS_OUTPUT_CNTL) == Some(&[fs.sp_ps_output_cntl])
@@ -1368,18 +1395,20 @@ fn validate_3d_sequences(
         }
         let link =
             link_meta(matched.ok_or("qcom-adreno-a618: incomplete canonical 3D pipeline state")?);
-        let (vs_packet, _) = segment_reg(words, start, end, SP_VS_BASE)
-            .ok_or("qcom-adreno-a618: vertex shader base is missing")?;
-        let (fs_packet, _) = segment_reg(words, start, end, SP_PS_BASE)
-            .ok_or("qcom-adreno-a618: fragment shader base is missing")?;
+        let (_, vs_address) =
+            segment_shader_program_layout(words, start, end, SP_VS_PROGRAM_COUNTER_OFFSET)
+                .ok_or("qcom-adreno-a618: vertex shader program layout is missing")?;
+        let (_, fs_address) =
+            segment_shader_program_layout(words, start, end, SP_PS_PROGRAM_COUNTER_OFFSET)
+                .ok_or("qcom-adreno-a618: fragment shader program layout is missing")?;
         set_address_source(
             addresses,
-            vs_packet + 1,
+            vs_address,
             AddressSource::CanonicalShader(link.vs),
         )?;
         set_address_source(
             addresses,
-            fs_packet + 1,
+            fs_address,
             AddressSource::CanonicalShader(link.fs),
         )?;
         let shader_preload_word = |wanted_opcode: u8, wanted_block: u32| {
@@ -2788,8 +2817,9 @@ mod tests {
         // This is the exact command shape reported by the first SWS cursor
         // frame on CoachZ: quad upload, target clear, one sampled draw, and
         // CCU retirement. The trusted kernel ring appends the only general
-        // cache-clean event, so the validated userspace IB is 520 dwords.
-        assert_eq!(artifact.words.len(), 520);
+        // cache-clean event. Atomic VS/FS program-layout bursts keep the
+        // validated userspace IB at 516 dwords.
+        assert_eq!(artifact.words.len(), 516);
         assert!(accept_codegen(&artifact).is_ok());
     }
 

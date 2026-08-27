@@ -933,3 +933,129 @@ fn vertex_draw_range_must_fit_the_bound_buffer() {
         Err(CompileError::OutOfBounds)
     );
 }
+
+#[test]
+fn coachz_cube_first_frame_uses_upstream_shader_program_bursts() {
+    const WIDTH: u32 = 2160;
+    const HEIGHT: u32 = 1440;
+    const STRIDE: u32 = WIDTH * 4;
+    const VERTEX_BYTES: usize = 36 * 28;
+
+    let resources = [
+        ResourceMeta {
+            id: TARGET,
+            size: u64::from(STRIDE) * u64::from(HEIGHT),
+            kind: ResourceKind::Image(ImageMeta {
+                format: TextureFormat::Bgra8Unorm,
+                storage_format: TextureFormat::Bgra8Unorm,
+                extent: Extent2D::new(WIDTH, HEIGHT).unwrap(),
+                usage: TextureUsage::RENDER_ATTACHMENT
+                    | TextureUsage::COPY_DST
+                    | TextureUsage::COPY_SRC,
+                modifier: ImageModifier::Linear,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    stride: STRIDE,
+                    size: u64::from(STRIDE) * u64::from(HEIGHT),
+                }],
+            }),
+        },
+        ResourceMeta {
+            id: VERTICES,
+            size: VERTEX_BYTES as u64,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+            },
+        },
+    ];
+    let descriptor = RenderPipelineDesc::new(
+        TextureFormat::Bgra8Unorm,
+        PrimitiveTopology::TriangleList,
+        VertexBufferLayout::new(
+            28,
+            vec![
+                VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                VertexAttribute::new(1, VertexFormat::Float32x3, 16),
+            ],
+        )
+        .unwrap(),
+        FragmentProgram::VertexColor,
+        BlendState::REPLACE,
+        RasterState::new(CullMode::Back, FrontFace::CounterClockwise),
+    )
+    .unwrap();
+    let pipelines = [PipelineMeta {
+        id: PIPELINE,
+        descriptor,
+    }];
+    let upload = [0_u8; VERTEX_BYTES];
+    let operations = [
+        Operation::WriteBuffer {
+            destination: VERTICES,
+            offset: 0,
+            data: &upload,
+        },
+        Operation::BeginRenderPass(RenderPass {
+            target: TARGET,
+            area: rect(0, 0, WIDTH, HEIGHT),
+            load: LoadOp::Clear(Color::rgba(0.45, 0.45, 0.45, 1.0).unwrap()),
+            store: StoreOp::Store,
+            depth: None,
+        }),
+        Operation::SetPipeline(PIPELINE),
+        Operation::SetVertexBuffer {
+            buffer: VERTICES,
+            offset: 0,
+        },
+        Operation::SetUniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+        )),
+        Operation::Draw {
+            vertex_count: 36,
+            first_vertex: 0,
+        },
+        Operation::EndRenderPass,
+    ];
+    let artifact = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 4096),
+        resources: &resources,
+        pipelines: &pipelines,
+        operations: &operations,
+    })
+    .unwrap();
+
+    assert_well_formed(&artifact);
+    assert_ccu_clean_before_every_color_invalidate(&artifact);
+    assert_eq!(artifact.words.len(), 487);
+    assert_eq!(artifact.generated_objects.len(), 2);
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (register, variant) in [
+        (0xa81b, ShaderVariant::VsStride28Pos4Color3),
+        (0xa982, ShaderVariant::FsVertexColor),
+    ] {
+        let layouts: Vec<_> = packets
+            .iter()
+            .filter(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type4 {
+                        register: actual,
+                        count: 7,
+                    } if actual == register
+                )
+            })
+            .collect();
+        assert_eq!(layouts.len(), 1);
+        let layout = layouts[0];
+        assert_eq!(layout.payload.len(), 7);
+        assert_eq!(layout.payload[0], 0);
+        assert_eq!(&layout.payload[3..], &[0; 4]);
+        assert!(artifact.fixups.iter().any(|fixup| {
+            fixup.word_offset == layout.word_offset + 2
+                && fixup.object == ObjectRef::CanonicalShader(variant)
+        }));
+    }
+}

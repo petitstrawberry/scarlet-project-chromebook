@@ -247,6 +247,8 @@ pub(crate) const CP_INT_FATAL_MASK: u32 = CP_INT_OPCODE_ERROR
     | CP_INT_ILLEGAL_INSTR_ERROR;
 pub(crate) const CP_PROTECT_STATUS: usize = 0x0824;
 pub(crate) const CP_SQE_INSTR_BASE: usize = 0x0830;
+pub(crate) const CP_SQE_STAT_ADDR: usize = 0x0908;
+pub(crate) const CP_SQE_STAT_DATA: usize = 0x0909;
 pub(crate) const CP_ADDR_MODE_CNTL: usize = 0x0842;
 pub(crate) const CP_SCRATCH_2: usize = 0x0885;
 pub(crate) const CP_ROQ_THRESHOLDS_1: usize = 0x08c1;

@@ -174,6 +174,36 @@ enum BootState {
     Lost,
 }
 
+#[derive(Clone, Copy, Default)]
+struct RingInterruptSnapshot {
+    rbbm: u32,
+    cp: u32,
+    cp_hw_fault: u32,
+    cp_protect_status: u32,
+    cp_opcode: u32,
+}
+
+impl RingInterruptSnapshot {
+    fn merge(&mut self, newer: Self) {
+        self.rbbm |= newer.rbbm;
+        self.cp |= newer.cp;
+        if newer.cp_hw_fault != 0 {
+            self.cp_hw_fault = newer.cp_hw_fault;
+        }
+        if newer.cp_protect_status != 0 {
+            self.cp_protect_status = newer.cp_protect_status;
+        }
+        if newer.cp_opcode != 0 {
+            self.cp_opcode = newer.cp_opcode;
+        }
+    }
+
+    fn is_fatal(self) -> bool {
+        let completion = self.rbbm & RBBM_INT_COMPLETION_MASK;
+        (self.rbbm & !completion) & RBBM_INT_FATAL_MASK != 0 || self.cp & CP_INT_FATAL_MASK != 0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RingFailureSnapshot {
     reason: &'static str,
@@ -190,6 +220,7 @@ struct RingFailureSnapshot {
     cp_interrupt: u32,
     cp_hw_fault: u32,
     cp_protect_status: u32,
+    cp_opcode: u32,
     ib1_base: u64,
     ib1_translation: Option<usize>,
     ib1_remaining: u32,
@@ -585,21 +616,46 @@ impl A618Core {
     ///
     /// Linux uses `CP_CACHE_FLUSH_TS` to retire fences from this same register;
     /// the status being non-zero is therefore not itself a device-loss signal.
-    fn consume_ring_interrupts(&self) -> Result<u32, u32> {
-        let interrupt = self.registers.read(RBBM_INT_0_STATUS);
-        let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
-        if interrupt != 0 {
-            self.registers.write(RBBM_INT_CLEAR_CMD, interrupt);
+    fn consume_ring_interrupts(&self) -> Result<RingInterruptSnapshot, RingInterruptSnapshot> {
+        let rbbm = self.registers.read(RBBM_INT_0_STATUS);
+        // CP_INTERRUPT_STATUS is no longer stable after the shared RBBM source
+        // is acknowledged. Capture its dependent diagnostics before that W1C;
+        // a second status read in the failure path reports a false zero.
+        let cp = self.registers.read(CP_INTERRUPT_STATUS);
+        let cp_hw_fault = if cp & CP_INT_HW_FAULT_ERROR != 0 {
+            self.registers.read(CP_HW_FAULT)
+        } else {
+            0
+        };
+        let cp_protect_status = if cp & CP_INT_REGISTER_PROTECTION_ERROR != 0 {
+            self.registers.read(CP_PROTECT_STATUS)
+        } else {
+            0
+        };
+        let cp_opcode = if cp & CP_INT_OPCODE_ERROR != 0 {
+            self.registers.write(CP_SQE_STAT_ADDR, 1);
+            arch::io_wmb();
+            self.registers.read(CP_SQE_STAT_DATA)
+        } else {
+            0
+        };
+        if rbbm != 0 {
+            self.registers.write(RBBM_INT_CLEAR_CMD, rbbm);
             // Commit the W1C before a following submit can report another
             // completion or fault through the same shared status register.
             arch::io_wmb();
         }
-        let completion = interrupt & RBBM_INT_COMPLETION_MASK;
-        let fatal = (interrupt & !completion) & RBBM_INT_FATAL_MASK;
-        if fatal != 0 || cp_interrupt & CP_INT_FATAL_MASK != 0 {
-            Err(interrupt)
+        let snapshot = RingInterruptSnapshot {
+            rbbm,
+            cp,
+            cp_hw_fault,
+            cp_protect_status,
+            cp_opcode,
+        };
+        if snapshot.is_fatal() {
+            Err(snapshot)
         } else {
-            Ok(interrupt)
+            Ok(snapshot)
         }
     }
 
@@ -610,16 +666,15 @@ impl A618Core {
         sequence: u32,
         command_words: usize,
         target_wptr: u32,
-        interrupt: u32,
+        interrupts: RingInterruptSnapshot,
         fence: Option<(u32, u32)>,
     ) -> RingFailureSnapshot {
-        let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
         let ib1_base = self.registers.read64(CP_IB1_BASE);
         RingFailureSnapshot {
             reason,
             sequence,
             command_words,
-            interrupt,
+            interrupt: interrupts.rbbm,
             rptr: self.registers.read(CP_RB_RPTR),
             wptr: self.registers.read(CP_RB_WPTR),
             target_wptr,
@@ -627,17 +682,10 @@ impl A618Core {
             status1: self.registers.read(RBBM_STATUS1),
             status2: self.registers.read(RBBM_STATUS2),
             status3: self.registers.read(RBBM_STATUS3),
-            cp_interrupt,
-            cp_hw_fault: if cp_interrupt != 0 {
-                self.registers.read(CP_HW_FAULT)
-            } else {
-                0
-            },
-            cp_protect_status: if cp_interrupt != 0 {
-                self.registers.read(CP_PROTECT_STATUS)
-            } else {
-                0
-            },
+            cp_interrupt: interrupts.cp,
+            cp_hw_fault: interrupts.cp_hw_fault,
+            cp_protect_status: interrupts.cp_protect_status,
+            cp_opcode: interrupts.cp_opcode,
             ib1_base,
             ib1_translation: self
                 .dma_context
@@ -700,9 +748,10 @@ impl A618Core {
         }
         if snapshot.cp_interrupt != 0 {
             early_println!(
-                "[a618] cp fault={:#010x} protect={:#010x}",
+                "[a618] cp fault={:#010x} protect={:#010x} opcode={:#010x}",
                 snapshot.cp_hw_fault,
                 snapshot.cp_protect_status,
+                snapshot.cp_opcode,
             );
         }
         early_println!(
@@ -747,7 +796,7 @@ impl A618Core {
         sequence: u32,
         command_words: usize,
         target_wptr: u32,
-        interrupt: u32,
+        interrupts: RingInterruptSnapshot,
         fence: Option<(u32, u32)>,
     ) {
         let snapshot = self.capture_ring_failure(
@@ -756,7 +805,7 @@ impl A618Core {
             sequence,
             command_words,
             target_wptr,
-            interrupt,
+            interrupts,
             fence,
         );
         Self::print_ring_failure(snapshot);
@@ -771,7 +820,7 @@ impl A618Core {
         command_words: usize,
     ) -> Result<(), &'static str> {
         let start = time::current_time();
-        let mut observed_interrupts = 0;
+        let mut observed_interrupts = RingInterruptSnapshot::default();
         loop {
             if self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
@@ -779,9 +828,9 @@ impl A618Core {
                 return Ok(());
             }
             match self.consume_ring_interrupts() {
-                Ok(interrupt) => observed_interrupts |= interrupt,
-                Err(interrupt) => {
-                    observed_interrupts |= interrupt;
+                Ok(interrupts) => observed_interrupts.merge(interrupts),
+                Err(interrupts) => {
+                    observed_interrupts.merge(interrupts);
                     self.record_ring_failure(
                         hardware,
                         "fatal interrupt during ME initialization",
@@ -833,17 +882,22 @@ impl A618Core {
         ring.extend_from_slice(&completion);
         let target_wptr = self.write_ring(hardware, &ring)?;
         let start = time::current_time();
-        let mut observed_interrupts = 0;
+        let mut observed_interrupts = RingInterruptSnapshot::default();
         loop {
             hardware.fence.invalidate_from_device();
             let fence_value = hardware.fence.read_word_volatile(0).unwrap_or(0);
             match self.consume_ring_interrupts() {
-                Ok(interrupt) => observed_interrupts |= interrupt,
-                Err(interrupt) => {
-                    observed_interrupts |= interrupt;
-                    let cp_interrupt = self.registers.read(CP_INTERRUPT_STATUS);
-                    let reason = if cp_interrupt & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
+                Ok(interrupts) => observed_interrupts.merge(interrupts),
+                Err(interrupts) => {
+                    observed_interrupts.merge(interrupts);
+                    let reason = if observed_interrupts.cp & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
                         "CP illegal instruction during submit"
+                    } else if observed_interrupts.cp & CP_INT_OPCODE_ERROR != 0 {
+                        "CP opcode error during submit"
+                    } else if observed_interrupts.cp & CP_INT_REGISTER_PROTECTION_ERROR != 0 {
+                        "CP register protection fault during submit"
+                    } else if observed_interrupts.cp & CP_INT_HW_FAULT_ERROR != 0 {
+                        "CP hardware fault during submit"
                     } else {
                         "fatal interrupt during submit"
                     };
@@ -856,16 +910,24 @@ impl A618Core {
                         observed_interrupts,
                         Some((fence_value, sequence)),
                     );
-                    return Err(if cp_interrupt & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
-                        "qcom-adreno-a618: CP illegal instruction during synchronous submit"
-                    } else {
-                        "qcom-adreno-a618: GPU fault interrupt during synchronous submit"
-                    });
+                    return Err(
+                        if observed_interrupts.cp & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
+                            "qcom-adreno-a618: CP illegal instruction during synchronous submit"
+                        } else if observed_interrupts.cp & CP_INT_OPCODE_ERROR != 0 {
+                            "qcom-adreno-a618: CP opcode error during synchronous submit"
+                        } else if observed_interrupts.cp & CP_INT_REGISTER_PROTECTION_ERROR != 0 {
+                            "qcom-adreno-a618: CP register protection fault during synchronous submit"
+                        } else if observed_interrupts.cp & CP_INT_HW_FAULT_ERROR != 0 {
+                            "qcom-adreno-a618: CP hardware fault during synchronous submit"
+                        } else {
+                            "qcom-adreno-a618: GPU fault interrupt during synchronous submit"
+                        },
+                    );
                 }
             }
             // Drain any status raised alongside the memory fence before
             // returning so the next ring kick starts from a clean status word.
-            if observed_interrupts & RBBM_INT_CP_CACHE_FLUSH_TS != 0
+            if observed_interrupts.rbbm & RBBM_INT_CP_CACHE_FLUSH_TS != 0
                 && self.registers.read(CP_SCRATCH_2) == sequence
                 && self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
@@ -874,7 +936,7 @@ impl A618Core {
                     early_println!(
                         "[a618] submit complete seq={} irq={:#010x} scratch={:#010x} fence={:#010x}",
                         sequence,
-                        observed_interrupts,
+                        observed_interrupts.rbbm,
                         self.registers.read(CP_SCRATCH_2),
                         fence_value,
                     );

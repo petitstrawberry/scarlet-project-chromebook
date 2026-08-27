@@ -148,8 +148,6 @@ const SP_VS_OUTPUT_CNTL: u32 = 0xa802;
 const SP_VS_OUTPUT_REG: u32 = 0xa803;
 const SP_VS_VPC_DEST_REG: u32 = 0xa813;
 const SP_VS_PROGRAM_COUNTER_OFFSET: u32 = 0xa81b;
-const SP_VS_BASE: u32 = 0xa81c;
-const SP_VS_PVT_MEM_PARAM: u32 = 0xa81e;
 const SP_VS_PVT_MEM_STACK_OFFSET: u32 = 0xa825;
 const SP_VS_CONFIG: u32 = 0xa823;
 const SP_VS_INSTR_SIZE: u32 = 0xa824;
@@ -158,8 +156,6 @@ const SP_DS_CONFIG: u32 = 0xa863;
 const SP_GS_CONFIG: u32 = 0xa894;
 const SP_PS_CNTL_0: u32 = 0xa980;
 const SP_PS_PROGRAM_COUNTER_OFFSET: u32 = 0xa982;
-const SP_PS_BASE: u32 = 0xa983;
-const SP_PS_PVT_MEM_PARAM: u32 = 0xa985;
 const SP_PS_PVT_MEM_STACK_OFFSET: u32 = 0xa9a9;
 const SP_BLEND_CNTL: u32 = 0xa989;
 const SP_SRGB_CNTL: u32 = 0xa98a;
@@ -342,20 +338,6 @@ impl Emitter {
     ) -> Result<(), CompileError> {
         self.push_word(type4(register, 2).map_err(|_| CompileError::InvalidPm4)?)?;
         self.address_words(object, object_offset, required_size, access)
-    }
-
-    fn canonical_shader(
-        &mut self,
-        register: u32,
-        variant: adreno_a6xx_shader_pack::ShaderVariant,
-    ) -> Result<(), CompileError> {
-        self.address_register(
-            register,
-            ObjectRef::CanonicalShader(variant),
-            0,
-            SHADER_SIZE as u64,
-            Access::READ,
-        )
     }
 
     fn load_direct(
@@ -696,11 +678,7 @@ impl Emitter {
         vs: VertexMeta,
         variant: adreno_a6xx_shader_pack::ShaderVariant,
     ) -> Result<(), CompileError> {
-        self.packet4(SP_VS_PROGRAM_COUNTER_OFFSET, &[0])?;
-        self.canonical_shader(SP_VS_BASE, variant)?;
-        // PVT_MEM_PARAM, PVT_MEM_BASE_LO/HI, and PVT_MEM_SIZE are all zero:
-        // every generated shader has pvtmem_size=0 in pinned Mesa metadata.
-        self.packet4(SP_VS_PVT_MEM_PARAM, &[0; 4])?;
+        self.emit_shader_program_layout(SP_VS_PROGRAM_COUNTER_OFFSET, variant)?;
         self.packet4(SP_VS_PVT_MEM_STACK_OFFSET, &[0])?;
         self.preload_shader(CP_LOAD_STATE6_GEOM, 8, vs.sp_vs_instr_size, variant)
     }
@@ -710,11 +688,31 @@ impl Emitter {
         fs: FragmentMeta,
         variant: adreno_a6xx_shader_pack::ShaderVariant,
     ) -> Result<(), CompileError> {
-        self.packet4(SP_PS_PROGRAM_COUNTER_OFFSET, &[0])?;
-        self.canonical_shader(SP_PS_BASE, variant)?;
-        self.packet4(SP_PS_PVT_MEM_PARAM, &[0; 4])?;
+        self.emit_shader_program_layout(SP_PS_PROGRAM_COUNTER_OFFSET, variant)?;
         self.packet4(SP_PS_PVT_MEM_STACK_OFFSET, &[0])?;
         self.preload_shader(CP_LOAD_STATE6_FRAG, 12, fs.sp_ps_instr_size, variant)
+    }
+
+    fn emit_shader_program_layout(
+        &mut self,
+        first_exec_register: u32,
+        variant: adreno_a6xx_shader_pack::ShaderVariant,
+    ) -> Result<(), CompileError> {
+        // Freedreno programs FIRST_EXEC_OFFSET, OBJ_START, PVT_MEM_PARAM,
+        // PVT_MEM_ADDR, and PVT_MEM_SIZE as one seven-register type-4 burst.
+        // Keeping this atomic matters: splitting at OBJ_START exposes an
+        // incomplete private-memory layout before CP_LOAD_STATE6 preloads the
+        // shader. Every canonical shader has pvtmem_size=0, hence the four
+        // trailing zero words after the two-word executable address.
+        self.push_word(type4(first_exec_register, 7).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.push_word(0)?;
+        self.address_words(
+            ObjectRef::CanonicalShader(variant),
+            0,
+            SHADER_SIZE as u64,
+            Access::READ,
+        )?;
+        self.extend_words(&[0; 4])
     }
 
     fn timestamped_cache_event(&mut self, event: u32) -> Result<(), CompileError> {
