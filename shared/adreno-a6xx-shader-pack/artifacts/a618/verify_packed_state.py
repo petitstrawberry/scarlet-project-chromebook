@@ -25,6 +25,8 @@ assert p["mesa_metadata_sha256"] == hashlib.sha256(mb).hexdigest()
 mv = {x["name"]: x for x in m["variants"]}
 assert set(mv) == set(p["variants"])
 assert {x["name"] for x in m["links"]} == set(p["links"])
+TEX_PREFETCH_SAM = 1
+OPC_SAM = 643
 
 for name, v in mv.items():
     s = p["variants"][name]
@@ -68,6 +70,23 @@ for name, v in mv.items():
         assert (s["sp_ps_initial_tex_load_cntl"] & 7) == v["num_sampler_prefetch"]
         assert ((s["sp_ps_initial_tex_load_cntl"] >> 4) & 1) == int(v["prefetch_end_of_quad"])
         assert len(s["sp_ps_initial_tex_load_cmd"]) == v["num_sampler_prefetch"]
+        for packed, prefetch in zip(
+            s["sp_ps_initial_tex_load_cmd"], v["sampler_prefetch"], strict=True
+        ):
+            # Independently validate every A6xx command field, especially the
+            # command selector: TEX_PREFETCH_SAM is 1, while 4 is GATHER4B.
+            assert prefetch["tex_opc"] == OPC_SAM
+            expected = (
+                prefetch["src"]
+                | (prefetch["samp_id"] << 7)
+                | (prefetch["tex_id"] << 11)
+                | (prefetch["dst"] << 16)
+                | (prefetch["wrmask"] << 22)
+                | (prefetch["half"] << 26)
+                | (int(prefetch["bindless"]) << 28)
+                | (TEX_PREFETCH_SAM << 29)
+            )
+            assert packed == expected
         assert (s["rb_ps_output_cntl"] & 1) == int(v["dual_src_blend"])
         assert ((s["rb_ps_output_cntl"] >> 1) & 1) == int(v["writes_pos"])
         assert ((s["rb_ps_output_cntl"] >> 2) & 1) == int(v["writes_smask"])

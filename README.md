@@ -303,6 +303,45 @@ usb start
 bootflow scan -a
 ```
 
+## Raspberry Pi USB controller
+
+The optional Raspberry Pi 5 helper presents the Scarlet image as a composite
+USB device with mass storage (and an optional boot-keyboard function). The
+reset helper uses the Chromebook EC's keyboard matrix by default, because
+Depthcharge handles the built-in EC keyboard path reliably.
+
+Install or refresh the Pi-side gadget and SSH controller:
+
+```sh
+./scripts/install-raspi-scarlet.sh
+./scripts/deploy-scarlet-to-raspi.sh
+./scripts/raspi-scarlet-control.sh status
+```
+
+Send a boot key from the host:
+
+```sh
+./scripts/raspi-scarlet-control.sh key ctrl-l
+./scripts/raspi-scarlet-control.sh key enter
+```
+
+Run the reset and alternate-firmware shortcut as one sequence:
+
+```sh
+./scripts/raspi-scarlet-boot.sh
+./scripts/raspi-scarlet-boot.sh --delay-ms 12000
+```
+
+The default sequence sends `apreset` over the Mac's CCD EC console, waits
+5 seconds, then injects `Ctrl+L` through the EC keyboard matrix. Tune
+`--delay-ms` if needed. The Pi HID path remains available explicitly with
+`--keyboard-backend hid`; no firmware image is written by this helper.
+
+The current reset path can remain on the Mac's CCD connection. A later
+controller backend can move EC/AP reset to a CCD connection on the Pi without
+changing the storage or HID interface. The image is intentionally kept under
+`/run/scarlet` (tmpfs), so a Pi reboot requires another image deployment.
+
 ## Repository layout
 
 ```text

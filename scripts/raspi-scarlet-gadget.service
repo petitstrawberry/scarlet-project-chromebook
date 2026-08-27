@@ -1,0 +1,15 @@
+[Unit]
+Description=Scarlet RAM-backed USB storage and HID gadget
+After=local-fs.target
+ConditionPathIsDirectory=/sys/kernel/config
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/scarlet-gadget
+ExecStart=/usr/local/sbin/scarlet-gadget wait
+ExecStop=/usr/local/sbin/scarlet-gadget detach
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

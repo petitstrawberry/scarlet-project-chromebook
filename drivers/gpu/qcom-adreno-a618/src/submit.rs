@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 
 use adreno_a6xx_pm4::{Header, Packet, Packets, opcode};
 use adreno_a6xx_shader_pack::{
-    PipelineVariant, ShaderMeta, ShaderVariant, link_meta, pipeline_state_meta, shader_meta,
+    PipelineVariant, SAMPLER_CLAMP_LINEAR, SAMPLER_CLAMP_NEAREST, ShaderMeta, ShaderVariant,
+    link_meta, pipeline_state_meta, shader_meta,
 };
 use adreno_a6xx_submit_wire::{
     ACCESS_READ, ACCESS_WRITE, AddressEncoding, DecodedSubmit, Relocation, RelocationSource,
@@ -522,7 +523,7 @@ fn validate_type4(
             address_field(addresses, packet_word + 1, ACCESS_READ, false, None)
         }
         (VFD_VERTEX_BUFFER_SIZE, 2)
-            if payload[0] != 0 && matches!(payload[1], 16 | 24 | 28 | 40) =>
+            if payload[0] != 0 && matches!(payload[1], 16 | 24 | 28 | 32 | 40) =>
         {
             Ok(())
         }
@@ -686,6 +687,36 @@ fn validate_type7(
                 && payload[2].is_multiple_of(3) =>
         {
             Ok(())
+        }
+        (CP_DRAW_INDX_OFFSET, 7) => {
+            let index_size = match payload[0] {
+                // TRIANGLE_LIST | DMA | INDEX4_SIZE_16/32_BIT.
+                0x404 => 2_u64,
+                0x804 => 4_u64,
+                _ => return Err("qcom-adreno-a618: unsafe indexed draw initiator"),
+            };
+            let end_index = payload[3]
+                .checked_add(payload[2])
+                .ok_or("qcom-adreno-a618: indexed draw range overflows")?;
+            if payload[1] != 1
+                || payload[2] == 0
+                || !payload[2].is_multiple_of(3)
+                || payload[6] == 0
+                || end_index > payload[6]
+                || payload[4..6] != [0, 0]
+            {
+                return Err("qcom-adreno-a618: unsafe indexed draw range");
+            }
+            let required_size = u64::from(payload[6])
+                .checked_mul(index_size)
+                .ok_or("qcom-adreno-a618: index buffer size overflows")?;
+            address_field(
+                addresses,
+                packet_word + 5,
+                ACCESS_READ,
+                false,
+                Some(required_size),
+            )
         }
         _ => Err("qcom-adreno-a618: PM4 opcode is not allowlisted"),
     }
@@ -1088,25 +1119,63 @@ fn validate_a2d_sequences(
     Ok(())
 }
 
-fn segment_reg<'a>(
-    words: &'a [u32],
-    start: u32,
-    end: u32,
-    wanted: u32,
-) -> Option<(u32, &'a [u32])> {
-    let mut found = None;
-    for packet in Packets::new(words).filter_map(Result::ok) {
-        if packet.word_offset >= start
-            && packet.word_offset < end
-            && matches!(packet.header, Header::Type4 { register, .. } if register == wanted)
-        {
-            if found.is_some() {
+#[derive(Clone, Copy)]
+struct SegmentRegister<'a> {
+    register: u32,
+    word_offset: u32,
+    payload: &'a [u32],
+}
+
+/// One parsed draw-state segment with a sorted Type4 register index.
+///
+/// The validator compares every segment against each canonical shader/link
+/// variant. Re-scanning the entire PM4 segment for every register in every
+/// candidate made validation dominate short UI submissions. The index only
+/// accelerates lookup: duplicate register packets still resolve to `None`, so
+/// the accepted language is unchanged.
+struct SegmentIndex<'packets, 'registers, 'words> {
+    packets: &'packets [Packet<'words>],
+    registers: &'registers [SegmentRegister<'words>],
+}
+
+impl<'packets, 'registers, 'words> SegmentIndex<'packets, 'registers, 'words> {
+    fn new(
+        packets: &'packets [Packet<'words>],
+        register_scratch: &'registers mut Vec<SegmentRegister<'words>>,
+    ) -> Self {
+        register_scratch.clear();
+        register_scratch.extend(packets.iter().filter_map(|packet| {
+            let Header::Type4 { register, .. } = packet.header else {
                 return None;
-            }
-            found = Some((packet.word_offset, packet.payload));
+            };
+            Some(SegmentRegister {
+                register,
+                word_offset: packet.word_offset,
+                payload: packet.payload,
+            })
+        }));
+        register_scratch.sort_unstable_by_key(|entry| entry.register);
+        Self {
+            packets,
+            registers: register_scratch.as_slice(),
         }
     }
-    found
+
+    fn reg(&self, wanted: u32) -> Option<(u32, &'words [u32])> {
+        let index = self
+            .registers
+            .partition_point(|entry| entry.register < wanted);
+        let entry = self.registers.get(index)?;
+        if entry.register != wanted
+            || self
+                .registers
+                .get(index + 1)
+                .is_some_and(|next| next.register == wanted)
+        {
+            return None;
+        }
+        Some((entry.word_offset, entry.payload))
+    }
 }
 
 /// Find the upstream A6xx shader-program layout burst and return the packet
@@ -1114,38 +1183,18 @@ fn segment_reg<'a>(
 /// PVT_MEM_PARAM, PVT_MEM_ADDR, and PVT_MEM_SIZE must be programmed together;
 /// accepting the older split form exposes a partially updated SP layout.
 fn segment_shader_program_layout(
-    words: &[u32],
-    start: u32,
-    end: u32,
+    segment: &SegmentIndex<'_, '_, '_>,
     first_exec_register: u32,
 ) -> Option<(u32, u32)> {
-    let mut found = None;
-    for packet in Packets::new(words).filter_map(Result::ok) {
-        if packet.word_offset < start || packet.word_offset >= end {
-            continue;
-        }
-        if !matches!(
-            packet.header,
-            Header::Type4 {
-                register,
-                count: 7,
-            } if register == first_exec_register
-        ) {
-            continue;
-        }
-        if packet.payload.len() != 7
-            || packet.payload[0] != 0
-            || packet.payload[3..] != [0; 4]
-            || found.is_some()
-        {
-            return None;
-        }
-        found = Some((packet.word_offset, packet.word_offset + 2));
+    let (word_offset, payload) = segment.reg(first_exec_register)?;
+    if payload.len() != 7 || payload[0] != 0 || payload[3..] != [0; 4] {
+        return None;
     }
-    found
+    Some((word_offset, word_offset + 2))
 }
 
-fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: PipelineVariant) -> bool {
+fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: PipelineVariant) -> bool {
+    let packets = segment.packets;
     let link = link_meta(variant);
     let fixed = pipeline_state_meta(variant);
     let ShaderMeta::Vertex(vs) = shader_meta(link.vs) else {
@@ -1154,9 +1203,11 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
     let ShaderMeta::Fragment(fs) = shader_meta(link.fs) else {
         return false;
     };
-    let reg = |wanted| segment_reg(words, start, end, wanted).map(|(_, p)| p);
+    let reg = |wanted| segment.reg(wanted).map(|(_, payload)| payload);
     let load_count = |opcode, block, state_type| {
-        packets_in_segment(words, start, end)
+        packets
+            .iter()
+            .copied()
             .filter(|p| {
                 matches!(p.header, Header::Type7 { opcode: actual, .. } if actual == opcode)
                     && p.payload.first().is_some_and(|word| {
@@ -1166,14 +1217,18 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
             .count()
     };
     let type7_count = |wanted_opcode, wanted_payload: &[u32]| {
-        packets_in_segment(words, start, end)
+        packets
+            .iter()
+            .copied()
             .filter(|packet| {
                 matches!(packet.header, Header::Type7 { opcode, .. } if opcode == wanted_opcode)
                     && packet.payload == wanted_payload
             })
             .count()
     };
-    let last_marker = packets_in_segment(words, start, end)
+    let last_marker = packets
+        .iter()
+        .copied()
         .filter_map(|packet| {
             matches!(
                 packet.header,
@@ -1247,9 +1302,9 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
         && reg(SP_VS_CONFIG) == Some(&[vs.sp_vs_config])
         && reg(SP_PS_INSTR_SIZE) == Some(&[fs.sp_ps_instr_size])
         && reg(SP_PS_CONFIG) == Some(&[fs.sp_ps_config])
-        && segment_shader_program_layout(words, start, end, SP_VS_PROGRAM_COUNTER_OFFSET).is_some()
+        && segment_shader_program_layout(segment, SP_VS_PROGRAM_COUNTER_OFFSET).is_some()
         && reg(SP_VS_PVT_MEM_STACK_OFFSET) == Some(&[0])
-        && segment_shader_program_layout(words, start, end, SP_PS_PROGRAM_COUNTER_OFFSET).is_some()
+        && segment_shader_program_layout(segment, SP_PS_PROGRAM_COUNTER_OFFSET).is_some()
         && reg(SP_PS_PVT_MEM_STACK_OFFSET) == Some(&[0])
         && reg(SP_REG_PROG_ID_0) == Some(&fs.sp_reg_prog_id)
         && reg(SP_PS_OUTPUT_CNTL) == Some(&[fs.sp_ps_output_cntl])
@@ -1260,19 +1315,16 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
             p.first() == Some(&fs.initial_tex_load_cntl)
                 && p.get(1..) == Some(fs.initial_tex_load_cmd)
         })
-        && reg(SP_PS_TSIZE) == Some(&[u32::from(fixed.sampler_dwords.is_some())])
-        && match fixed.sampler_dwords {
-            Some(_) => {
+        && reg(SP_PS_TSIZE) == Some(&[u32::from(fixed.uses_sampler)])
+        && if fixed.uses_sampler {
                 reg(SP_PS_INITIAL_TEX_INDEX_CMD) == Some(&[0])
                     && reg(SP_PS_SAMPLER_BASE).is_some()
                     && reg(SP_PS_TEXMEMOBJ_BASE).is_some()
-            }
-            None => {
+            } else {
                 reg(SP_PS_INITIAL_TEX_INDEX_CMD).is_none()
                     && reg(SP_PS_SAMPLER_BASE).is_none()
                     && reg(SP_PS_TEXMEMOBJ_BASE).is_none()
             }
-        }
         && reg(VFD_VERTEX_BUFFER_SIZE).is_some_and(|p| p.len() == 2 && p[1] == fixed.stride)
         && reg(VFD_FETCH_INSTR) == Some(fixed.vfd_fetch)
         && reg(VFD_CNTL_0)
@@ -1339,10 +1391,10 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
         && load_count(CP_LOAD_STATE6_FRAG, 12, 1) == 1
         && load_count(CP_LOAD_STATE6_GEOM, 8, 0) == 1
         && load_count(CP_LOAD_STATE6_FRAG, 12, 0) == 1
-        && load_count(CP_LOAD_STATE6_FRAG, 4, 1) == usize::from(fixed.sampler_dwords.is_some())
-        && load_count(CP_LOAD_STATE6_FRAG, 4, 0) == usize::from(fixed.sampler_dwords.is_some())
-        && match fixed.sampler_dwords {
-            Some(expected) => packets_in_segment(words, start, end).any(|p| {
+        && load_count(CP_LOAD_STATE6_FRAG, 4, 1) == usize::from(fixed.uses_sampler)
+        && load_count(CP_LOAD_STATE6_FRAG, 4, 0) == usize::from(fixed.uses_sampler)
+        && if fixed.uses_sampler {
+            packets.iter().copied().any(|p| {
                 matches!(
                     p.header,
                     Header::Type7 {
@@ -1350,9 +1402,11 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
                         ..
                     }
                 ) && p.payload.len() == 22
-                    && p.payload[18..] == expected
-            }),
-            None => !packets_in_segment(words, start, end).any(|p| {
+                    && (p.payload[18..] == SAMPLER_CLAMP_NEAREST
+                        || p.payload[18..] == SAMPLER_CLAMP_LINEAR)
+            })
+        } else {
+            !packets.iter().copied().any(|p| {
                 matches!(
                     p.header,
                     Header::Type7 {
@@ -1361,7 +1415,7 @@ fn segment_matches_pipeline(words: &[u32], start: u32, end: u32, variant: Pipeli
                     }
                 ) && p.payload.len() == 22
                     && p.payload[2] == 0x4c00_6880
-            }),
+            })
         }
 }
 
@@ -1397,11 +1451,12 @@ fn validate_3d_sequences(
     words: &[u32],
     addresses: &mut [AddressField],
 ) -> Result<(), &'static str> {
-    let mut start = 0;
     let packets: Vec<_> = Packets::new(words)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "qcom-adreno-a618: malformed 3D packet stream")?;
-    for packet in packets {
+    let mut segment_start = 0usize;
+    let mut segment_registers = Vec::new();
+    for (packet_index, packet) in packets.iter().copied().enumerate() {
         if !matches!(
             packet.header,
             Header::Type7 {
@@ -1411,10 +1466,13 @@ fn validate_3d_sequences(
         ) {
             continue;
         }
-        let end = packet.word_offset;
+        let segment = SegmentIndex::new(
+            &packets[segment_start..packet_index],
+            &mut segment_registers,
+        );
         let mut matched = None;
         for candidate in PipelineVariant::ALL {
-            if segment_matches_pipeline(words, start, end, candidate) {
+            if segment_matches_pipeline(&segment, candidate) {
                 if matched.is_some() {
                     return Err("qcom-adreno-a618: ambiguous canonical 3D pipeline state");
                 }
@@ -1423,12 +1481,10 @@ fn validate_3d_sequences(
         }
         let link =
             link_meta(matched.ok_or("qcom-adreno-a618: incomplete canonical 3D pipeline state")?);
-        let (_, vs_address) =
-            segment_shader_program_layout(words, start, end, SP_VS_PROGRAM_COUNTER_OFFSET)
-                .ok_or("qcom-adreno-a618: vertex shader program layout is missing")?;
-        let (_, fs_address) =
-            segment_shader_program_layout(words, start, end, SP_PS_PROGRAM_COUNTER_OFFSET)
-                .ok_or("qcom-adreno-a618: fragment shader program layout is missing")?;
+        let (_, vs_address) = segment_shader_program_layout(&segment, SP_VS_PROGRAM_COUNTER_OFFSET)
+            .ok_or("qcom-adreno-a618: vertex shader program layout is missing")?;
+        let (_, fs_address) = segment_shader_program_layout(&segment, SP_PS_PROGRAM_COUNTER_OFFSET)
+            .ok_or("qcom-adreno-a618: fragment shader program layout is missing")?;
         set_address_source(
             addresses,
             vs_address,
@@ -1440,7 +1496,10 @@ fn validate_3d_sequences(
             AddressSource::CanonicalShader(link.fs),
         )?;
         let shader_preload_word = |wanted_opcode: u8, wanted_block: u32| {
-            packets_in_segment(words, start, end)
+            segment
+                .packets
+                .iter()
+                .copied()
                 .find(|candidate| {
                     matches!(
                         candidate.header,
@@ -1465,21 +1524,35 @@ fn validate_3d_sequences(
             AddressSource::CanonicalShader(link.fs),
         )?;
 
-        let (pitch_packet, pitch) = segment_reg(words, start, end, RB_MRT_PITCH)
+        let (pitch_packet, pitch) = segment
+            .reg(RB_MRT_PITCH)
             .ok_or("qcom-adreno-a618: MRT layout is missing")?;
-        let (base_packet, _) = segment_reg(words, start, end, RB_MRT_BASE)
+        let (base_packet, _) = segment
+            .reg(RB_MRT_BASE)
             .ok_or("qcom-adreno-a618: MRT base is missing")?;
-        let (_, screen) = segment_reg(words, start, end, GRAS_SC_SCREEN_SCISSOR_TL)
+        let (_, clip_transform) = segment
+            .reg(GRAS_CL_VIEWPORT_XOFFSET)
+            .ok_or("qcom-adreno-a618: viewport transform is missing")?;
+        let (_, screen) = segment
+            .reg(GRAS_SC_SCREEN_SCISSOR_TL)
             .ok_or("qcom-adreno-a618: render bounds are missing")?;
-        let (_, viewport) = segment_reg(words, start, end, GRAS_SC_VIEWPORT_SCISSOR_TL)
+        let (_, viewport) = segment
+            .reg(GRAS_SC_VIEWPORT_SCISSOR_TL)
             .ok_or("qcom-adreno-a618: viewport scissor is missing")?;
-        let (_, window) = segment_reg(words, start, end, GRAS_SC_WINDOW_SCISSOR_TL)
+        let (_, window) = segment
+            .reg(GRAS_SC_WINDOW_SCISSOR_TL)
             .ok_or("qcom-adreno-a618: window scissor is missing")?;
         let x = |word: u32| word & 0xffff;
         let y = |word: u32| word >> 16;
-        if viewport != screen
+        if viewport[0] != 0
+            || x(viewport[0]) > x(viewport[1])
+            || y(viewport[0]) > y(viewport[1])
             || x(screen[0]) > x(screen[1])
             || y(screen[0]) > y(screen[1])
+            || x(screen[0]) < x(viewport[0])
+            || y(screen[0]) < y(viewport[0])
+            || x(screen[1]) > x(viewport[1])
+            || y(screen[1]) > y(viewport[1])
             || x(window[0]) > x(window[1])
             || y(window[0]) > y(window[1])
             || x(window[0]) < x(screen[0])
@@ -1488,6 +1561,24 @@ fn validate_3d_sequences(
             || y(window[1]) > y(screen[1])
         {
             return Err("qcom-adreno-a618: unsafe 3D scissor state");
+        }
+        // SGFX clip-space coordinates are defined against the complete
+        // attachment.  The render area is damage and may only narrow the
+        // screen/window scissors; it must never remap the viewport.
+        let width = (x(viewport[1]) - x(viewport[0]) + 1) as f32;
+        let height = (y(viewport[1]) - y(viewport[0]) + 1) as f32;
+        let x_scale = width * 0.5;
+        let y_scale = height * 0.5;
+        let expected_clip_transform = [
+            (x(viewport[0]) as f32 + x_scale).to_bits(),
+            x_scale.to_bits(),
+            (y(viewport[0]) as f32 + y_scale).to_bits(),
+            (-y_scale).to_bits(),
+            0.5_f32.to_bits(),
+            0.5_f32.to_bits(),
+        ];
+        if clip_transform != expected_clip_transform {
+            return Err("qcom-adreno-a618: unsafe 3D viewport transform");
         }
         let _ = pitch_packet;
         let row_pitch = pitch[0]
@@ -1498,9 +1589,9 @@ fn validate_3d_sequences(
             base_packet + 1,
             ImageExpectation {
                 row_pitch,
-                width: (screen[1] & 0xffff).saturating_add(1),
-                height: (screen[1] >> 16).saturating_add(1),
-                exact_extent: false,
+                width: (viewport[1] & 0xffff).saturating_add(1),
+                height: (viewport[1] >> 16).saturating_add(1),
+                exact_extent: true,
                 pitch_align: None,
                 array_pitch: Some(ArrayPitchExpectation {
                     bytes: u64::from(pitch[1]) << 6,
@@ -1508,18 +1599,31 @@ fn validate_3d_sequences(
                 }),
             },
         )?;
-        let (_, vertex_layout) = segment_reg(words, start, end, VFD_VERTEX_BUFFER_SIZE)
+        let (_, vertex_layout) = segment
+            .reg(VFD_VERTEX_BUFFER_SIZE)
             .ok_or("qcom-adreno-a618: VFD buffer layout is missing")?;
-        let (_, vertex_offset) = segment_reg(words, start, end, VFD_INDEX_OFFSET)
+        let (_, vertex_offset) = segment
+            .reg(VFD_INDEX_OFFSET)
             .ok_or("qcom-adreno-a618: VFD vertex offset is missing")?;
-        let required_vertex_bytes = packet.payload[2]
-            .checked_add(vertex_offset[0])
-            .and_then(|count| count.checked_mul(vertex_layout[1]))
-            .ok_or("qcom-adreno-a618: VFD vertex span overflows")?;
-        if vertex_layout[0] != required_vertex_bytes {
-            return Err("qcom-adreno-a618: VFD size does not match draw span");
+        if packet.payload.len() == 3 {
+            let required_vertex_bytes = packet.payload[2]
+                .checked_add(vertex_offset[0])
+                .and_then(|count| count.checked_mul(vertex_layout[1]))
+                .ok_or("qcom-adreno-a618: VFD vertex span overflows")?;
+            if vertex_layout[0] != required_vertex_bytes {
+                return Err("qcom-adreno-a618: VFD size does not match draw span");
+            }
+        } else {
+            let minimum_vertex_bytes = vertex_offset[0]
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(vertex_layout[1]))
+                .ok_or("qcom-adreno-a618: indexed VFD base vertex overflows")?;
+            if minimum_vertex_bytes > vertex_layout[0] {
+                return Err("qcom-adreno-a618: indexed VFD base vertex is out of bounds");
+            }
         }
-        let (vertex_base, _) = segment_reg(words, start, end, VFD_VERTEX_BUFFER_BASE)
+        let (vertex_base, _) = segment
+            .reg(VFD_VERTEX_BUFFER_BASE)
             .ok_or("qcom-adreno-a618: VFD buffer base is missing")?;
         let vertex_address = addresses
             .iter_mut()
@@ -1527,8 +1631,8 @@ fn validate_3d_sequences(
             .ok_or("qcom-adreno-a618: VFD address lacks relocation")?;
         vertex_address.required_size = Some(u64::from(vertex_layout[0]));
 
-        if let Some((descriptor_packet, descriptor)) = packets_in_segment(words, start, end)
-            .find_map(|packet| {
+        if let Some((descriptor_packet, descriptor)) =
+            segment.packets.iter().copied().find_map(|packet| {
                 matches!(
                     packet.header,
                     Header::Type7 {
@@ -1563,8 +1667,8 @@ fn validate_3d_sequences(
                 },
             )?;
         }
-        if let Some((descriptor_packet, descriptor)) = packets_in_segment(words, start, end)
-            .find_map(|packet| {
+        if let Some((descriptor_packet, descriptor)) =
+            segment.packets.iter().copied().find_map(|packet| {
                 matches!(
                     packet.header,
                     Header::Type7 {
@@ -1596,19 +1700,9 @@ fn validate_3d_sequences(
                 },
             )?;
         }
-        start = packet.word_offset + 4;
+        segment_start = packet_index + 1;
     }
     Ok(())
-}
-
-fn packets_in_segment<'a>(
-    words: &'a [u32],
-    start: u32,
-    end: u32,
-) -> impl Iterator<Item = adreno_a6xx_pm4::Packet<'a>> {
-    Packets::new(words)
-        .filter_map(Result::ok)
-        .filter(move |p| p.word_offset >= start && p.word_offset < end)
 }
 
 fn copy_pm4(decoded: DecodedSubmit<'_>) -> Result<Vec<u32>, &'static str> {
@@ -1918,7 +2012,7 @@ mod tests {
     };
     use sgfx_core::ir::{
         AddressMode, BlendState, BufferUsage, Color, CullMode, DrawUniforms, Extent2D, FilterMode,
-        FragmentProgram, FrontFace, LoadOp, PixelRect, PrimitiveTopology, RasterState,
+        FragmentProgram, FrontFace, IndexFormat, LoadOp, PixelRect, PrimitiveTopology, RasterState,
         RenderPipelineDesc, SamplerDesc, StoreOp, TextureFormat, TextureSampleMode, TextureUsage,
         Transform, VertexAttribute, VertexBufferLayout, VertexFormat,
     };
@@ -2808,6 +2902,25 @@ mod tests {
         bad_pitch.words[pitch.word_offset as usize + 1] = u32::MAX;
         assert!(accept_codegen(&bad_pitch).is_err());
 
+        let mut upside_down_viewport = artifact.clone();
+        let viewport = Packets::new(&artifact.words)
+            .filter_map(Result::ok)
+            .find(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type4 {
+                        register: super::GRAS_CL_VIEWPORT_XOFFSET,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        upside_down_viewport.words[viewport.word_offset as usize + 4] ^= 1 << 31;
+        assert_eq!(
+            accept_codegen(&upside_down_viewport),
+            Err("qcom-adreno-a618: unsafe 3D viewport transform")
+        );
+
         let mut bad_vfd_count = artifact.clone();
         let vfd = Packets::new(&artifact.words)
             .filter_map(Result::ok)
@@ -2823,6 +2936,219 @@ mod tests {
             .unwrap();
         bad_vfd_count.words[vfd.word_offset as usize + 1] = 0x0303;
         assert!(accept_codegen(&bad_vfd_count).is_err());
+    }
+
+    #[test]
+    fn partial_render_area_keeps_a_full_attachment_viewport_at_the_kernel_boundary() {
+        const PIPELINE: PipelineId = PipelineId::new(8);
+        let resources = [
+            image(TARGET, TextureUsage::RENDER_ATTACHMENT),
+            ResourceMeta {
+                id: BUFFER,
+                size: 120,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX,
+                },
+            },
+        ];
+        let pipelines = [PipelineMeta {
+            id: PIPELINE,
+            descriptor: RenderPipelineDesc::new(
+                TextureFormat::Bgra8Unorm,
+                PrimitiveTopology::TriangleList,
+                VertexBufferLayout::new(
+                    40,
+                    std::vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+                    ],
+                )
+                .unwrap(),
+                FragmentProgram::VertexColor,
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(CullMode::Back, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        }];
+        let operations = [
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: PixelRect::new(4, 5, 6, 7).unwrap(),
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            },
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::SetScissor(None),
+            Operation::Draw {
+                vertex_count: 3,
+                first_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &operations,
+        })
+        .unwrap();
+
+        assert!(accept_codegen(&artifact).is_ok());
+        let packets = Packets::new(&artifact.words)
+            .collect::<Result<std::vec::Vec<_>, _>>()
+            .unwrap();
+        let register = |wanted| {
+            packets.iter().find_map(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type4 {
+                        register,
+                        ..
+                    } if register == wanted
+                )
+                .then_some(packet.payload)
+            })
+        };
+        assert_eq!(
+            register(super::GRAS_SC_SCREEN_SCISSOR_TL),
+            Some(&[0x0005_0004, 0x000b_0009][..])
+        );
+        assert_eq!(
+            register(super::GRAS_SC_VIEWPORT_SCISSOR_TL),
+            Some(&[0, 0x000f_000f][..])
+        );
+    }
+
+    #[test]
+    fn indexed_draw_reaches_the_kernel_with_exact_buffer_bounds() {
+        const PIPELINE: PipelineId = PipelineId::new(17);
+        const INDEX: ObjectId = ObjectId::new(5);
+        let resources = [
+            image(TARGET, TextureUsage::RENDER_ATTACHMENT),
+            ResourceMeta {
+                id: BUFFER,
+                size: 128,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX,
+                },
+            },
+            ResourceMeta {
+                id: INDEX,
+                size: 16,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::INDEX,
+                },
+            },
+        ];
+        let pipelines = [PipelineMeta {
+            id: PIPELINE,
+            descriptor: RenderPipelineDesc::new(
+                TextureFormat::Bgra8Unorm,
+                PrimitiveTopology::TriangleList,
+                VertexBufferLayout::new(
+                    32,
+                    std::vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+                    ],
+                )
+                .unwrap(),
+                FragmentProgram::VertexColor,
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        }];
+        let operations = [
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: PixelRect::new(0, 0, 16, 16).unwrap(),
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            },
+            Operation::SetIndexBuffer {
+                buffer: INDEX,
+                offset: 0,
+                format: IndexFormat::Uint16,
+            },
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::DrawIndexed {
+                index_count: 6,
+                first_index: 2,
+                base_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &operations,
+        })
+        .unwrap();
+        assert!(accept_codegen(&artifact).is_ok());
+
+        let draw = Packets::new(&artifact.words)
+            .filter_map(Result::ok)
+            .find(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: super::CP_DRAW_INDX_OFFSET,
+                        count: 7,
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(draw.payload, [0x404, 1, 6, 2, 0, 0, 8]);
+        let draw_word = draw.word_offset as usize;
+
+        let mut short_max = artifact.clone();
+        short_max.words[draw_word + 7] = 7;
+        assert!(accept_codegen(&short_max).is_err());
+
+        let mut short_relocation = artifact.clone();
+        short_relocation
+            .fixups
+            .iter_mut()
+            .find(|fixup| fixup.word_offset == draw.word_offset + 5)
+            .unwrap()
+            .required_size -= 2;
+        assert!(accept_codegen(&short_relocation).is_err());
+
+        let index_offset_packet = Packets::new(&artifact.words)
+            .filter_map(Result::ok)
+            .find(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type4 {
+                        register: super::VFD_INDEX_OFFSET,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let mut negative_base = artifact.clone();
+        negative_base.words[index_offset_packet.word_offset as usize + 1] = u32::MAX;
+        assert!(accept_codegen(&negative_base).is_err());
     }
 
     #[test]
@@ -3092,7 +3418,10 @@ mod tests {
                         SOURCE
                     },
                 ));
-                let filter = if stride == 24 {
+                // Sampler filtering is dynamic SGFX state rather than part of
+                // the shader/vertex pipeline identity. Exercise linear mode
+                // for every sampled layout, including the stride-16 UI path.
+                let filter = if matches!(index, 1 | 2 | 5 | 8) {
                     FilterMode::Linear
                 } else {
                     FilterMode::Nearest

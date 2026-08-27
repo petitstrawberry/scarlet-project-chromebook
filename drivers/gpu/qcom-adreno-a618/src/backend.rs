@@ -3,11 +3,12 @@
 //! Scarlet generic GPU backend for the SC7180 Adreno 618.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use scarlet::{
     arch,
     device::{
+        events::InterruptCapableDevice,
         gpu::{
             GPU_EXECUTION_SUPPORT_ADDRESS_SPACE, GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD,
             GPU_EXECUTION_SUPPORT_MEMORY, GPU_EXECUTION_SUPPORT_PRESENTATION,
@@ -29,7 +30,7 @@ use scarlet::{
     },
     early_println,
     environment::PAGE_SIZE,
-    sync::{IrqSpinLock, Mutex},
+    sync::{IrqSpinLock, Mutex, Waker},
     time, vm,
 };
 
@@ -208,6 +209,10 @@ impl RingInterruptSnapshot {
         let completion = self.rbbm & RBBM_INT_COMPLETION_MASK;
         (self.rbbm & !completion) & RBBM_INT_FATAL_MASK != 0 || self.cp & CP_INT_FATAL_MASK != 0
     }
+
+    fn is_empty(self) -> bool {
+        self.rbbm == 0 && self.cp == 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -248,6 +253,7 @@ struct RingFailureSnapshot {
 struct HardwareState {
     boot: BootState,
     ring: DmaAllocation,
+    command: DmaAllocation,
     sqe: Option<DmaAllocation>,
     shader_pack: Option<DmaAllocation>,
     fence: DmaAllocation,
@@ -271,6 +277,10 @@ struct ResourceEntry {
 struct A618Core {
     registers: DwordRegisters,
     register_base: usize,
+    interrupt_id: scarlet::interrupt::InterruptId,
+    interrupt_snapshot: IrqSpinLock<RingInterruptSnapshot>,
+    interrupt_waker: Arc<Waker>,
+    interrupt_wait_armed: AtomicBool,
     dma_context: DmaContext,
     gmu: Arc<Mutex<A618Gmu>>,
     hardware: Mutex<HardwareState>,
@@ -455,10 +465,9 @@ impl A618Core {
         registers.write(RBBM_INT_0_MASK, 0);
         registers.write(RBBM_INT_CLEAR_CMD, u32::MAX);
         arch::io_wmb();
-        // Scarlet keeps the platform IRQ disabled and polls the RBBM status,
-        // but A6xx still needs the same internal completion source enabled as
-        // Linux so CACHE_FLUSH_TS can be observed and W1C-acknowledged before
-        // the next submit.
+        // Enable the same completion and fault sources as the registered
+        // platform IRQ. The hard-IRQ path snapshots dependent CP diagnostics
+        // before acknowledging this shared RBBM status word.
         registers.write(RBBM_INT_0_MASK, RBBM_INT_POLL_MASK);
         registers.write(RBBM_SECVID_TSB_CNTL, 0);
         registers.write64(RBBM_SECVID_TSB_TRUSTED_BASE, 0);
@@ -665,6 +674,26 @@ impl A618Core {
         }
     }
 
+    fn take_interrupt_snapshot(&self) -> RingInterruptSnapshot {
+        let mut pending = self.interrupt_snapshot.lock();
+        let snapshot = *pending;
+        *pending = RingInterruptSnapshot::default();
+        snapshot
+    }
+
+    fn collect_polled_interrupts(&self) -> Result<RingInterruptSnapshot, RingInterruptSnapshot> {
+        let mut combined = self.take_interrupt_snapshot();
+        match self.consume_ring_interrupts() {
+            Ok(snapshot) => combined.merge(snapshot),
+            Err(snapshot) => combined.merge(snapshot),
+        }
+        if combined.is_fatal() {
+            Err(combined)
+        } else {
+            Ok(combined)
+        }
+    }
+
     fn capture_ring_failure(
         &self,
         hardware: &HardwareState,
@@ -833,7 +862,7 @@ impl A618Core {
             {
                 return Ok(());
             }
-            match self.consume_ring_interrupts() {
+            match self.collect_polled_interrupts() {
                 Ok(interrupts) => observed_interrupts.merge(interrupts),
                 Err(interrupts) => {
                     observed_interrupts.merge(interrupts);
@@ -888,48 +917,47 @@ impl A618Core {
         ring.extend_from_slice(&completion);
         let target_wptr = self.write_ring(hardware, &ring)?;
         let start = time::current_time();
+        #[cfg(debug_assertions)]
+        let mut waits = 0u32;
         let mut observed_interrupts = RingInterruptSnapshot::default();
         loop {
             hardware.fence.invalidate_from_device();
             let fence_value = hardware.fence.read_word_volatile(0).unwrap_or(0);
-            match self.consume_ring_interrupts() {
-                Ok(interrupts) => observed_interrupts.merge(interrupts),
-                Err(interrupts) => {
-                    observed_interrupts.merge(interrupts);
-                    let reason = if observed_interrupts.cp & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
-                        "CP illegal instruction during submit"
+            observed_interrupts.merge(self.take_interrupt_snapshot());
+            if observed_interrupts.is_fatal() {
+                let reason = if observed_interrupts.cp & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
+                    "CP illegal instruction during submit"
+                } else if observed_interrupts.cp & CP_INT_OPCODE_ERROR != 0 {
+                    "CP opcode error during submit"
+                } else if observed_interrupts.cp & CP_INT_REGISTER_PROTECTION_ERROR != 0 {
+                    "CP register protection fault during submit"
+                } else if observed_interrupts.cp & CP_INT_HW_FAULT_ERROR != 0 {
+                    "CP hardware fault during submit"
+                } else {
+                    "fatal interrupt during submit"
+                };
+                self.record_ring_failure(
+                    hardware,
+                    reason,
+                    sequence,
+                    command_words,
+                    target_wptr,
+                    observed_interrupts,
+                    Some((fence_value, sequence)),
+                );
+                return Err(
+                    if observed_interrupts.cp & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
+                        "qcom-adreno-a618: CP illegal instruction during synchronous submit"
                     } else if observed_interrupts.cp & CP_INT_OPCODE_ERROR != 0 {
-                        "CP opcode error during submit"
+                        "qcom-adreno-a618: CP opcode error during synchronous submit"
                     } else if observed_interrupts.cp & CP_INT_REGISTER_PROTECTION_ERROR != 0 {
-                        "CP register protection fault during submit"
+                        "qcom-adreno-a618: CP register protection fault during synchronous submit"
                     } else if observed_interrupts.cp & CP_INT_HW_FAULT_ERROR != 0 {
-                        "CP hardware fault during submit"
+                        "qcom-adreno-a618: CP hardware fault during synchronous submit"
                     } else {
-                        "fatal interrupt during submit"
-                    };
-                    self.record_ring_failure(
-                        hardware,
-                        reason,
-                        sequence,
-                        command_words,
-                        target_wptr,
-                        observed_interrupts,
-                        Some((fence_value, sequence)),
-                    );
-                    return Err(
-                        if observed_interrupts.cp & CP_INT_ILLEGAL_INSTR_ERROR != 0 {
-                            "qcom-adreno-a618: CP illegal instruction during synchronous submit"
-                        } else if observed_interrupts.cp & CP_INT_OPCODE_ERROR != 0 {
-                            "qcom-adreno-a618: CP opcode error during synchronous submit"
-                        } else if observed_interrupts.cp & CP_INT_REGISTER_PROTECTION_ERROR != 0 {
-                            "qcom-adreno-a618: CP register protection fault during synchronous submit"
-                        } else if observed_interrupts.cp & CP_INT_HW_FAULT_ERROR != 0 {
-                            "qcom-adreno-a618: CP hardware fault during synchronous submit"
-                        } else {
-                            "qcom-adreno-a618: GPU fault interrupt during synchronous submit"
-                        },
-                    );
-                }
+                        "qcom-adreno-a618: GPU fault interrupt during synchronous submit"
+                    },
+                );
             }
             // Drain any status raised alongside the memory fence before
             // returning so the next ring kick starts from a clean status word.
@@ -938,10 +966,15 @@ impl A618Core {
                 && self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
             {
-                if sequence <= 2 {
+                #[cfg(debug_assertions)]
+                if sequence <= 4 || sequence.is_power_of_two() {
+                    let elapsed_us = time::current_time().saturating_sub(start);
                     early_println!(
-                        "[a618] submit complete seq={} irq={:#010x} scratch={:#010x} fence={:#010x}",
+                        "[a618] submit complete seq={} words={} elapsed_us={} waits={} irq={:#010x} scratch={:#010x} fence={:#010x}",
                         sequence,
+                        command_words,
+                        elapsed_us,
+                        waits,
                         observed_interrupts.rbbm,
                         self.registers.read(CP_SCRATCH_2),
                         fence_value,
@@ -961,7 +994,36 @@ impl A618Core {
                 );
                 return Err("qcom-adreno-a618: synchronous GPU fence timed out");
             }
-            time::udelay(10);
+
+            // Arm before the final snapshot recheck. If the IRQ races this
+            // transition, the handler either leaves a snapshot for this loop
+            // or latches a Waker notification that the following wait consumes.
+            self.interrupt_wait_armed.store(true, Ordering::Release);
+            let late_interrupts = self.take_interrupt_snapshot();
+            if !late_interrupts.is_empty() {
+                self.interrupt_wait_armed.store(false, Ordering::Release);
+                observed_interrupts.merge(late_interrupts);
+                continue;
+            }
+
+            let elapsed_us = time::current_time().saturating_sub(start);
+            let remaining_ns = GPU_TIMEOUT_US
+                .saturating_sub(elapsed_us)
+                .saturating_mul(1_000);
+            if let Some(task) = scarlet::task::mytask() {
+                let _ = self.interrupt_waker.wait_with_timeout(
+                    task.get_id(),
+                    task.get_trapframe(),
+                    Some(remaining_ns),
+                );
+            } else {
+                time::udelay(10);
+            }
+            self.interrupt_wait_armed.store(false, Ordering::Release);
+            #[cfg(debug_assertions)]
+            {
+                waits = waits.saturating_add(1);
+            }
         }
     }
 
@@ -1119,18 +1181,61 @@ impl A618Core {
         }
     }
 
-    fn submit_command(&self, command: &DmaAllocation) -> Result<(), GpuBackendSubmitError> {
-        let word_count = u32::try_from(command.as_words().len()).map_err(|_| {
+    fn submit_words(&self, words: &[u32]) -> Result<(), GpuBackendSubmitError> {
+        let word_count = u32::try_from(words.len()).map_err(|_| {
             GpuBackendSubmitError::Rejected("qcom-adreno-a618: command stream is too large")
         })?;
-        let submission = submission_commands(command.dma_addr(), word_count)
-            .map_err(GpuBackendSubmitError::Unavailable)?;
+        let byte_size = words.len().checked_mul(core::mem::size_of::<u32>()).ok_or(
+            GpuBackendSubmitError::Rejected("qcom-adreno-a618: command byte size overflows"),
+        )?;
         let mut hardware = self.hardware.lock();
-        self.execute_ring(&mut hardware, &submission, command.as_words().len())
+        if byte_size > hardware.command.requested_size() {
+            return Err(GpuBackendSubmitError::Rejected(
+                "qcom-adreno-a618: command stream exceeds staging allocation",
+            ));
+        }
+        hardware.command.as_words_mut()[..words.len()].copy_from_slice(words);
+        hardware
+            .command
+            .clean_prefix_for_device(byte_size)
+            .map_err(GpuBackendSubmitError::Unavailable)?;
+        let submission = submission_commands(hardware.command.dma_addr(), word_count)
+            .map_err(GpuBackendSubmitError::Unavailable)?;
+        self.execute_ring(&mut hardware, &submission, words.len())
             .map_err(|error| {
                 self.quiesce_lost(&mut hardware, error);
                 GpuBackendSubmitError::DeviceLost(error)
             })
+    }
+}
+
+impl InterruptCapableDevice for A618Core {
+    fn handle_interrupt(&self) -> scarlet::interrupt::InterruptResult<()> {
+        let _ = self.claim_interrupt()?;
+        Ok(())
+    }
+
+    fn interrupt_id(&self) -> Option<scarlet::interrupt::InterruptId> {
+        Some(self.interrupt_id)
+    }
+
+    fn claim_interrupt(
+        &self,
+    ) -> scarlet::interrupt::InterruptResult<scarlet::interrupt::InterruptClaim> {
+        if self.registers.read(RBBM_INT_0_STATUS) == 0 {
+            return Ok(scarlet::interrupt::InterruptClaim::NotMine);
+        }
+        let snapshot = match self.consume_ring_interrupts() {
+            Ok(snapshot) | Err(snapshot) => snapshot,
+        };
+        {
+            let mut pending = self.interrupt_snapshot.lock();
+            pending.merge(snapshot);
+        }
+        if self.interrupt_wait_armed.swap(false, Ordering::AcqRel) {
+            self.interrupt_waker.wake_all();
+        }
+        Ok(scarlet::interrupt::InterruptClaim::Handled)
     }
 }
 
@@ -1210,6 +1315,7 @@ struct A618ContextInner {
     core: Arc<A618Core>,
     id: u64,
     next_attachment: AtomicU64,
+    submit_count: AtomicU64,
     attachments: IrqSpinLock<Vec<Attachment>>,
     execution: Mutex<()>,
 }
@@ -1360,6 +1466,10 @@ impl GpuBackendQueue for A618Queue {
 
     fn submit(&self, commands: &[u8]) -> Result<(), GpuBackendSubmitError> {
         let _execution = self.context.execution.lock();
+        #[cfg(debug_assertions)]
+        let submit_start = time::current_time();
+        #[cfg(debug_assertions)]
+        let submit_number = self.context.submit_count.fetch_add(1, Ordering::Relaxed) + 1;
         self.context
             .core
             .ensure_shader_pack()
@@ -1383,22 +1493,40 @@ impl GpuBackendQueue for A618Queue {
             }
             GpuBackendSubmitError::Rejected(error)
         })?;
-        let byte_size = words.len().checked_mul(core::mem::size_of::<u32>()).ok_or(
-            GpuBackendSubmitError::Rejected("qcom-adreno-a618: command byte size overflows"),
-        )?;
-        let mut command = DmaAllocation::new(
-            &self.context.core.dma_context,
-            byte_size,
-            IommuMapFlags::READ,
-        )
-        .map_err(GpuBackendSubmitError::Unavailable)?;
-        command.as_words_mut().copy_from_slice(&words);
-        command.clean_for_device();
-
-        // The validated command allocation deliberately stays alive across
-        // lazy boot and synchronous kernel-owned fence completion.
+        #[cfg(debug_assertions)]
+        let validate_us = time::current_time().saturating_sub(submit_start);
+        // The core owns one persistently mapped command staging allocation.
+        // Hardware execution is serialized by its mutex, so every context can
+        // safely reuse the mapping without allocating and tearing down IOMMU
+        // state on every frame.
         self.context.core.ensure_hardware_ready()?;
-        self.context.core.submit_command(&command)
+        #[cfg(debug_assertions)]
+        let hardware_start = time::current_time();
+        let result = self.context.core.submit_words(&words);
+        #[cfg(debug_assertions)]
+        let completed = time::current_time();
+        #[cfg(debug_assertions)]
+        let hardware_us = completed.saturating_sub(hardware_start);
+        #[cfg(debug_assertions)]
+        let total_us = completed.saturating_sub(submit_start);
+        // Use a cadence distinct from the core's power-of-two ring log. A
+        // synchronous UART print inside execute_ring otherwise inflates every
+        // sampled end-to-end measurement by the console transmission time.
+        #[cfg(debug_assertions)]
+        if submit_number <= 4 || submit_number.is_multiple_of(127) {
+            early_println!(
+                "[a618-path] context={} submit={} bytes={} words={} validate_us={} hardware_us={} total_us={} result={}",
+                self.context.id,
+                submit_number,
+                commands.len(),
+                words.len(),
+                validate_us,
+                hardware_us,
+                total_us,
+                if result.is_ok() { "ok" } else { "error" },
+            );
+        }
+        result
     }
 }
 
@@ -1496,11 +1624,22 @@ impl GpuBackend for A618Backend {
             &NEXT_CONTEXT_ID,
             "qcom-adreno-a618: context ID space exhausted",
         )?;
+        if let Some(task) = scarlet::task::mytask() {
+            early_println!(
+                "[a618-context] create id={} task={} tgid={}",
+                id,
+                task.get_id(),
+                task.get_thread_group_id(),
+            );
+        } else {
+            early_println!("[a618-context] create id={} task=0 tgid=0", id);
+        }
         Ok(Arc::new(A618Context {
             inner: Arc::new(A618ContextInner {
                 core: Arc::clone(&self.core),
                 id,
                 next_attachment: AtomicU64::new(1),
+                submit_count: AtomicU64::new(0),
                 attachments: IrqSpinLock::new(Vec::new()),
                 execution: Mutex::new(()),
             }),
@@ -1618,6 +1757,13 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .iter()
         .find(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .ok_or("qcom-adreno-a618: missing GPU register resource")?;
+    let interrupt_resource = device
+        .get_resources()
+        .iter()
+        .find(|resource| resource.res_type == PlatformDeviceResourceType::IRQ)
+        .ok_or("qcom-adreno-a618: missing GPU interrupt resource")?;
+    let interrupt_id = scarlet::interrupt::resolve_platform_irq(interrupt_resource)
+        .map_err(|_| "qcom-adreno-a618: failed to resolve GPU interrupt")?;
     let resource_size = resource
         .end
         .checked_sub(resource.start)
@@ -1638,6 +1784,11 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             },
         )?;
         let ring = DmaAllocation::new(&dma_context, RING_SIZE, bidirectional_flags())?;
+        let command = DmaAllocation::new(
+            &dma_context,
+            GPU_MAX_OPAQUE_COMMAND_SIZE as usize,
+            IommuMapFlags::READ,
+        )?;
         let fence = DmaAllocation::new(&dma_context, PAGE_SIZE, bidirectional_flags())?;
         let backend_cookie = allocate_monotonic(
             &NEXT_BACKEND_COOKIE,
@@ -1646,11 +1797,16 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         let core = Arc::new(A618Core {
             registers: DwordRegisters::new(register_base),
             register_base,
+            interrupt_id,
+            interrupt_snapshot: IrqSpinLock::new(RingInterruptSnapshot::default()),
+            interrupt_waker: Arc::new(Waker::new_uninterruptible("a618-submit")),
+            interrupt_wait_armed: AtomicBool::new(false),
             dma_context,
             gmu,
             hardware: Mutex::new(HardwareState {
                 boot: BootState::Cold,
                 ring,
+                command,
                 sqe: None,
                 shader_pack: None,
                 fence,
@@ -1665,6 +1821,12 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             next_resource_token: AtomicU64::new(1),
             backend_cookie,
         });
+        scarlet::interrupt::register_and_enable_platform_irq_device(
+            interrupt_resource,
+            core.clone(),
+            arch::get_cpu().get_cpuid() as u32,
+        )
+        .map_err(|_| "qcom-adreno-a618: failed to register GPU interrupt")?;
         let (device_id, gpu_name) = register_gpu_control_device(Arc::new(A618Backend {
             core: Arc::clone(&core),
         }))?;
@@ -1675,9 +1837,10 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             _core: core,
         });
         early_println!(
-            "[qcom-adreno-a618] registered lazy CoachZ GPU backend as {} paddr={:#x}",
+            "[qcom-adreno-a618] registered lazy CoachZ GPU backend as {} paddr={:#x} irq={}",
             gpu_name,
             resource.start,
+            interrupt_id,
         );
         Ok(())
     })();

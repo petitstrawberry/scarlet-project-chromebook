@@ -43,7 +43,12 @@ CARGO_TARGET_DIR="$target_dir" cargo build \
     --target aarch64-unknown-scarlet \
     --release \
     -p userprogram \
-    --bin sgfx_probe
+    --bin sgfx_probe \
+    --bin taskbar \
+    --bin terminal \
+    --bin ui-demo \
+    --bin ui-benchmark \
+    --bin settings
 
 # `userprogram` uses Scarlet's no_std compatibility layer, while std-bin uses
 # the target's Rust std.  Keep them in separate Cargo feature-resolution units
@@ -57,11 +62,21 @@ CARGO_TARGET_DIR="$target_dir" cargo build \
     --release \
     -p scarlet-std-bin \
     --bin sws \
+    --bin clock \
+    --bin files \
+    --bin launcher \
+    --bin notepad \
+    --bin task_manager \
+    --bin ui-sgfx-showcase \
     --bin sgfx_cube \
     --bin sgfx_texture \
     --bin sgfx_showcase
 
-for binary in sgfx_probe sws sgfx_cube sgfx_texture sgfx_showcase; do
+for binary in \
+    sgfx_probe taskbar terminal ui-demo ui-benchmark settings \
+    sws clock files launcher notepad task_manager ui-sgfx-showcase \
+    sgfx_cube sgfx_texture sgfx_showcase
+do
     source_path="$target_bins/$binary"
     if [ ! -x "$source_path" ]; then
         echo "CoachZ userspace binary missing after build: $source_path" >&2

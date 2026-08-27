@@ -4,10 +4,10 @@ use alloc::vec::Vec;
 
 use adreno_a6xx_pm4::{opcode, type4, type7};
 use adreno_a6xx_shader_pack::{
-    FragmentMeta, LinkMeta, PipelineVariant, SHADER_SIZE, ShaderMeta, VertexMeta, link_meta,
-    shader_meta,
+    FragmentMeta, LinkMeta, PipelineVariant, SAMPLER_CLAMP_LINEAR, SAMPLER_CLAMP_NEAREST,
+    SHADER_SIZE, ShaderMeta, VertexMeta, link_meta, shader_meta,
 };
-use sgfx_core::ir::{Color, PixelRect};
+use sgfx_core::ir::{Color, IndexFormat, PixelRect};
 
 use crate::model::{
     Access, AddressEncoding, CompileError, GeneratedObject, GeneratedObjectId, GeneratedObjectKind,
@@ -205,8 +205,29 @@ pub(crate) struct DrawState {
     pub(crate) linear_sampler: bool,
     pub(crate) source_over: bool,
     pub(crate) cull: u32,
-    pub(crate) first_vertex: u32,
-    pub(crate) vertex_count: u32,
+    pub(crate) draw: DrawCall,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DrawCall {
+    NonIndexed {
+        first_vertex: u32,
+        vertex_count: u32,
+    },
+    Indexed(IndexedDraw),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IndexedDraw {
+    pub(crate) index: ObjectId,
+    pub(crate) index_offset: u64,
+    pub(crate) index_size: u64,
+    pub(crate) format: IndexFormat,
+    pub(crate) index_count: u32,
+    pub(crate) first_index: u32,
+    pub(crate) base_vertex: u32,
+    pub(crate) max_indices: u32,
+    pub(crate) vertex_size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -576,6 +597,9 @@ impl Emitter {
         self.emit_no_depth_state()?;
         self.emit_single_sample_state()?;
 
+        let target_area = PixelRect::new(0, 0, draw.target.width, draw.target.height)
+            .map_err(|_| CompileError::InvalidResource)?;
+        let target_br = pack_xy(draw.target.width - 1, draw.target.height - 1);
         let area_br = pack_xy(
             draw.area.x() + draw.area.width() - 1,
             draw.area.y() + draw.area.height() - 1,
@@ -584,26 +608,21 @@ impl Emitter {
             draw.scissor.x() + draw.scissor.width() - 1,
             draw.scissor.y() + draw.scissor.height() - 1,
         );
+        // SGFX vertices are transformed to clip space against the complete
+        // render target.  A render-pass area is damage, not a second logical
+        // framebuffer: shrinking the hardware viewport to that area remaps
+        // the whole scene into each dirty rectangle.  VirGL/wgpu keep the
+        // target viewport stable and apply damage only through scissors.
+        self.packet4(GRAS_CL_VIEWPORT_XOFFSET, &viewport_transform(target_area))?;
         self.packet4(
-            GRAS_CL_VIEWPORT_XOFFSET,
-            &[
-                f32_bits(draw.area.x() as f32 + draw.area.width() as f32 * 0.5),
-                f32_bits(draw.area.width() as f32 * 0.5),
-                f32_bits(draw.area.y() as f32 + draw.area.height() as f32 * 0.5),
-                f32_bits(draw.area.height() as f32 * 0.5),
-                f32_bits(0.5),
-                f32_bits(0.5),
-            ],
+            GRAS_CL_GUARDBAND_CLIP_ADJ,
+            &[guardband_clip_adj(target_area)],
         )?;
-        self.packet4(GRAS_CL_GUARDBAND_CLIP_ADJ, &[guardband_clip_adj(draw.area)])?;
         self.packet4(
             GRAS_SC_SCREEN_SCISSOR_TL,
             &[pack_xy(draw.area.x(), draw.area.y()), area_br],
         )?;
-        self.packet4(
-            GRAS_SC_VIEWPORT_SCISSOR_TL,
-            &[pack_xy(draw.area.x(), draw.area.y()), area_br],
-        )?;
+        self.packet4(GRAS_SC_VIEWPORT_SCISSOR_TL, &[pack_xy(0, 0), target_br])?;
         self.packet4(
             GRAS_SC_WINDOW_SCISSOR_TL,
             &[pack_xy(draw.scissor.x(), draw.scissor.y()), scissor_br],
@@ -622,7 +641,11 @@ impl Emitter {
             &[(draw.attributes.len() as u32) | ((draw.attributes.len() as u32) << 8)],
         )?;
         self.packet4(VFD_CNTL_1, &vs.vfd_cntl_1_6)?;
-        self.packet4(VFD_INDEX_OFFSET, &[draw.first_vertex, 0])?;
+        let vertex_offset = match draw.draw {
+            DrawCall::NonIndexed { first_vertex, .. } => first_vertex,
+            DrawCall::Indexed(indexed) => indexed.base_vertex,
+        };
+        self.packet4(VFD_INDEX_OFFSET, &[vertex_offset, 0])?;
         self.address_register(
             VFD_VERTEX_BUFFER_BASE,
             ObjectRef::External(draw.vertex),
@@ -658,10 +681,10 @@ impl Emitter {
             // direct-state payload and raises CP_ILLEGAL_INSTR_ERROR.
             let sampler = if draw.linear_sampler {
                 // clamp-to-edge, linear min/mag, no mip chain, chroma-linear
-                [0x92a, 0x40, 0x20, 0]
+                SAMPLER_CLAMP_LINEAR
             } else {
                 // clamp-to-edge, nearest min/mag, no mip chain
-                [0x920, 0x40, 0, 0]
+                SAMPLER_CLAMP_NEAREST
             };
             let state = self.texture_state_backing(texture, sampler)?;
             self.load_indirect(
@@ -684,7 +707,30 @@ impl Emitter {
             )?;
         }
         self.wait_for_idle()?;
-        self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, draw.vertex_count])?;
+        match draw.draw {
+            DrawCall::NonIndexed { vertex_count, .. } => {
+                self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, vertex_count])?;
+            }
+            DrawCall::Indexed(indexed) => {
+                let initiator = match indexed.format {
+                    // CP_DRAW_INDX_OFFSET uses the A4xx+ initiator layout:
+                    // TRIANGLE_LIST | DMA | INDEX4_SIZE_16/32_BIT.
+                    IndexFormat::Uint16 => 0x404,
+                    IndexFormat::Uint32 => 0x804,
+                };
+                self.push_word(
+                    type7(CP_DRAW_INDX_OFFSET, 7).map_err(|_| CompileError::InvalidPm4)?,
+                )?;
+                self.extend_words(&[initiator, 1, indexed.index_count, indexed.first_index])?;
+                self.address_words(
+                    ObjectRef::External(indexed.index),
+                    indexed.index_offset,
+                    indexed.index_size,
+                    Access::READ,
+                )?;
+                self.push_word(indexed.max_indices)?;
+            }
+        }
         self.submission_end()
     }
 
@@ -1170,6 +1216,26 @@ fn f32_bits(value: f32) -> u32 {
     value.to_bits()
 }
 
+/// Build the A6xx clip-space to framebuffer transform for SGFX.
+///
+/// SGFX follows the same contract as its VirGL and wgpu backends: clip-space
+/// `+Y` is the top of an upper-left-origin render target, while clip-space Z
+/// spans `[-W, +W]`.  A6xx framebuffer coordinates grow downwards, so Y must
+/// use a negative scale.  Z uses the OpenGL-style half-scale/half-offset that
+/// pairs with `GRAS_CL_CNTL.ZERO_GB_SCALE_Z = 0`.
+fn viewport_transform(area: PixelRect) -> [u32; 6] {
+    let x_scale = area.width() as f32 * 0.5;
+    let y_scale = area.height() as f32 * 0.5;
+    [
+        f32_bits(area.x() as f32 + x_scale),
+        f32_bits(x_scale),
+        f32_bits(area.y() as f32 + y_scale),
+        f32_bits(-y_scale),
+        f32_bits(0.5),
+        f32_bits(0.5),
+    ]
+}
+
 fn guardband_axis(offset: f32, scale: f32) -> u32 {
     const MAX_GUARDBAND: u32 = 0x1ff;
 
@@ -1211,7 +1277,7 @@ mod tests {
 
     use sgfx_core::ir::PixelRect;
 
-    use super::{Emitter, guardband_axis, guardband_clip_adj};
+    use super::{Emitter, guardband_axis, guardband_clip_adj, viewport_transform};
     use crate::model::{
         Access, AddressEncoding, CompileError, ObjectId, ObjectRef, SymbolicAddress,
     };
@@ -1256,5 +1322,21 @@ mod tests {
 
         let panel = PixelRect::new(0, 0, 2160, 1440).unwrap();
         assert_eq!(guardband_clip_adj(panel), 0x0005_6535);
+    }
+
+    #[test]
+    fn viewport_uses_the_sgfx_upper_left_and_negative_one_to_one_depth_contract() {
+        let area = PixelRect::new(32, 48, 640, 480).unwrap();
+        let words = viewport_transform(area);
+        let values = words.map(f32::from_bits);
+        assert_eq!(values, [352.0, 320.0, 288.0, -240.0, 0.5, 0.5]);
+
+        let map = |coordinate: f32, offset: f32, scale: f32| offset + coordinate * scale;
+        assert_eq!(map(-1.0, values[0], values[1]), 32.0);
+        assert_eq!(map(1.0, values[0], values[1]), 672.0);
+        assert_eq!(map(1.0, values[2], values[3]), 48.0);
+        assert_eq!(map(-1.0, values[2], values[3]), 528.0);
+        assert_eq!(map(-1.0, values[4], values[5]), 0.0);
+        assert_eq!(map(1.0, values[4], values[5]), 1.0);
     }
 }

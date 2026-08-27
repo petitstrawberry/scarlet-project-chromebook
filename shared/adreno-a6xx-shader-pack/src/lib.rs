@@ -251,10 +251,10 @@ pub const fn shader_meta(variant: ShaderVariant) -> ShaderMeta {
             rb_ps_output_mask: 15,
         }),
         FsVertexColor => fragment_varying(0x8150_0180, 0, &[], &[6]),
-        FsTextureRgba => fragment_varying(0x8150_0180, 1, &[0x83c2_0000], &[6]),
-        FsTextureAlphaMask => fragment_varying(0x8150_0180, 1, &[0x8202_0000], &[6]),
-        FsTextureVertexColorRgba => fragment_varying(0x8150_0200, 1, &[0x83c2_0004], &[10]),
-        FsTextureRgbIgnoreAlpha => fragment_varying(0x8150_0180, 1, &[0x81c2_0000], &[5]),
+        FsTextureRgba => fragment_varying(0x8150_0180, 1, &[0x23c2_0000], &[6]),
+        FsTextureAlphaMask => fragment_varying(0x8150_0180, 1, &[0x2202_0000], &[6]),
+        FsTextureVertexColorRgba => fragment_varying(0x8150_0200, 1, &[0x23c2_0004], &[10]),
+        FsTextureRgbIgnoreAlpha => fragment_varying(0x8150_0180, 1, &[0x21c2_0000], &[5]),
     }
 }
 
@@ -312,10 +312,13 @@ pub enum PipelineVariant {
     Stride24TextureRgba,
     Stride24TextureRgbIgnoreAlpha,
     Stride28VertexColor,
+    Stride32Solid,
+    Stride32VertexColor,
+    Stride24TextureAlphaMask,
 }
 
 impl PipelineVariant {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::Stride16Solid,
         Self::Stride16TextureRgba,
         Self::Stride16TextureAlphaMask,
@@ -326,6 +329,9 @@ impl PipelineVariant {
         Self::Stride24TextureRgba,
         Self::Stride24TextureRgbIgnoreAlpha,
         Self::Stride28VertexColor,
+        Self::Stride32Solid,
+        Self::Stride32VertexColor,
+        Self::Stride24TextureAlphaMask,
     ];
 }
 
@@ -334,9 +340,14 @@ impl PipelineVariant {
 pub struct PipelineStateMeta {
     pub stride: u32,
     pub vfd_fetch: &'static [u32],
-    pub sampler_dwords: Option<[u32; 4]>,
+    pub uses_sampler: bool,
     pub source_over: bool,
 }
+
+/// Canonical A6xx clamp-to-edge nearest sampler state accepted by the A618 subset.
+pub const SAMPLER_CLAMP_NEAREST: [u32; 4] = [0x920, 0x40, 0, 0];
+/// Canonical A6xx clamp-to-edge linear sampler state accepted by the A618 subset.
+pub const SAMPLER_CLAMP_LINEAR: [u32; 4] = [0x92a, 0x40, 0x20, 0];
 
 /// Mesa/XML-derived fixed VFD/sampler/blend state for a canonical pipeline.
 pub const fn pipeline_state_meta(variant: PipelineVariant) -> PipelineStateMeta {
@@ -349,33 +360,31 @@ pub const fn pipeline_state_meta(variant: PipelineVariant) -> PipelineStateMeta 
     const POS4_COLOR4: &[u32] = &[0xc820_0000, 1, 0xc820_0200, 1];
     const POS4_COLOR4_UV2: &[u32] = &[0xc820_0000, 1, 0xc820_0200, 1, 0xc670_0400, 1];
     match variant {
-        Stride16Solid => fixed(16, POS2, None, true),
-        Stride16TextureRgba | Stride16TextureAlphaMask => {
-            fixed(16, POS2_UV2, Some([0x920, 0x40, 0, 0]), true)
+        Stride16Solid => fixed(16, POS2, false, true),
+        Stride16TextureRgba | Stride16TextureAlphaMask => fixed(16, POS2_UV2, true, true),
+        Stride40Solid => fixed(40, POS4, false, true),
+        Stride40VertexColor => fixed(40, POS4_COLOR4, false, true),
+        Stride40TextureVertexColorRgba => fixed(40, POS4_COLOR4_UV2, true, true),
+        Stride24Solid => fixed(24, POS4, false, true),
+        Stride24TextureRgba | Stride24TextureRgbIgnoreAlpha | Stride24TextureAlphaMask => {
+            fixed(24, POS4_UV2, true, true)
         }
-        Stride40Solid => fixed(40, POS4, None, true),
-        Stride40VertexColor => fixed(40, POS4_COLOR4, None, true),
-        Stride40TextureVertexColorRgba => {
-            fixed(40, POS4_COLOR4_UV2, Some([0x920, 0x40, 0, 0]), true)
-        }
-        Stride24Solid => fixed(24, POS4, None, true),
-        Stride24TextureRgba | Stride24TextureRgbIgnoreAlpha => {
-            fixed(24, POS4_UV2, Some([0x92a, 0x40, 0x20, 0]), true)
-        }
-        Stride28VertexColor => fixed(28, POS4_COLOR3, None, false),
+        Stride28VertexColor => fixed(28, POS4_COLOR3, false, false),
+        Stride32Solid => fixed(32, POS4, false, true),
+        Stride32VertexColor => fixed(32, POS4_COLOR4, false, true),
     }
 }
 
 const fn fixed(
     stride: u32,
     vfd_fetch: &'static [u32],
-    sampler_dwords: Option<[u32; 4]>,
+    uses_sampler: bool,
     source_over: bool,
 ) -> PipelineStateMeta {
     PipelineStateMeta {
         stride,
         vfd_fetch,
-        sampler_dwords,
+        uses_sampler,
         source_over,
     }
 }
@@ -484,8 +493,41 @@ pub const fn link_meta(variant: PipelineVariant) -> LinkMeta {
             [0xffff_fffc, u32::MAX, u32::MAX, u32::MAX],
             0xff01_ff02,
         ),
+        Stride24TextureAlphaMask => link(
+            VsStride24Pos4Uv2,
+            FsTextureAlphaMask,
+            &[0x0f0a_0304],
+            &[512],
+            0x00ff_0206,
+            6,
+            2,
+            [0xffff_fffc, u32::MAX, u32::MAX, u32::MAX],
+            0xff01_ff02,
+        ),
         Stride28VertexColor => link(
             VsStride28Pos4Color3,
+            FsVertexColor,
+            &[0x0f0c_0f04],
+            &[1024],
+            0x00ff_0408,
+            8,
+            2,
+            [0xffff_fff0, u32::MAX, u32::MAX, u32::MAX],
+            0xff01_ff04,
+        ),
+        Stride32Solid => link(
+            VsStride40Pos4,
+            FsSolid,
+            &[3848],
+            &[0],
+            0x00ff_0004,
+            4,
+            1,
+            [u32::MAX; 4],
+            0xff00_ff00,
+        ),
+        Stride32VertexColor => link(
+            VsStride40Pos4Color4,
             FsVertexColor,
             &[0x0f0c_0f04],
             &[1024],
@@ -592,6 +634,23 @@ mod tests {
     }
 
     #[test]
+    fn texture_prefetch_commands_are_plain_samples() {
+        let variants = [
+            ShaderVariant::FsTextureRgba,
+            ShaderVariant::FsTextureAlphaMask,
+            ShaderVariant::FsTextureVertexColorRgba,
+            ShaderVariant::FsTextureRgbIgnoreAlpha,
+        ];
+        for variant in variants {
+            let ShaderMeta::Fragment(meta) = shader_meta(variant) else {
+                panic!("texture variant must be a fragment shader");
+            };
+            assert_eq!(meta.initial_tex_load_cmd.len(), 1);
+            assert_eq!(meta.initial_tex_load_cmd[0] >> 29 & 0x7, 1);
+        }
+    }
+
+    #[test]
     fn typed_metadata_is_chained_to_schema_v2_generated_state() {
         let generated = include_str!("../artifacts/a618/packed-state.json");
         assert!(generated.contains(MESA_METADATA_SHA256));
@@ -685,6 +744,9 @@ mod tests {
             "stride24_texture_rgba",
             "stride24_texture_rgb_ignore_alpha",
             "stride28_vertex_color",
+            "stride40_solid",
+            "stride40_vertex_color",
+            "stride24_texture_rgba",
         ];
         for (variant, name) in PipelineVariant::ALL.into_iter().zip(link_names) {
             let generated = object(object(generated, "links"), name);
@@ -706,14 +768,10 @@ mod tests {
             );
             assert_eq!(meta.vpc_ps_cntl, number(generated, "vpc_ps_cntl"));
         }
-        assert_eq!(
-            pipeline_state_meta(PipelineVariant::Stride16TextureRgba).sampler_dwords,
-            Some([0x920, 0x40, 0, 0])
-        );
-        assert_eq!(
-            pipeline_state_meta(PipelineVariant::Stride24TextureRgba).sampler_dwords,
-            Some([0x92a, 0x40, 0x20, 0])
-        );
+        assert!(pipeline_state_meta(PipelineVariant::Stride16TextureRgba).uses_sampler);
+        assert!(pipeline_state_meta(PipelineVariant::Stride24TextureRgba).uses_sampler);
+        assert_eq!(SAMPLER_CLAMP_NEAREST, [0x920, 0x40, 0, 0]);
+        assert_eq!(SAMPLER_CLAMP_LINEAR, [0x92a, 0x40, 0x20, 0]);
         assert_eq!(PACKED_STATE_SHA256.len(), 64);
     }
 }

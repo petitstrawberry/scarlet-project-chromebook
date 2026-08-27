@@ -57,7 +57,11 @@ if [[ "$image_kernel_hash" != "$kernel_hash" ]]; then
   exit 1
 fi
 
-for binary in sgfx_probe sws sgfx_cube sgfx_texture sgfx_showcase; do
+for binary in \
+  sgfx_probe taskbar terminal ui-demo ui-benchmark settings \
+  sws clock files launcher notepad task_manager ui-sgfx-showcase \
+  sgfx_cube sgfx_texture sgfx_showcase
+do
   staged_binary="$staging_dir/rootfs/system/scarlet/bin/$binary"
   staged_hash=$(shasum -a 256 "$staged_binary" | awk '{print $1}')
   image_hash=$(debugfs -R "cat /system/scarlet/bin/$binary" "$rootfs_image" 2>/dev/null | shasum -a 256 | awk '{print $1}')

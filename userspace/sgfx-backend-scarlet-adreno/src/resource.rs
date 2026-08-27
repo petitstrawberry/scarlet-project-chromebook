@@ -115,6 +115,8 @@ pub(crate) struct RawBuffer {
     pub(crate) raw: GpuBuffer,
     pub(crate) attachment_token: u64,
     pub(crate) logical_size: u64,
+    mapping_address: usize,
+    mapping_len: usize,
 }
 
 impl RawBuffer {
@@ -129,15 +131,35 @@ impl RawBuffer {
         if !raw.cpu_visible() || raw.allocated_size() < logical_size {
             return Err(HandleError::Unsupported);
         }
-        let attachment_token = context.raw.attach_buffer(&raw)?;
+        let mapping_len = usize::try_from(raw.allocated_size())
+            .map_err(|_| HandleError::InvalidParameter)?;
+        let mapping = raw.as_handle().as_memory_mapping()?;
+        let mapping_address = mapping.mmap(
+            0,
+            mapping_len,
+            prot::READ | prot::WRITE,
+            flags::SHARED,
+            0,
+        )
+        .map_err(|_| HandleError::SystemError(-1))?;
+        let attachment_token = match context.raw.attach_buffer(&raw) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = MemoryMappingOps::munmap(mapping_address, mapping_len);
+                return Err(error);
+            }
+        };
         if attachment_token == 0 {
             let _ = context.raw.detach_buffer(&raw);
+            let _ = MemoryMappingOps::munmap(mapping_address, mapping_len);
             return Err(HandleError::InvalidParameter);
         }
         Ok(Self {
             raw,
             attachment_token,
             logical_size,
+            mapping_address,
+            mapping_len,
         })
     }
 
@@ -149,26 +171,21 @@ impl RawBuffer {
         if bytes.is_empty() || end > self.logical_size {
             return Err(HandleError::InvalidParameter);
         }
-        let mapping_len = usize::try_from(self.raw.allocated_size())
-            .map_err(|_| HandleError::InvalidParameter)?;
         let destination_offset =
             usize::try_from(offset).map_err(|_| HandleError::InvalidParameter)?;
-        let mapping = self.raw.as_handle().as_memory_mapping()?;
-        let address = mapping
-            .mmap(0, mapping_len, prot::READ | prot::WRITE, flags::SHARED, 0)
-            .map_err(|_| HandleError::SystemError(-1))?;
 
-        // SAFETY: the kernel returned a writable mapping of `mapping_len`
-        // bytes. The checked logical range above is no larger than the backing
-        // allocation and the source slice remains valid for this copy.
+        // SAFETY: `create` retains a writable mapping of `mapping_len` bytes
+        // for the complete RawBuffer lifetime. The checked logical range above
+        // is no larger than that backing allocation and the source slice
+        // remains valid for this copy.
         unsafe {
             ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                (address as *mut u8).add(destination_offset),
+                (self.mapping_address as *mut u8).add(destination_offset),
                 bytes.len(),
             );
         }
-        MemoryMappingOps::munmap(address, mapping_len).map_err(|_| HandleError::SystemError(-1))
+        Ok(())
     }
 
     pub(crate) fn read_u32(&self, offset: u64) -> HandleResult<u32> {
@@ -178,24 +195,28 @@ impl RawBuffer {
         if !offset.is_multiple_of(core::mem::align_of::<u32>() as u64) || end > self.logical_size {
             return Err(HandleError::InvalidParameter);
         }
-        let mapping_len = usize::try_from(self.raw.allocated_size())
-            .map_err(|_| HandleError::InvalidParameter)?;
         let source_offset = usize::try_from(offset).map_err(|_| HandleError::InvalidParameter)?;
-        let mapping = self.raw.as_handle().as_memory_mapping()?;
-        let address = mapping
-            .mmap(0, mapping_len, prot::READ, flags::SHARED, 0)
-            .map_err(|_| HandleError::SystemError(-1))?;
 
-        // SAFETY: the kernel returned a readable mapping of `mapping_len`
-        // bytes, the checked range lies within the backing allocation, and
-        // generated CCU sequence objects are at least four-byte aligned.
+        // SAFETY: the retained mapping is readable, the checked range lies
+        // within the backing allocation, and generated CCU sequence objects
+        // are at least four-byte aligned.
         let value = unsafe {
             u32::from_le(ptr::read_volatile(
-                (address as *const u8).add(source_offset).cast::<u32>(),
+                (self.mapping_address as *const u8)
+                    .add(source_offset)
+                    .cast::<u32>(),
             ))
         };
-        MemoryMappingOps::munmap(address, mapping_len).map_err(|_| HandleError::SystemError(-1))?;
         Ok(value)
+    }
+}
+
+impl Drop for RawBuffer {
+    fn drop(&mut self) {
+        // The mapping must be retired before the capability-backed allocation
+        // is dropped. Teardown cannot report an error, and the kernel still
+        // revokes the address space when the process exits.
+        let _ = MemoryMappingOps::munmap(self.mapping_address, self.mapping_len);
     }
 }
 
@@ -227,15 +248,7 @@ impl ContextResources {
         image: Rc<Image>,
     ) -> Result<(), IrSubmitError> {
         let reference = self.resources.texture_ref(texture)?;
-        let descriptor = self.resources.texture(reference)?;
-        if image.raw.context_id != self.context_id() {
-            return Err(IrSubmitError::ContextMismatch);
-        }
-        if descriptor.extent().width() != image.width
-            || descriptor.extent().height() != image.height
-        {
-            return Err(IrSubmitError::TargetExtentMismatch);
-        }
+        self.validate_present_image(reference, &image)?;
         let slot = reference.slot();
         if self
             .images
@@ -254,6 +267,28 @@ impl ContextResources {
             return Err(IrSubmitError::ImageAlreadyMapped);
         }
         self.images[slot] = Some(Rc::clone(&image.raw));
+        Ok(())
+    }
+
+    fn validate_present_image(
+        &self,
+        reference: ir::TextureRef<'_>,
+        image: &Image,
+    ) -> Result<(), IrSubmitError> {
+        let descriptor = self.resources.texture(reference)?;
+        if !descriptor.usage().contains(ir::TextureUsage::PRESENT) {
+            return Err(IrSubmitError::Unsupported(
+                crate::UnsupportedIrFeature::ResourceState,
+            ));
+        }
+        if image.raw.context_id != self.context_id() {
+            return Err(IrSubmitError::ContextMismatch);
+        }
+        if descriptor.extent().width() != image.width
+            || descriptor.extent().height() != image.height
+        {
+            return Err(IrSubmitError::TargetExtentMismatch);
+        }
         Ok(())
     }
 

@@ -242,7 +242,10 @@ impl Context {
     ///
     /// # Returns
     ///
-    /// A session owning its queue, cache, context, and mapped images.
+    /// A session owning its queue, cache, context, and mapped images. Each
+    /// logical target has one stable physical image for the session lifetime;
+    /// callers implement buffering with multiple target identities, matching
+    /// the VirGL mapped-target contract and shared-image registration model.
     pub fn create_mapped_target_session(
         &self,
         resources: Rc<ir::ResourceTable>,
@@ -404,7 +407,7 @@ impl MappedTargetSession {
         self.resources.release_imported_image(texture)
     }
 
-    /// Borrow the image mapped to a logical presentation target.
+    /// Borrow the stable image mapped to a logical presentation target.
     pub fn image(&self, target: ir::TextureId) -> Result<ImageRef<'_>, IrSubmitError> {
         self.images
             .iter()
@@ -467,8 +470,13 @@ impl sgfx_core::backend::CommandExecutor for Executor<'_> {
         &mut self,
         commands: &ir::CommandBuffer<'r, 'data>,
     ) -> Result<(), Self::Error> {
-        self.resources
-            .execute(&self.context.inner, self.queue, commands)
+        let result = self
+            .resources
+            .execute(&self.context.inner, self.queue, commands);
+        if let Err(error) = &result {
+            std::println!("[a618-userspace] command execution failed: {:?}", error);
+        }
+        result
     }
 }
 

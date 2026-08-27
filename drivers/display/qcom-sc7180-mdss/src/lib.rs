@@ -349,10 +349,20 @@ impl Sc7180DisplayEngine {
         // front buffer back to the compositor before that boundary.
         let start = time::current_time();
         while self.dpu.pending_flush() != 0 {
-            if time::current_time().saturating_sub(start) >= PRESENT_TIMEOUT_US {
+            let elapsed = time::current_time().saturating_sub(start);
+            if elapsed >= PRESENT_TIMEOUT_US {
                 return Err("qcom-sc7180-mdss: timeout waiting for page flip");
             }
-            core::hint::spin_loop();
+            if elapsed < 50 {
+                core::hint::spin_loop();
+            } else if let Some(task) = scarlet::task::mytask() {
+                // The flip is vblank-paced and can be almost one frame away.
+                // Yield the submitting task instead of burning that interval
+                // in the kernel with preemption otherwise enabled.
+                scarlet::sched::scheduler::schedule(task.get_trapframe());
+            } else {
+                core::hint::spin_loop();
+            }
         }
         Ok(())
     }
@@ -363,16 +373,33 @@ pub struct Sc7180GraphicsDevice {
     timing: DisplayTiming,
     scanout: [ContiguousPages; SCANOUT_BUFFER_COUNT],
     scanout_dma: [DmaMapping; SCANOUT_BUFFER_COUNT],
-    dma_context: DmaContext,
-    gpu_scanout: Mutex<Option<GpuScanout>>,
+    gpu_staging: Mutex<GpuStagingState>,
+    gpu_present_count: AtomicUsize,
     front: AtomicUsize,
     present_lock: Mutex<()>,
     engine: Sc7180DisplayEngine,
 }
 
-struct GpuScanout {
-    backing: GpuLinearDisplayBacking,
-    mapping: DmaMapping,
+struct GpuStagingState {
+    source: Option<GpuLinearDisplayBacking>,
+    initialized: [bool; SCANOUT_BUFFER_COUNT],
+    previous_damage: Option<DisplayRegion>,
+}
+
+impl GpuStagingState {
+    const fn new() -> Self {
+        Self {
+            source: None,
+            initialized: [false; SCANOUT_BUFFER_COUNT],
+            previous_damage: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.source = None;
+        self.initialized.fill(false);
+        self.previous_damage = None;
+    }
 }
 
 impl Sc7180GraphicsDevice {
@@ -453,22 +480,83 @@ impl Sc7180GraphicsDevice {
         Ok(backing)
     }
 
-    fn map_gpu_scanout(
+    fn clamp_region(&self, region: DisplayRegion) -> Option<DisplayRegion> {
+        let x = region.x.min(self.config.width);
+        let y = region.y.min(self.config.height);
+        let width = region.width.min(self.config.width.saturating_sub(x));
+        let height = region.height.min(self.config.height.saturating_sub(y));
+        (width != 0 && height != 0).then_some(DisplayRegion::new(x, y, width, height))
+    }
+
+    fn region_contains(outer: DisplayRegion, inner: DisplayRegion) -> bool {
+        outer.x <= inner.x
+            && outer.y <= inner.y
+            && outer.x.saturating_add(outer.width) >= inner.x.saturating_add(inner.width)
+            && outer.y.saturating_add(outer.height) >= inner.y.saturating_add(inner.height)
+    }
+
+    fn copy_gpu_region_to_scanout(
         &self,
         backing: &GpuLinearDisplayBacking,
-    ) -> Result<DmaMapping, &'static str> {
-        let length = usize::try_from(backing.allocation_size())
-            .map_err(|_| "qcom-sc7180-mdss: GPU scanout length exceeds usize")?;
-        let mapping = self
-            .dma_context
-            .map_phys_owned(
-                backing.physical_addr(),
-                length,
-                IommuMapFlags::READ | IommuMapFlags::COHERENT,
-            )
-            .map_err(|_| "qcom-sc7180-mdss: failed to map GPU scanout for DPU DMA")?;
-        dpu_dma_address(&mapping)?;
-        Ok(mapping)
+        destination: &ContiguousPages,
+        region: DisplayRegion,
+    ) -> Result<(), &'static str> {
+        let region = self
+            .clamp_region(region)
+            .ok_or("qcom-sc7180-mdss: GPU damage region is empty")?;
+        let bytes_per_pixel = self.config.format.bytes_per_pixel();
+        let source_stride = backing.stride() as usize;
+        let destination_stride = self.config.stride as usize;
+        let x_bytes = (region.x as usize)
+            .checked_mul(bytes_per_pixel)
+            .ok_or("qcom-sc7180-mdss: GPU damage x offset overflows")?;
+        let row_bytes = (region.width as usize)
+            .checked_mul(bytes_per_pixel)
+            .ok_or("qcom-sc7180-mdss: GPU damage row size overflows")?;
+        let first_source_offset = (region.y as usize)
+            .checked_mul(source_stride)
+            .and_then(|offset| offset.checked_add(x_bytes))
+            .ok_or("qcom-sc7180-mdss: GPU source offset overflows")?;
+        let last_source_end = (region.y as usize + region.height as usize - 1)
+            .checked_mul(source_stride)
+            .and_then(|offset| offset.checked_add(x_bytes))
+            .and_then(|offset| offset.checked_add(row_bytes))
+            .ok_or("qcom-sc7180-mdss: GPU source range overflows")?;
+        let source_allocation_size = usize::try_from(backing.allocation_size())
+            .map_err(|_| "qcom-sc7180-mdss: GPU source allocation exceeds usize")?;
+        if last_source_end > source_allocation_size {
+            return Err("qcom-sc7180-mdss: GPU source damage exceeds backing");
+        }
+
+        let source_base = vm::phys_to_virt(backing.physical_addr());
+        arch::invalidate_dcache_to_poc_range(
+            source_base + first_source_offset,
+            last_source_end - first_source_offset,
+        );
+        for row in 0..region.height as usize {
+            let source_offset = (region.y as usize + row)
+                .checked_mul(source_stride)
+                .and_then(|offset| offset.checked_add(x_bytes))
+                .ok_or("qcom-sc7180-mdss: GPU source row overflows")?;
+            let destination_offset = (region.y as usize + row)
+                .checked_mul(destination_stride)
+                .and_then(|offset| offset.checked_add(x_bytes))
+                .ok_or("qcom-sc7180-mdss: GPU destination row overflows")?;
+            if destination_offset.saturating_add(row_bytes) > self.config.size() {
+                return Err("qcom-sc7180-mdss: GPU destination damage exceeds scanout");
+            }
+            // SAFETY: the source is a retained, validated linear GPU backing;
+            // the destination is the non-visible owned scanout; both row
+            // ranges were checked against their complete allocations.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    (source_base + source_offset) as *const u8,
+                    (destination.as_vaddr() + destination_offset) as *mut u8,
+                    row_bytes,
+                );
+            }
+        }
+        self.clean_regions(destination, &[region])
     }
 }
 
@@ -523,7 +611,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         self.clean_regions(&self.scanout[back], &[region])?;
         self.engine
             .present(dpu_dma_address(&self.scanout_dma[back])?)?;
-        self.gpu_scanout.lock().take();
+        self.gpu_staging.lock().reset();
         self.front.store(back, Ordering::Release);
         Ok(())
     }
@@ -571,7 +659,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
 
         self.clean_regions(scanout, regions)?;
         self.engine.present(dpu_dma_address(scanout_dma)?)?;
-        self.gpu_scanout.lock().take();
+        self.gpu_staging.lock().reset();
         self.front.store(index, Ordering::Release);
         Ok(())
     }
@@ -579,26 +667,87 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
     fn present_gpu_resource_region(
         &self,
         resource: GpuDisplayResource,
-        _region: DisplayRegion,
+        region: DisplayRegion,
     ) -> Result<(), &'static str> {
         let backing = self.validate_gpu_backing(resource)?;
+        let damage = self
+            .clamp_region(region)
+            .ok_or("qcom-sc7180-mdss: GPU damage region is empty")?;
         let _present = self.present_lock.lock();
-        let mut gpu_scanout = self.gpu_scanout.lock();
-        if let Some(active) = gpu_scanout.as_mut()
-            && active.backing == backing
+        let back = self.front.load(Ordering::Acquire) ^ 1;
+        let mut staging = self.gpu_staging.lock();
+        if staging
+            .source
+            .as_ref()
+            .is_none_or(|source| source != &backing)
         {
-            // Refresh the opaque producer owner even when the physical layout
-            // and existing DPU mapping can be reused.
-            active.backing = backing;
-            arch::io_wmb();
-            self.engine.present(dpu_dma_address(&active.mapping)?)?;
-            return Ok(());
+            staging.reset();
+            staging.source = Some(backing.clone());
         }
 
-        let mapping = self.map_gpu_scanout(&backing)?;
-        arch::io_wmb();
-        self.engine.present(dpu_dma_address(&mapping)?)?;
-        *gpu_scanout = Some(GpuScanout { backing, mapping });
+        // Each scanout is reused two presents later. If it already contains a
+        // staged frame, bring it forward by copying both the damage from the
+        // skipped frame and this frame. Keep disjoint regions separate: using
+        // their bounding box turns an 80-pixel taskbar update followed by one
+        // small window update into a multi-megabyte full-width CPU copy.
+        let copy_regions = if staging.initialized[back] {
+            match staging.previous_damage {
+                Some(previous) if Self::region_contains(previous, damage) => [Some(previous), None],
+                Some(previous) if Self::region_contains(damage, previous) => [Some(damage), None],
+                Some(previous) => [Some(previous), Some(damage)],
+                None => [Some(damage), None],
+            }
+        } else {
+            [Some(DisplayRegion::full(&self.config)), None]
+        };
+        #[cfg(debug_assertions)]
+        let copy_start = time::current_time();
+        #[cfg(debug_assertions)]
+        let mut copied_pixels = 0u64;
+        #[cfg(debug_assertions)]
+        let mut copied_regions = 0usize;
+        for copy_region in copy_regions.into_iter().flatten() {
+            self.copy_gpu_region_to_scanout(&backing, &self.scanout[back], copy_region)?;
+            #[cfg(debug_assertions)]
+            {
+                copied_pixels = copied_pixels.saturating_add(
+                    u64::from(copy_region.width).saturating_mul(u64::from(copy_region.height)),
+                );
+                copied_regions += 1;
+            }
+        }
+        #[cfg(debug_assertions)]
+        let copy_us = time::current_time().saturating_sub(copy_start);
+        #[cfg(debug_assertions)]
+        let flip_start = time::current_time();
+        self.engine
+            .present(dpu_dma_address(&self.scanout_dma[back])?)?;
+        #[cfg(debug_assertions)]
+        let flip_us = time::current_time().saturating_sub(flip_start);
+        staging.source = Some(backing);
+        staging.initialized[back] = true;
+        staging.previous_damage = Some(damage);
+        self.front.store(back, Ordering::Release);
+
+        #[cfg(debug_assertions)]
+        {
+            let sequence = self.gpu_present_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if sequence <= 4 || sequence.is_power_of_two() {
+                println!(
+                    "[qcom-sc7180-mdss] GPU stage seq={} back={} regions={} pixels={} damage={}x{}+{},{} copy_us={} flip_us={}",
+                    sequence,
+                    back,
+                    copied_regions,
+                    copied_pixels,
+                    damage.width,
+                    damage.height,
+                    damage.x,
+                    damage.y,
+                    copy_us,
+                    flip_us,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -942,8 +1091,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         timing,
         scanout,
         scanout_dma,
-        dma_context,
-        gpu_scanout: Mutex::new(None),
+        gpu_staging: Mutex::new(GpuStagingState::new()),
+        gpu_present_count: AtomicUsize::new(0),
         front: AtomicUsize::new(0),
         present_lock: Mutex::new(()),
         engine,

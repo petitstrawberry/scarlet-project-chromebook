@@ -113,6 +113,14 @@ impl DmaAllocation {
         arch::clean_dcache_to_poc_range(self.vaddr(), self.allocation_size());
     }
 
+    pub(crate) fn clean_prefix_for_device(&self, size: usize) -> Result<(), &'static str> {
+        if size == 0 || size > self.requested_size {
+            return Err("qcom-adreno-a618: DMA cache-clean range is invalid");
+        }
+        arch::clean_dcache_to_poc_range(self.vaddr(), size);
+        Ok(())
+    }
+
     pub(crate) fn invalidate_from_device(&self) {
         arch::invalidate_dcache_to_poc_range(self.vaddr(), self.allocation_size());
     }

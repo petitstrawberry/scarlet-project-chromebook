@@ -5,11 +5,11 @@ use alloc::{vec, vec::Vec};
 use adreno_a6xx_shader_pack::PipelineVariant;
 use sgfx_core::ir::{
     AddressMode, BlendState, BufferUsage, CullMode, DepthLoadOp, DrawUniforms, FilterMode,
-    FragmentProgram, LoadOp, PixelRect, SamplerDesc, TextureFormat, TextureSampleMode,
+    FragmentProgram, IndexFormat, LoadOp, PixelRect, SamplerDesc, TextureFormat, TextureSampleMode,
     TextureUsage,
 };
 
-use crate::emit::{DrawState, Emitter, Surface};
+use crate::emit::{DrawCall, DrawState, Emitter, IndexedDraw, Surface};
 use crate::model::{
     Chip, CompileError, CompileInput, ImageMeta, ImageModifier, ObjectId, Operation, PipelineId,
     PipelineMeta, RelocatablePm4, ResourceKind, ResourceMeta,
@@ -24,6 +24,13 @@ struct BufferBinding {
 }
 
 #[derive(Clone, Copy)]
+struct IndexBinding {
+    object: ObjectId,
+    offset: u64,
+    format: IndexFormat,
+}
+
+#[derive(Clone, Copy)]
 struct PassState {
     target: ObjectId,
     area: PixelRect,
@@ -34,7 +41,7 @@ struct State<'a> {
     pass: Option<PassState>,
     pipeline: Option<&'a PipelineMeta>,
     vertex: Option<BufferBinding>,
-    index: Option<BufferBinding>,
+    index: Option<IndexBinding>,
     texture: Option<ObjectId>,
     sampler: Option<SamplerDesc>,
     uniforms: Option<DrawUniforms>,
@@ -189,16 +196,21 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
                     offset: *offset,
                 });
             }
-            Operation::SetIndexBuffer { buffer, offset, .. } => {
+            Operation::SetIndexBuffer {
+                buffer,
+                offset,
+                format,
+            } => {
                 require_inside_pass(&state)?;
                 let resource = find_resource(input.resources, *buffer)?;
                 require_buffer_usage(resource, BufferUsage::INDEX)?;
-                if *offset >= resource.size {
+                if *offset >= resource.size || *offset % format.byte_size() != 0 {
                     return Err(CompileError::OutOfBounds);
                 }
-                state.index = Some(BufferBinding {
+                state.index = Some(IndexBinding {
                     object: *buffer,
                     offset: *offset,
+                    format: *format,
                 });
             }
             Operation::SetTexture(texture) => {
@@ -229,11 +241,27 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
             Operation::Draw {
                 vertex_count,
                 first_vertex,
-            } => emit_draw(&mut emitter, input, &state, *vertex_count, *first_vertex)?,
-            Operation::DrawIndexed { .. } => {
-                require_draw_state(&state)?;
-                return Err(CompileError::UnsupportedFeature);
-            }
+            } => emit_draw(
+                &mut emitter,
+                input,
+                &state,
+                DrawCall::NonIndexed {
+                    vertex_count: *vertex_count,
+                    first_vertex: *first_vertex,
+                },
+            )?,
+            Operation::DrawIndexed {
+                index_count,
+                first_index,
+                base_vertex,
+            } => emit_draw_indexed(
+                &mut emitter,
+                input,
+                &state,
+                *index_count,
+                *first_index,
+                *base_vertex,
+            )?,
         }
     }
 
@@ -442,14 +470,30 @@ fn emit_draw(
     emitter: &mut Emitter,
     input: CompileInput<'_>,
     state: &State<'_>,
-    vertex_count: u32,
-    first_vertex: u32,
+    draw: DrawCall,
 ) -> Result<(), CompileError> {
     let (pass, pipeline, vertex, uniforms) = require_draw_state(state)?;
-    if vertex_count == 0
+    let (vertex_size, draw_count) = match draw {
+        DrawCall::NonIndexed {
+            vertex_count,
+            first_vertex,
+        } => {
+            let end_vertex = first_vertex
+                .checked_add(vertex_count)
+                .ok_or(CompileError::Overflow)?;
+            (
+                u64::from(end_vertex)
+                    .checked_mul(u64::from(pipeline.descriptor.vertex_buffer().stride()))
+                    .ok_or(CompileError::Overflow)?,
+                vertex_count,
+            )
+        }
+        DrawCall::Indexed(indexed) => (indexed.vertex_size, indexed.index_count),
+    };
+    if draw_count == 0
         || pass.has_depth
         || pipeline.descriptor.depth_state().is_some()
-        || !vertex_count.is_multiple_of(3)
+        || !draw_count.is_multiple_of(3)
     {
         return Err(CompileError::UnsupportedFeature);
     }
@@ -462,17 +506,12 @@ fn emit_draw(
     if pipeline.descriptor.target_format() != TextureFormat::Bgra8Unorm {
         return Err(CompileError::InvalidResource);
     }
-    validate_sample_state(input.resources, state, pipeline)?;
+    let linear_sampler = validate_sample_state(input.resources, state, pipeline)?;
     let vertex_resource = find_resource(input.resources, vertex.object)?;
     require_buffer_usage(vertex_resource, BufferUsage::VERTEX)?;
     let stride = pipeline.descriptor.vertex_buffer().stride();
-    let end_vertex = first_vertex
-        .checked_add(vertex_count)
-        .ok_or(CompileError::Overflow)?;
-    let required_size = u64::from(end_vertex)
-        .checked_mul(u64::from(stride))
-        .ok_or(CompileError::Overflow)?;
-    validate_range(vertex_resource.size, vertex.offset, required_size)?;
+    validate_range(vertex_resource.size, vertex.offset, vertex_size)?;
+    u32::try_from(vertex_size).map_err(|_| CompileError::OutOfBounds)?;
     if state
         .scissor
         .is_some_and(|scissor| !rect_within(scissor, pass.area))
@@ -523,17 +562,85 @@ fn emit_draw(
         scissor: state.scissor.unwrap_or(pass.area),
         vertex: vertex.object,
         vertex_offset: vertex.offset,
-        vertex_size: required_size,
+        vertex_size,
         stride,
         attributes,
         uniforms: uniform_words,
         texture,
-        linear_sampler: stride == 24,
+        linear_sampler,
         source_over,
         cull,
-        first_vertex,
-        vertex_count,
+        draw,
     })
+}
+
+fn emit_draw_indexed(
+    emitter: &mut Emitter,
+    input: CompileInput<'_>,
+    state: &State<'_>,
+    index_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+) -> Result<(), CompileError> {
+    let (_, pipeline, vertex, _) = require_draw_state(state)?;
+    let index = state.index.ok_or(CompileError::InvalidState)?;
+    if base_vertex < 0 {
+        // Without inspecting untrusted index contents, a negative base could
+        // address bytes before the authorized VFD buffer base.  Keep the
+        // initial A618 dialect safely bounded to non-negative base vertices.
+        return Err(CompileError::UnsupportedFeature);
+    }
+    let index_resource = find_resource(input.resources, index.object)?;
+    require_buffer_usage(index_resource, BufferUsage::INDEX)?;
+    let index_element_size = index.format.byte_size();
+    let available_index_bytes = index_resource
+        .size
+        .checked_sub(index.offset)
+        .ok_or(CompileError::OutOfBounds)?;
+    let available_indices = available_index_bytes / index_element_size;
+    let max_indices = u32::try_from(available_indices).map_err(|_| CompileError::OutOfBounds)?;
+    let end_index = first_index
+        .checked_add(index_count)
+        .ok_or(CompileError::Overflow)?;
+    if index_count == 0 || end_index > max_indices {
+        return Err(CompileError::OutOfBounds);
+    }
+    let index_size = u64::from(max_indices)
+        .checked_mul(index_element_size)
+        .ok_or(CompileError::Overflow)?;
+
+    let vertex_resource = find_resource(input.resources, vertex.object)?;
+    require_buffer_usage(vertex_resource, BufferUsage::VERTEX)?;
+    let vertex_size = vertex_resource
+        .size
+        .checked_sub(vertex.offset)
+        .ok_or(CompileError::OutOfBounds)?;
+    let stride = u64::from(pipeline.descriptor.vertex_buffer().stride());
+    let base_vertex = u32::try_from(base_vertex).map_err(|_| CompileError::UnsupportedFeature)?;
+    let minimum_vertex_bytes = u64::from(base_vertex)
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or(CompileError::Overflow)?;
+    if minimum_vertex_bytes > vertex_size {
+        return Err(CompileError::OutOfBounds);
+    }
+
+    emit_draw(
+        emitter,
+        input,
+        state,
+        DrawCall::Indexed(IndexedDraw {
+            index: index.object,
+            index_offset: index.offset,
+            index_size,
+            format: index.format,
+            index_count,
+            first_index,
+            base_vertex,
+            max_indices,
+            vertex_size,
+        }),
+    )
 }
 
 fn pipeline_variant(
@@ -552,7 +659,10 @@ fn pipeline_variant(
             (24, Solid) => PipelineVariant::Stride24Solid,
             (24, Texture(Rgba)) => PipelineVariant::Stride24TextureRgba,
             (24, Texture(RgbIgnoreAlpha)) => PipelineVariant::Stride24TextureRgbIgnoreAlpha,
+            (24, Texture(AlphaMask)) => PipelineVariant::Stride24TextureAlphaMask,
             (28, VertexColor) => PipelineVariant::Stride28VertexColor,
+            (32, Solid) => PipelineVariant::Stride32Solid,
+            (32, VertexColor) => PipelineVariant::Stride32VertexColor,
             _ => return Err(CompileError::UnsupportedFeature),
         },
     )
@@ -571,9 +681,12 @@ fn draw_fixed_state(
     let attributes = match (descriptor.vertex_buffer().stride(), descriptor.fragment()) {
         (16, FragmentProgram::Solid) => POS2,
         (16, _) => POS2_UV2,
-        (24, FragmentProgram::Solid) | (40, FragmentProgram::Solid) => POS4,
+        (24, FragmentProgram::Solid)
+        | (32, FragmentProgram::Solid)
+        | (40, FragmentProgram::Solid) => POS4,
         (24, _) => POS4_UV2,
         (28, _) => POS4_COLOR3,
+        (32, FragmentProgram::VertexColor) => POS4_COLOR4,
         (40, FragmentProgram::VertexColor) => POS4_COLOR4,
         (40, _) => POS4_COLOR4_UV2,
         _ => return Err(CompileError::UnsupportedFeature),
@@ -588,21 +701,15 @@ fn validate_sample_state(
     resources: &[ResourceMeta],
     state: &State<'_>,
     pipeline: &PipelineMeta,
-) -> Result<(), CompileError> {
+) -> Result<bool, CompileError> {
     let fragment = pipeline.descriptor.fragment();
     let sample_mode = match fragment {
-        FragmentProgram::Solid | FragmentProgram::VertexColor => return Ok(()),
+        FragmentProgram::Solid | FragmentProgram::VertexColor => return Ok(false),
         FragmentProgram::Texture(mode) | FragmentProgram::TextureVertexColor(mode) => mode,
     };
     let texture = state.texture.ok_or(CompileError::InvalidState)?;
     let sampler = state.sampler.ok_or(CompileError::InvalidState)?;
-    let expected_filter = if pipeline.descriptor.vertex_buffer().stride() == 24 {
-        FilterMode::Linear
-    } else {
-        FilterMode::Nearest
-    };
-    if sampler.min_filter() != expected_filter
-        || sampler.mag_filter() != expected_filter
+    if sampler.min_filter() != sampler.mag_filter()
         || sampler.address_u() != AddressMode::ClampToEdge
         || sampler.address_v() != AddressMode::ClampToEdge
     {
@@ -624,7 +731,7 @@ fn validate_sample_state(
     {
         return Err(CompileError::InvalidResource);
     }
-    Ok(())
+    Ok(sampler.min_filter() == FilterMode::Linear)
 }
 
 fn emit_texture_upload(
@@ -733,7 +840,7 @@ fn validate_pipeline_descriptor(pipeline: &PipelineMeta) -> Result<(), CompileEr
     if descriptor.target_format() != TextureFormat::Bgra8Unorm
         || descriptor.topology() != PrimitiveTopology::TriangleList
         || descriptor.depth_state().is_some()
-        || !matches!(descriptor.vertex_buffer().stride(), 16 | 24 | 28 | 40)
+        || !matches!(descriptor.vertex_buffer().stride(), 16 | 24 | 28 | 32 | 40)
     {
         return Err(CompileError::UnsupportedFeature);
     }
@@ -763,7 +870,11 @@ fn validate_pipeline_descriptor(pipeline: &PipelineMeta) -> Result<(), CompileEr
         (24, FragmentProgram::Solid) => find(0) == Some((VertexFormat::Float32x4, 0)),
         (
             24,
-            FragmentProgram::Texture(TextureSampleMode::Rgba | TextureSampleMode::RgbIgnoreAlpha),
+            FragmentProgram::Texture(
+                TextureSampleMode::Rgba
+                | TextureSampleMode::RgbIgnoreAlpha
+                | TextureSampleMode::AlphaMask,
+            ),
         ) => {
             find(0) == Some((VertexFormat::Float32x4, 0))
                 && find(1) == Some((VertexFormat::Float32x2, 16))
@@ -772,10 +883,15 @@ fn validate_pipeline_descriptor(pipeline: &PipelineMeta) -> Result<(), CompileEr
             find(0) == Some((VertexFormat::Float32x4, 0))
                 && find(1) == Some((VertexFormat::Float32x3, 16))
         }
+        (32, FragmentProgram::Solid) => find(0) == Some((VertexFormat::Float32x4, 0)),
+        (32, FragmentProgram::VertexColor) => {
+            find(0) == Some((VertexFormat::Float32x4, 0))
+                && find(1) == Some((VertexFormat::Float32x4, 16))
+        }
         _ => false,
     };
     let fixed_state_ok = match descriptor.vertex_buffer().stride() {
-        16 | 24 => {
+        16 | 24 | 32 => {
             descriptor.blend() == BlendState::SOURCE_OVER_STRAIGHT_ALPHA
                 && descriptor.raster().cull_mode() == CullMode::None
                 && descriptor.raster().front_face() == FrontFace::CounterClockwise

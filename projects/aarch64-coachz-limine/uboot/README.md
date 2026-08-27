@@ -42,12 +42,30 @@ then use the documented Depthcharge altfw flow:
 
 ```sh
 flashrom -r bios.bin
+cat > ubootfw.txt <<'EOF'
+0;uboot;uboot;U-Boot default entry
+1;uboot;uboot;U-Boot menu entry
+EOF
+cbfstool bios.bin remove -r RW_LEGACY -n altfw/list || true
+cbfstool bios.bin add -r RW_LEGACY -n altfw/list -f ubootfw.txt -t raw
 cbfstool bios.bin add-payload -r RW_LEGACY -c lzma -n uboot \
   -f u-boot.elf
 flashrom -w bios.bin -i RW_LEGACY
 crossystem dev_boot_altfw=1
 crossystem dev_default_boot=altfw
 ```
+
+The `altfw/list` entry with sequence number `0` is required for the timeout
+path: Depthcharge uses it as the default alternate bootloader. Sequence `1`
+is the visible menu entry. Keep both lines even when they point to the same
+U-Boot payload; otherwise the altfw menu can appear automatically while still
+requiring a manual U-Boot selection.
+
+If the list is correct but the firmware still opens the selection screen after
+the developer-mode timeout, the installed Depthcharge likely predates the
+upstream fix `fd736823` (“Boot from default target altfw after timeout”). That
+behavior cannot be changed by U-Boot or `crossystem`; it requires updating the
+Depthcharge/main firmware, or accepting one `Enter` keypress in the menu.
 
 The repository never runs `flashrom` or writes firmware automatically. First
 boot should be observed over the AP UART (`./scripts/ec-usb-console.sh ap`).

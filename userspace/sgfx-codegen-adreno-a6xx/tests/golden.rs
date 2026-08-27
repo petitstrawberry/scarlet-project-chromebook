@@ -7,15 +7,16 @@ use sgfx_codegen_adreno_a6xx::{
 };
 use sgfx_core::ir::{
     AddressMode, BlendState, BufferUsage, Color, CullMode, DrawUniforms, Extent2D, FilterMode,
-    FragmentProgram, FrontFace, LoadOp, PrimitiveTopology, RasterState, RenderPipelineDesc,
-    SamplerDesc, StoreOp, TextureFormat, TextureSampleMode, TextureUsage, Transform,
-    VertexAttribute, VertexBufferLayout, VertexFormat,
+    FragmentProgram, FrontFace, IndexFormat, LoadOp, PrimitiveTopology, RasterState,
+    RenderPipelineDesc, SamplerDesc, StoreOp, TextureFormat, TextureSampleMode, TextureUsage,
+    Transform, VertexAttribute, VertexBufferLayout, VertexFormat,
 };
 
 const TARGET: ObjectId = ObjectId::new(0);
 const SOURCE: ObjectId = ObjectId::new(1);
 const VERTICES: ObjectId = ObjectId::new(2);
 const ALPHA: ObjectId = ObjectId::new(3);
+const INDICES: ObjectId = ObjectId::new(4);
 const PIPELINE: PipelineId = PipelineId::new(0);
 
 fn rect(x: u32, y: u32, width: u32, height: u32) -> sgfx_core::ir::PixelRect {
@@ -95,6 +96,29 @@ fn pipeline() -> PipelineMeta {
     PipelineMeta {
         id: PIPELINE,
         descriptor,
+    }
+}
+
+fn showcase_color_pipeline() -> PipelineMeta {
+    let layout = VertexBufferLayout::new(
+        32,
+        vec![
+            VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+            VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+        ],
+    )
+    .unwrap();
+    PipelineMeta {
+        id: PIPELINE,
+        descriptor: RenderPipelineDesc::new(
+            TextureFormat::Bgra8Unorm,
+            PrimitiveTopology::TriangleList,
+            layout,
+            FragmentProgram::VertexColor,
+            BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+            RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        )
+        .unwrap(),
     }
 }
 
@@ -394,6 +418,75 @@ fn copy_is_a_golden_stream_with_ccu_sequence_and_two_surfaces() {
 }
 
 #[test]
+fn partial_render_area_keeps_full_target_viewport_and_uses_damage_scissors() {
+    let resources = resources();
+    let pipelines = [pipeline()];
+    let operations = [
+        Operation::BeginRenderPass(RenderPass {
+            target: TARGET,
+            area: rect(4, 5, 6, 7),
+            load: LoadOp::Load,
+            store: StoreOp::Store,
+            depth: None,
+        }),
+        Operation::SetPipeline(PIPELINE),
+        Operation::SetVertexBuffer {
+            buffer: VERTICES,
+            offset: 0,
+        },
+        Operation::SetUniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+        )),
+        Operation::SetScissor(None),
+        Operation::Draw {
+            vertex_count: 3,
+            first_vertex: 0,
+        },
+        Operation::EndRenderPass,
+    ];
+    let artifact = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 4096),
+        resources: &resources,
+        pipelines: &pipelines,
+        operations: &operations,
+    })
+    .unwrap();
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let register = |wanted| {
+        packets.iter().find_map(|packet| {
+            matches!(
+                packet.header,
+                Header::Type4 {
+                    register,
+                    ..
+                } if register == wanted
+            )
+            .then_some(packet.payload)
+        })
+    };
+
+    assert_eq!(
+        register(0x8010),
+        Some(
+            &[
+                8.0_f32.to_bits(),
+                8.0_f32.to_bits(),
+                8.0_f32.to_bits(),
+                (-8.0_f32).to_bits(),
+                0.5_f32.to_bits(),
+                0.5_f32.to_bits(),
+            ][..]
+        )
+    );
+    assert_eq!(register(0x80b0), Some(&[0x0005_0004, 0x000b_0009][..]));
+    assert_eq!(register(0x80d0), Some(&[0, 0x000f_000f][..]));
+    assert_eq!(register(0x80f0), Some(&[0x0005_0004, 0x000b_0009][..]));
+}
+
+#[test]
 fn vertex_color_draw_uses_only_canonical_shader_relocations() {
     let resources = resources();
     let pipelines = [pipeline()];
@@ -537,6 +630,7 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
         (0x9306, &[0]),
         (0x8000, &[0x80]),
         (0x8006, &[0x0007_fdff]),
+        (0x8090, &[0x2012]),
         (0x9108, &[3]),
         (0x9b00, &[0]),
     ] {
@@ -551,6 +645,143 @@ fn vertex_color_draw_uses_only_canonical_shader_relocations() {
                 ) && packet.payload == expected
             }),
             "missing canonical A618 register {register:#x}"
+        );
+    }
+}
+
+#[test]
+fn indexed_draws_use_the_bounded_a6xx_dma_packet() {
+    for (format, index_bytes, initiator) in [
+        (IndexFormat::Uint16, 16_u64, 0x404_u32),
+        (IndexFormat::Uint32, 32_u64, 0x804_u32),
+    ] {
+        let mut resources = resources();
+        resources[2].size = 128;
+        resources.push(ResourceMeta {
+            id: INDICES,
+            size: index_bytes,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::INDEX,
+            },
+        });
+        let pipelines = [showcase_color_pipeline()];
+        let operations = [
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: rect(0, 0, 16, 16),
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetVertexBuffer {
+                buffer: VERTICES,
+                offset: 0,
+            },
+            Operation::SetIndexBuffer {
+                buffer: INDICES,
+                offset: 0,
+                format,
+            },
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::DrawIndexed {
+                index_count: 6,
+                first_index: 2,
+                base_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &operations,
+        })
+        .unwrap();
+        assert_well_formed(&artifact);
+        let packet = Packets::new(&artifact.words)
+            .filter_map(Result::ok)
+            .find(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: 0x38,
+                        count: 7,
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(packet.payload, [initiator, 1, 6, 2, 0, 0, 8]);
+        let fixup = artifact
+            .fixups
+            .iter()
+            .find(|fixup| fixup.word_offset == packet.word_offset + 5)
+            .unwrap();
+        assert_eq!(fixup.object, ObjectRef::External(INDICES));
+        assert_eq!(fixup.object_offset, 0);
+        assert_eq!(fixup.required_size, index_bytes);
+        assert_eq!(fixup.access, Access::READ);
+    }
+}
+
+#[test]
+fn indexed_draw_rejects_unaligned_binding_and_negative_base_vertex() {
+    let mut resources = resources();
+    resources[2].size = 128;
+    resources.push(ResourceMeta {
+        id: INDICES,
+        size: 16,
+        kind: ResourceKind::Buffer {
+            usage: BufferUsage::INDEX,
+        },
+    });
+    let pipelines = [showcase_color_pipeline()];
+    let make_operations = |offset, base_vertex| {
+        vec![
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: rect(0, 0, 16, 16),
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetVertexBuffer {
+                buffer: VERTICES,
+                offset: 0,
+            },
+            Operation::SetIndexBuffer {
+                buffer: INDICES,
+                offset,
+                format: IndexFormat::Uint16,
+            },
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::DrawIndexed {
+                index_count: 6,
+                first_index: 0,
+                base_vertex,
+            },
+            Operation::EndRenderPass,
+        ]
+    };
+    for (operations, expected) in [
+        (make_operations(1, 0), CompileError::OutOfBounds),
+        (make_operations(0, -1), CompileError::UnsupportedFeature),
+    ] {
+        assert_eq!(
+            compile(CompileInput {
+                capabilities: Capabilities::a618(512 * 1024, 4096),
+                resources: &resources,
+                pipelines: &pipelines,
+                operations: &operations,
+            }),
+            Err(expected)
         );
     }
 }
@@ -785,6 +1016,7 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
         FragmentProgram::Solid,
         FragmentProgram::Texture(TextureSampleMode::Rgba),
         FragmentProgram::Texture(TextureSampleMode::RgbIgnoreAlpha),
+        FragmentProgram::Texture(TextureSampleMode::AlphaMask),
     ] {
         pipelines.push(PipelineMeta {
             id: PipelineId::new(pipelines.len() as u32),
@@ -846,7 +1078,7 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
         ];
         if textured {
             operations.push(Operation::SetTexture(if alpha { ALPHA } else { SOURCE }));
-            let filter = if stride == 24 {
+            let filter = if matches!(stride, 16 | 24) {
                 FilterMode::Linear
             } else {
                 FilterMode::Nearest
@@ -897,7 +1129,7 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
                         && packet.payload[2] == 0x4c00_6880
                 })
                 .expect("one CP_MEM_WRITE texture-state materialization");
-            let expected_sampler = if stride == 24 {
+            let expected_sampler = if matches!(stride, 16 | 24) {
                 [0x92a, 0x40, 0x20, 0]
             } else {
                 [0x920, 0x40, 0, 0]
@@ -1241,6 +1473,15 @@ fn coachz_cube_first_frame_uses_upstream_shader_program_bursts() {
     let packets = Packets::new(&artifact.words)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
+    assert!(packets.iter().any(|packet| {
+        matches!(
+            packet.header,
+            Header::Type4 {
+                register: 0x8090,
+                count: 1,
+            }
+        ) && packet.payload == [0x2012]
+    }));
     for (register, variant) in [
         (0xa81b, ShaderVariant::VsStride28Pos4Color3),
         (0xa982, ShaderVariant::FsVertexColor),
@@ -1267,4 +1508,284 @@ fn coachz_cube_first_frame_uses_upstream_shader_program_bursts() {
                 && fixup.object == ObjectRef::CanonicalShader(variant)
         }));
     }
+}
+
+#[test]
+fn showcase_first_frame_compiles_as_one_complete_multipass_stream() {
+    const SCREEN: ObjectId = ObjectId::new(20);
+    const OFFSCREEN: ObjectId = ObjectId::new(21);
+    const COPIED: ObjectId = ObjectId::new(22);
+    const MASK: ObjectId = ObjectId::new(23);
+    const COLOR_VERTICES: ObjectId = ObjectId::new(24);
+    const TEXTURE_VERTICES: ObjectId = ObjectId::new(25);
+    const SHOWCASE_INDICES: ObjectId = ObjectId::new(26);
+
+    let image =
+        |id: ObjectId, format: TextureFormat, width: u32, height: u32, usage: TextureUsage| {
+            let stride = (width * 4_u32).next_multiple_of(64);
+            ResourceMeta {
+                id,
+                size: u64::from(stride) * u64::from(height),
+                kind: ResourceKind::Image(ImageMeta {
+                    format,
+                    storage_format: TextureFormat::Bgra8Unorm,
+                    extent: Extent2D::new(width, height).unwrap(),
+                    usage,
+                    modifier: ImageModifier::Linear,
+                    planes: vec![PlaneLayout {
+                        offset: 0,
+                        stride,
+                        size: u64::from(stride) * u64::from(height),
+                    }],
+                }),
+            }
+        };
+    let resources = vec![
+        image(
+            SCREEN,
+            TextureFormat::Bgra8Unorm,
+            64,
+            48,
+            TextureUsage::RENDER_ATTACHMENT,
+        ),
+        image(
+            OFFSCREEN,
+            TextureFormat::Bgra8Unorm,
+            32,
+            24,
+            TextureUsage::RENDER_ATTACHMENT | TextureUsage::SAMPLED | TextureUsage::COPY_SRC,
+        ),
+        image(
+            COPIED,
+            TextureFormat::Bgra8Unorm,
+            32,
+            24,
+            TextureUsage::SAMPLED | TextureUsage::COPY_DST,
+        ),
+        image(
+            MASK,
+            TextureFormat::R8Unorm,
+            4,
+            4,
+            TextureUsage::SAMPLED | TextureUsage::COPY_DST,
+        ),
+        ResourceMeta {
+            id: COLOR_VERTICES,
+            size: 128,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+            },
+        },
+        ResourceMeta {
+            id: TEXTURE_VERTICES,
+            size: 96,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+            },
+        },
+        ResourceMeta {
+            id: SHOWCASE_INDICES,
+            size: 12,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::INDEX | BufferUsage::COPY_DST,
+            },
+        },
+    ];
+    let color_layout = VertexBufferLayout::new(
+        32,
+        vec![
+            VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+            VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+        ],
+    )
+    .unwrap();
+    let texture_layout = VertexBufferLayout::new(
+        24,
+        vec![
+            VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+            VertexAttribute::new(1, VertexFormat::Float32x2, 16),
+        ],
+    )
+    .unwrap();
+    let raster = RasterState::new(CullMode::None, FrontFace::CounterClockwise);
+    let pipeline = |id, layout, fragment| PipelineMeta {
+        id: PipelineId::new(id),
+        descriptor: RenderPipelineDesc::new(
+            TextureFormat::Bgra8Unorm,
+            PrimitiveTopology::TriangleList,
+            layout,
+            fragment,
+            BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+            raster,
+        )
+        .unwrap(),
+    };
+    let pipelines = vec![
+        pipeline(0, color_layout.clone(), FragmentProgram::VertexColor),
+        pipeline(1, color_layout, FragmentProgram::Solid),
+        pipeline(
+            2,
+            texture_layout.clone(),
+            FragmentProgram::Texture(TextureSampleMode::Rgba),
+        ),
+        pipeline(
+            3,
+            texture_layout,
+            FragmentProgram::Texture(TextureSampleMode::AlphaMask),
+        ),
+    ];
+    let color_bytes = [0_u8; 128];
+    let texture_bytes = [0_u8; 96];
+    let index_bytes = [0_u8, 0, 1, 0, 2, 0, 0, 0, 2, 0, 3, 0];
+    let mask_bytes = [0xff_u8; 16];
+    let uniforms = DrawUniforms::new(
+        Transform::identity(),
+        Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+    );
+    let sampler = SamplerDesc::new(
+        FilterMode::Linear,
+        FilterMode::Linear,
+        AddressMode::ClampToEdge,
+        AddressMode::ClampToEdge,
+    );
+    let mut operations = vec![
+        Operation::WriteBuffer {
+            destination: COLOR_VERTICES,
+            offset: 0,
+            data: &color_bytes,
+        },
+        Operation::WriteBuffer {
+            destination: TEXTURE_VERTICES,
+            offset: 0,
+            data: &texture_bytes,
+        },
+        Operation::WriteBuffer {
+            destination: SHOWCASE_INDICES,
+            offset: 0,
+            data: &index_bytes,
+        },
+        Operation::WriteTexture {
+            destination: MASK,
+            area: rect(0, 0, 4, 4),
+            bytes_per_row: 4,
+            data: &mask_bytes,
+        },
+        Operation::BeginRenderPass(RenderPass {
+            target: OFFSCREEN,
+            area: rect(0, 0, 32, 24),
+            load: LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 1.0).unwrap()),
+            store: StoreOp::Store,
+            depth: None,
+        }),
+        Operation::SetPipeline(PipelineId::new(0)),
+        Operation::SetVertexBuffer {
+            buffer: COLOR_VERTICES,
+            offset: 0,
+        },
+        Operation::SetIndexBuffer {
+            buffer: SHOWCASE_INDICES,
+            offset: 0,
+            format: IndexFormat::Uint16,
+        },
+        Operation::SetScissor(Some(rect(1, 1, 30, 22))),
+        Operation::SetUniforms(uniforms),
+        Operation::DrawIndexed {
+            index_count: 6,
+            first_index: 0,
+            base_vertex: 0,
+        },
+        Operation::SetUniforms(uniforms),
+        Operation::DrawIndexed {
+            index_count: 6,
+            first_index: 0,
+            base_vertex: 0,
+        },
+        Operation::EndRenderPass,
+        Operation::CopyTextureToTexture {
+            source: OFFSCREEN,
+            source_rect: rect(0, 0, 32, 24),
+            destination: COPIED,
+            destination_rect: rect(0, 0, 32, 24),
+        },
+        Operation::BeginRenderPass(RenderPass {
+            target: SCREEN,
+            area: rect(0, 0, 64, 48),
+            load: LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 1.0).unwrap()),
+            store: StoreOp::Store,
+            depth: None,
+        }),
+        Operation::SetPipeline(PipelineId::new(2)),
+        Operation::SetVertexBuffer {
+            buffer: TEXTURE_VERTICES,
+            offset: 0,
+        },
+        Operation::SetIndexBuffer {
+            buffer: SHOWCASE_INDICES,
+            offset: 0,
+            format: IndexFormat::Uint16,
+        },
+        Operation::SetTexture(COPIED),
+        Operation::SetSampler(sampler),
+        Operation::SetUniforms(uniforms),
+        Operation::DrawIndexed {
+            index_count: 6,
+            first_index: 0,
+            base_vertex: 0,
+        },
+        Operation::SetTexture(OFFSCREEN),
+        Operation::SetUniforms(uniforms),
+        Operation::DrawIndexed {
+            index_count: 6,
+            first_index: 0,
+            base_vertex: 0,
+        },
+        Operation::SetPipeline(PipelineId::new(3)),
+        Operation::SetTexture(MASK),
+        Operation::SetScissor(None),
+        Operation::SetUniforms(uniforms),
+        Operation::DrawIndexed {
+            index_count: 6,
+            first_index: 0,
+            base_vertex: 0,
+        },
+        Operation::SetPipeline(PipelineId::new(1)),
+        Operation::SetVertexBuffer {
+            buffer: COLOR_VERTICES,
+            offset: 0,
+        },
+        Operation::SetUniforms(uniforms),
+        Operation::DrawIndexed {
+            index_count: 6,
+            first_index: 0,
+            base_vertex: 0,
+        },
+        Operation::EndRenderPass,
+    ];
+
+    let artifact = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 16 * 1024),
+        resources: &resources,
+        pipelines: &pipelines,
+        operations: &operations,
+    })
+    .unwrap();
+    assert_well_formed(&artifact);
+    assert_ccu_clean_before_every_color_invalidate(&artifact);
+    assert_eq!(
+        Packets::new(&artifact.words)
+            .filter_map(Result::ok)
+            .filter(|packet| matches!(
+                packet.header,
+                Header::Type7 {
+                    opcode: 0x38,
+                    count: 7,
+                }
+            ))
+            .count(),
+        6
+    );
+    assert!(artifact.fixups.iter().any(|fixup| {
+        fixup.object == ObjectRef::CanonicalShader(ShaderVariant::FsTextureAlphaMask)
+    }));
+    operations.clear();
 }

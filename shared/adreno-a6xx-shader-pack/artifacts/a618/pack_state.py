@@ -25,6 +25,8 @@ ROOT = args.pack.resolve()
 d = json.loads((ROOT / "mesa-metadata.json").read_text())
 variants = {v["name"]: v for v in d["variants"]}
 INVALID = 0xfc  # regid(63, 0)
+TEX_PREFETCH_SAM = 1
+OPC_SAM = 643
 
 def xs_config(v):
     """Pack A6XX_SP_xS_CONFIG for this non-bindless shader pack."""
@@ -76,10 +78,15 @@ def xs_state(v):
                (int(v["prefetch_end_of_quad"]) << 4))
     cmds = []
     for p in v["sampler_prefetch"]:
+        # Pinned Mesa's tex_opc_to_prefetch_cmd() maps OPC_SAM to
+        # TEX_PREFETCH_SAM.  The A6xx XML encoding for TEX_PREFETCH_SAM is 1;
+        # value 4 is GATHER4B and silently changes both color and alpha
+        # semantics rather than faulting the command stream.
+        assert p["tex_opc"] == OPC_SAM
         cmds.append(p["src"] | (p["samp_id"] << 7) | (p["tex_id"] << 11) |
                     (p["dst"] << 16) | (p["wrmask"] << 22) |
                     (p["half"] << 26) | (int(p["bindless"]) << 28) |
-                    (4 << 29))  # TEX_PREFETCH_SAM
+                    (TEX_PREFETCH_SAM << 29))
     assert not v["color0_mrt"]
     color_outputs = [x for x in v["outputs"] if x["slot"] == 4]
     assert len(color_outputs) == 1 and color_outputs[0]["aliased_components"] == 0
