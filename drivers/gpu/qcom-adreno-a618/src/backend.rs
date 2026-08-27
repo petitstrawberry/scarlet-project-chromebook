@@ -55,6 +55,7 @@ const GMEM_BASE: u64 = 0x10_0000;
 const GMEM_SIZE: u64 = 512 * 1024;
 const GPU_TIMEOUT_US: u64 = 1_000_000;
 const GPU_QUIESCE_TIMEOUT_US: u64 = 10_000;
+const GPU_INTERRUPT_CLEAR_TIMEOUT_US: u64 = 1_000;
 const CP_INDIRECT_BUFFER: u8 = 0x3f;
 const EVENT_CACHE_FLUSH_TS: u32 = 0x04;
 const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
@@ -549,10 +550,34 @@ impl A618Core {
             hardware.wptr = (hardware.wptr + 1) & (capacity as u32 - 1);
         }
         hardware.ring.clean_for_device();
-        self.registers.write(RBBM_INT_CLEAR_CMD, u32::MAX);
-        arch::io_wmb();
+        self.clear_ring_interrupts()?;
         self.registers.write(CP_RB_WPTR, hardware.wptr);
         Ok(hardware.wptr)
+    }
+
+    /// Establish an unambiguous completion edge before advancing the ring.
+    ///
+    /// The userspace validator forbids CACHE_FLUSH_TS, so bit 20 can only be
+    /// raised by the kernel-owned completion event appended by `execute_ring`.
+    /// Requiring a zero readback here makes the next observed bit fresh even
+    /// on systems where the event's optional memory payload is unreliable.
+    fn clear_ring_interrupts(&self) -> Result<(), &'static str> {
+        let start = time::current_time();
+        loop {
+            let pending = self.registers.read(RBBM_INT_0_STATUS);
+            if pending == 0 {
+                return Ok(());
+            }
+            if pending & RBBM_INT_FATAL_MASK != 0 {
+                return Err("qcom-adreno-a618: GPU fault pending before ring submit");
+            }
+            self.registers.write(RBBM_INT_CLEAR_CMD, pending);
+            arch::io_wmb();
+            if time::current_time().saturating_sub(start) >= GPU_INTERRUPT_CLEAR_TIMEOUT_US {
+                return Err("qcom-adreno-a618: stale GPU interrupt did not clear");
+            }
+            time::udelay(1);
+        }
     }
 
     /// Consume the shared A6xx interrupt status without confusing timestamp
@@ -795,10 +820,11 @@ impl A618Core {
         let sequence = hardware.fence_sequence;
         hardware.fence.as_words_mut()[0] = 0;
         hardware.fence.clean_for_device();
-        // Match Linux's A6xx fence payload and completion source:
-        // CACHE_FLUSH_TS writes the software sequence to memory and raises the
-        // RBBM completion bit. Scarlet polls and W1C-acknowledges that bit while
-        // the corresponding platform interrupt remains disabled at the GIC.
+        // Match Linux's A6xx completion source. The addressed timestamp remains
+        // useful diagnostic state, but this serialized single-ring backend
+        // retires from a fresh RBBM completion bit plus the sequence-specific
+        // scratch register. Some SC7180 firmware paths acknowledge the event
+        // without making a repeated timestamp write CPU-visible.
         let completion = completion_commands(hardware.fence.dma_addr(), sequence)?;
         let mut ring = Vec::new();
         ring.try_reserve_exact(words.len() + completion.len())
@@ -839,16 +865,17 @@ impl A618Core {
             }
             // Drain any status raised alongside the memory fence before
             // returning so the next ring kick starts from a clean status word.
-            if fence_value == sequence
-                && observed_interrupts & RBBM_INT_CP_CACHE_FLUSH_TS != 0
+            if observed_interrupts & RBBM_INT_CP_CACHE_FLUSH_TS != 0
                 && self.registers.read(CP_SCRATCH_2) == sequence
                 && self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
             {
-                if sequence == 1 {
+                if sequence <= 2 {
                     early_println!(
-                        "[a618] first submit complete irq={:#010x} fence={:#010x}",
+                        "[a618] submit complete seq={} irq={:#010x} scratch={:#010x} fence={:#010x}",
+                        sequence,
                         observed_interrupts,
+                        self.registers.read(CP_SCRATCH_2),
                         fence_value,
                     );
                 }
@@ -1543,11 +1570,7 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             },
         )?;
         let ring = DmaAllocation::new(&dma_context, RING_SIZE, bidirectional_flags())?;
-        // Linux keeps the A6xx completion word in an MSM_BO_WC memptr page.
-        // Mirror that CPU attribute so consecutive device writes cannot be
-        // hidden behind a stale WB direct-map cache line.
-        let fence =
-            DmaAllocation::new_cpu_noncacheable(&dma_context, PAGE_SIZE, bidirectional_flags())?;
+        let fence = DmaAllocation::new(&dma_context, PAGE_SIZE, bidirectional_flags())?;
         let backend_cookie = allocate_monotonic(
             &NEXT_BACKEND_COOKIE,
             "qcom-adreno-a618: backend cookie space exhausted",

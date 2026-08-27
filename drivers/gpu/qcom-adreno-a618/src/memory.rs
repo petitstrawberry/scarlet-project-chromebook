@@ -9,7 +9,6 @@ use scarlet::{
     device::iommu::{DmaContext, DmaMapping, IommuMapFlags},
     environment::PAGE_SIZE,
     mem::page::ContiguousPages,
-    vm::vmem::MemoryAttribute,
 };
 
 pub(crate) fn page_count(size: usize) -> Result<usize, &'static str> {
@@ -33,31 +32,7 @@ impl DmaAllocation {
         size: usize,
         flags: IommuMapFlags,
     ) -> Result<Self, &'static str> {
-        Self::new_with_cpu_attribute(context, size, flags, MemoryAttribute::Normal)
-    }
-
-    /// Allocate a device-owned status page through a CPU non-cacheable alias.
-    ///
-    /// Linux maps the A6xx ring memptrs (including the completion fence) as
-    /// `MSM_BO_WC`.  Normal-NC is the corresponding AArch64 memory type and is
-    /// required for a word that the GPU repeatedly overwrites while the CPU
-    /// polls it; a normal WB direct-map alias can retain a stale cache line
-    /// across consecutive CACHE_FLUSH_TS events on this non-coherent device.
-    pub(crate) fn new_cpu_noncacheable(
-        context: &DmaContext,
-        size: usize,
-        flags: IommuMapFlags,
-    ) -> Result<Self, &'static str> {
-        Self::new_with_cpu_attribute(context, size, flags, MemoryAttribute::NonCacheable)
-    }
-
-    fn new_with_cpu_attribute(
-        context: &DmaContext,
-        size: usize,
-        flags: IommuMapFlags,
-        cpu_attribute: MemoryAttribute,
-    ) -> Result<Self, &'static str> {
-        let mut pages = ContiguousPages::new(page_count(size)?)
+        let pages = ContiguousPages::new(page_count(size)?)
             .ok_or("qcom-adreno-a618: contiguous DMA allocation failed")?;
         let allocation_size = pages
             .len()
@@ -67,11 +42,6 @@ impl DmaAllocation {
         // exactly `allocation_size` bytes.
         unsafe { ptr::write_bytes(pages.as_vaddr() as *mut u8, 0, allocation_size) };
         arch::clean_dcache_to_poc_range(pages.as_vaddr(), allocation_size);
-        if cpu_attribute != MemoryAttribute::Normal {
-            pages
-                .retag_memory_attribute(cpu_attribute)
-                .map_err(|_| "qcom-adreno-a618: failed to retag DMA allocation")?;
-        }
         let mapping = context
             .map_phys_owned(pages.as_paddr(), allocation_size, flags)
             .map_err(|_| "qcom-adreno-a618: IOMMU mapping failed")?;
