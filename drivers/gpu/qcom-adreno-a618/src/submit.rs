@@ -1440,21 +1440,29 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
 }
 
 /// Reject impossible pipeline candidates using state that the full matcher
-/// already requires.  A production UI draw used to run the packet-scanning
-/// matcher for all thirteen canonical variants even though stride, vertex
-/// fetch layout, sampler use, and blend mode narrow that set to at most three.
-/// This is only a prefilter: every surviving candidate still passes the exact
-/// canonical-state matcher below, so the accepted PM4 language is unchanged.
+/// already requires.  Stride, vertex fetch layout, sampler use, blend mode,
+/// and the fragment program's initial texture-load command form a unique
+/// identity for every supported canonical pipeline.  This keeps the expensive
+/// packet-scanning matcher to one candidate per draw.  It remains only a
+/// prefilter: every surviving candidate still passes the exact canonical-state
+/// matcher below, so the accepted PM4 language is unchanged.
 fn segment_may_match_pipeline(
     segment: &SegmentIndex<'_, '_, '_>,
     variant: PipelineVariant,
 ) -> bool {
     let fixed = pipeline_state_meta(variant);
+    let ShaderMeta::Fragment(fs) = shader_meta(link_meta(variant).fs) else {
+        return false;
+    };
     let reg = |wanted| segment.reg(wanted).map(|(_, payload)| payload);
     reg(VFD_VERTEX_BUFFER_SIZE)
         .is_some_and(|payload| payload.len() == 2 && payload[1] == fixed.stride)
         && reg(VFD_FETCH_INSTR) == Some(fixed.vfd_fetch)
         && reg(SP_PS_TSIZE) == Some(&[u32::from(fixed.uses_sampler)])
+        && reg(SP_PS_INITIAL_TEX_LOAD_CNTL).is_some_and(|payload| {
+            payload.first() == Some(&fs.initial_tex_load_cntl)
+                && payload.get(1..) == Some(fs.initial_tex_load_cmd)
+        })
         && reg(RB_MRT_CONTROL)
             == Some(if fixed.source_over {
                 &[0x7e3, 0x0701_0706]
@@ -2088,6 +2096,39 @@ mod tests {
         ResolvedResource, diagnose_rejected_packet, relocate_one, validate_and_relocate,
         validate_type7,
     };
+
+    #[test]
+    fn canonical_pipeline_prefilter_identity_is_unique() {
+        use adreno_a6xx_shader_pack::{
+            PipelineVariant, ShaderMeta, link_meta, pipeline_state_meta, shader_meta,
+        };
+
+        for variant in PipelineVariant::ALL {
+            let fixed = pipeline_state_meta(variant);
+            let ShaderMeta::Fragment(fragment) = shader_meta(link_meta(variant).fs) else {
+                panic!("canonical pipeline has a non-fragment pixel stage");
+            };
+            let identity_matches = PipelineVariant::ALL
+                .into_iter()
+                .filter(|candidate| {
+                    let candidate_fixed = pipeline_state_meta(*candidate);
+                    let ShaderMeta::Fragment(candidate_fragment) =
+                        shader_meta(link_meta(*candidate).fs)
+                    else {
+                        return false;
+                    };
+                    candidate_fixed == fixed
+                        && candidate_fragment.initial_tex_load_cntl
+                            == fragment.initial_tex_load_cntl
+                        && candidate_fragment.initial_tex_load_cmd == fragment.initial_tex_load_cmd
+                })
+                .count();
+            assert_eq!(
+                identity_matches, 1,
+                "canonical pipeline identity for {variant:?} is ambiguous"
+            );
+        }
+    }
 
     const TARGET: ObjectId = ObjectId::new(0);
     const SOURCE: ObjectId = ObjectId::new(1);
