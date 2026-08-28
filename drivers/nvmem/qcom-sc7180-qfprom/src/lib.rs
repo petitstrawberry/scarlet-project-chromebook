@@ -29,6 +29,7 @@ use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use scarlet::{
     arch::mmio,
     device::{
+        DeviceInfo,
         fdt::FdtManager,
         manager::{DeviceManager, DriverPriority},
         nvmem::{NvmemError, NvmemProvider},
@@ -157,7 +158,7 @@ fn node_phandle(node: &fdt::node::FdtNode<'_, '_>) -> Option<u32> {
         .and_then(|property| be_u32(property.value))
 }
 
-fn direct_child_bitfields(provider_phandle: u32) -> Vec<BitField> {
+fn direct_child_bitfields(provider_phandle: u32, provider_name: &str) -> Vec<BitField> {
     let Some(fdt) = FdtManager::get_manager().get_fdt() else {
         return Vec::new();
     };
@@ -167,7 +168,12 @@ fn direct_child_bitfields(provider_phandle: u32) -> Vec<BitField> {
 
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node_phandle(&node) == Some(provider_phandle) {
+        // Platform population assigns a synthetic phandle to nodes that do
+        // not carry one in the original FDT.  That synthetic value is needed
+        // for provider registration, but it cannot be found by rescanning the
+        // immutable source blob.  Match the stable node name as the
+        // fallback so child `bits` declarations are retained in that case.
+        if node_phandle(&node) == Some(provider_phandle) || node.name == provider_name {
             return node
                 .children()
                 .filter_map(|child| {
@@ -225,7 +231,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let (paddr, size) = corrected_resource(device)?;
     let base = vm::ioremap(paddr, size).map_err(|_| "qcom-sc7180-qfprom: ioremap failed")?;
     let phandle = device_phandle(device)?;
-    let bitfields = direct_child_bitfields(phandle);
+    let bitfields = direct_child_bitfields(phandle, device.name());
 
     let provider = Arc::new(Sc7180Qfprom::new(base, size, bitfields));
     DeviceManager::get_manager().register_nvmem_provider(phandle, provider);
@@ -274,5 +280,18 @@ mod tests {
         let mut bytes = [0b0011_1010];
         Sc7180Qfprom::pack_bitfield(field, &mut bytes).unwrap();
         assert_eq!(bytes, [0b101]);
+    }
+
+    #[test_case]
+    fn sc7180_gpu_speed_bin_bits_are_packed() {
+        let field = BitField {
+            offset: 0x1d2,
+            size: 2,
+            bit_offset: 5,
+            bit_size: 8,
+        };
+        let mut bytes = [0x30, 0x15];
+        Sc7180Qfprom::pack_bitfield(field, &mut bytes).unwrap();
+        assert_eq!(bytes, [169, 0]);
     }
 }
