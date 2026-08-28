@@ -123,6 +123,17 @@ pub struct RpmhRsc {
     lock: IrqSpinLock<()>,
 }
 
+/// One command in a synchronous active-only RPMh transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveCommand {
+    /// Command DB resource address.
+    pub address: u32,
+    /// Resource-specific vote payload.
+    pub data: u32,
+    /// Request a response for this command before the TCS completes.
+    pub wait_for_completion: bool,
+}
+
 impl RpmhRsc {
     fn read_tcs_register(&self, tcs_id: u32, offset: usize) -> u32 {
         // SAFETY: `tcs_id` is selected from the validated active TCS group.
@@ -236,9 +247,30 @@ impl RpmhRsc {
     ///
     /// Success after the RSC completion status is acknowledged.
     pub fn write_active(&self, address: u32, data: u32) -> Result<(), &'static str> {
+        self.write_active_batch(&[ActiveCommand {
+            address,
+            data,
+            wait_for_completion: true,
+        }])
+    }
+
+    /// Send a synchronous active-only RPMh command batch in one TCS.
+    ///
+    /// BCM interconnect votes must commit every resource in a virtual clock
+    /// domain atomically.  Keeping the commands in one TCS preserves that
+    /// firmware contract and avoids transiently applying a partial bandwidth
+    /// vote.  At least one command must request a response so completion is an
+    /// observable boundary.
+    pub fn write_active_batch(&self, commands: &[ActiveCommand]) -> Result<(), &'static str> {
         let _guard = self.lock.lock();
         if self.active_tcs_count == 0 || self.commands_per_tcs == 0 {
             return Err("qcom-rpmh-rsc: no active TCS available");
+        }
+        if commands.is_empty() {
+            return Err("qcom-rpmh-rsc: active request has no commands");
+        }
+        if commands.len() > self.commands_per_tcs as usize {
+            return Err("qcom-rpmh-rsc: active request exceeds TCS command capacity");
         }
 
         let tcs_id = self.active_tcs_offset;
@@ -249,29 +281,61 @@ impl RpmhRsc {
             return Err("qcom-rpmh-rsc: active TCS is busy");
         }
 
+        let command_mask = (1u32 << commands.len()) - 1;
+        let mut wait_mask = 0u32;
+        for (index, command) in commands.iter().enumerate() {
+            if command.wait_for_completion {
+                wait_mask |= 1u32 << index;
+            }
+        }
+        if wait_mask == 0 {
+            return Err("qcom-rpmh-rsc: synchronous request has no completion command");
+        }
+
+        #[cfg(debug_assertions)]
         early_println!(
-            "[qcom-rpmh-rsc] active write begin tcs={} address={:#x} data={}",
+            "[qcom-rpmh-rsc] active batch begin tcs={} commands={} wait={:#x}",
             tcs_id,
-            address,
-            data,
+            commands.len(),
+            wait_mask,
         );
 
         self.clear_trigger(tcs_id)?;
         self.write_tcs_register_sync(tcs_id, self.registers.command_enable, 0)?;
         self.clear_irq_status(irq_mask)?;
 
-        let message_id = CMD_MSGID_LEN | CMD_MSGID_RESP_REQ | CMD_MSGID_WRITE;
-        self.write_tcs_command(tcs_id, 0, self.registers.command_msgid, message_id);
-        self.write_tcs_command(tcs_id, 0, self.registers.command_address, address);
-        self.write_tcs_command(tcs_id, 0, self.registers.command_data, data);
-        self.write_tcs_register_sync(tcs_id, self.registers.command_enable, 1)?;
+        for (index, command) in commands.iter().enumerate() {
+            let command_id = index as u32;
+            let mut message_id = CMD_MSGID_LEN | CMD_MSGID_WRITE;
+            if command.wait_for_completion {
+                message_id |= CMD_MSGID_RESP_REQ;
+            }
+            self.write_tcs_command(tcs_id, command_id, self.registers.command_msgid, message_id);
+            self.write_tcs_command(
+                tcs_id,
+                command_id,
+                self.registers.command_address,
+                command.address,
+            );
+            self.write_tcs_command(
+                tcs_id,
+                command_id,
+                self.registers.command_data,
+                command.data,
+            );
+        }
+        self.write_tcs_register_sync(tcs_id, self.registers.command_enable, command_mask)?;
         // A response-request bit in MSGID asks the accelerator to acknowledge
-        // the command, while CMD_WAIT_FOR_CMPL makes the RSC hold completion
-        // until that acknowledgement arrives.  The latter ensures the fresh
-        // IRQ awaited below cannot precede application of the new rail corner.
-        self.write_tcs_register_sync(tcs_id, self.registers.command_wait_for_completion, 1)?;
+        // each VCD commit command, while CMD_WAIT_FOR_CMPL holds TCS completion
+        // until those acknowledgements arrive.
+        self.write_tcs_register_sync(
+            tcs_id,
+            self.registers.command_wait_for_completion,
+            wait_mask,
+        )?;
         self.trigger(tcs_id)?;
-        early_println!("[qcom-rpmh-rsc] active write triggered tcs={}", tcs_id);
+        #[cfg(debug_assertions)]
+        early_println!("[qcom-rpmh-rsc] active batch triggered tcs={}", tcs_id);
 
         // CMD_STATUS is sticky across TCS reuse and may still contain the
         // bootloader's ISSUED/COMPL bits when Scarlet takes ownership.  Wait
@@ -290,21 +354,30 @@ impl RpmhRsc {
             }
             time::udelay(1);
         }
-        let command_status = self.read_tcs_command(tcs_id, 0, self.registers.command_status);
+        let mut acknowledged = true;
+        for index in 0..commands.len() {
+            if wait_mask & (1u32 << index) == 0 {
+                continue;
+            }
+            let command_status =
+                self.read_tcs_command(tcs_id, index as u32, self.registers.command_status);
+            acknowledged &= command_status & (CMD_STATUS_ISSUED | CMD_STATUS_COMPLETE)
+                == (CMD_STATUS_ISSUED | CMD_STATUS_COMPLETE);
+        }
 
         self.clear_trigger(tcs_id)?;
         self.write_tcs_register_sync(tcs_id, self.registers.command_enable, 0)?;
+        self.write_tcs_register_sync(tcs_id, self.registers.command_wait_for_completion, 0)?;
         self.clear_irq_status(irq_mask)?;
 
-        if command_status & (CMD_STATUS_ISSUED | CMD_STATUS_COMPLETE)
-            != (CMD_STATUS_ISSUED | CMD_STATUS_COMPLETE)
-        {
+        if !acknowledged {
             return Err("qcom-rpmh-rsc: request completed without command acknowledgement");
         }
+        #[cfg(debug_assertions)]
         early_println!(
-            "[qcom-rpmh-rsc] active write complete tcs={} status={:#010x}",
+            "[qcom-rpmh-rsc] active batch complete tcs={} commands={}",
             tcs_id,
-            command_status,
+            commands.len(),
         );
         Ok(())
     }

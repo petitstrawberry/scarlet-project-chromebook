@@ -124,6 +124,7 @@ dependencies = [
  "scarlet",
  "scarlet-driver-qcom-cmd-db",
  "scarlet-driver-qcom-sc7180-gpucc",
+ "scarlet-driver-qcom-sc7180-interconnect",
 ]
 
 [[package]]
@@ -215,6 +216,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-sc7180-interconnect"
+version = "0.1.0"
+dependencies = [
+ "fdt",
+ "scarlet",
+ "scarlet-driver-qcom-cmd-db",
+ "scarlet-driver-qcom-rpmh-rsc",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-sc7180-mdss"
 version = "0.1.0"
 dependencies = [
@@ -292,6 +303,7 @@ dependencies = [
  "scarlet-driver-qcom-sc7180-dispcc",
  "scarlet-driver-qcom-sc7180-gcc-display",
  "scarlet-driver-qcom-sc7180-gpucc",
+ "scarlet-driver-qcom-sc7180-interconnect",
  "scarlet-driver-qcom-sc7180-mdss",
  "scarlet-driver-qcom-sc7180-qfprom",
  "scarlet-driver-qcom-sc7180-rpmhcc",

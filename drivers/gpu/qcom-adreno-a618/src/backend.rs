@@ -36,6 +36,7 @@ use scarlet::{
 
 use adreno_a6xx_pm4::{opcode, type4, type7};
 use adreno_a6xx_shader_pack::{PACK_SIZE, SHADER_ALIGNMENT, SHADER_SIZE, ShaderVariant, copy_pack};
+use qcom_sc7180_interconnect::GpuMemoryPath;
 
 use crate::{
     firmware,
@@ -284,6 +285,8 @@ struct A618Core {
     interrupt_waker: Arc<Waker>,
     interrupt_wait_armed: AtomicBool,
     dma_context: DmaContext,
+    interconnect: GpuMemoryPath,
+    peak_kbps: u32,
     gmu: Arc<Mutex<A618Gmu>>,
     hardware: Mutex<HardwareState>,
     resources: IrqSpinLock<Vec<Arc<ResourceEntry>>>,
@@ -1069,6 +1072,10 @@ impl A618Core {
             ));
         }
 
+        self.interconnect
+            .set_peak_kbps(self.peak_kbps)
+            .map_err(GpuBackendSubmitError::Unavailable)?;
+
         let mut gmu = self.gmu.lock();
         gmu.ensure_ready()
             .map_err(GpuBackendSubmitError::Unavailable)?;
@@ -1788,6 +1795,12 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         None => return probe_defer(),
     };
     let gpu_operating_points = read_gpu_operating_points(device)?;
+    let peak_kbps = gpu_operating_points
+        .iter()
+        .filter_map(|point| point.peak_kbps)
+        .max()
+        .ok_or("qcom-adreno-a618: GPU OPP table has no peak bandwidth")?;
+    let interconnect = qcom_sc7180_interconnect::gpu_memory_path(device)?;
     gmu.lock()
         .configure_gpu_operating_points(gpu_operating_points)?;
     let resource = device
@@ -1840,6 +1853,8 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             interrupt_waker: Arc::new(Waker::new_uninterruptible("a618-submit")),
             interrupt_wait_armed: AtomicBool::new(false),
             dma_context,
+            interconnect,
+            peak_kbps,
             gmu,
             hardware: Mutex::new(HardwareState {
                 boot: BootState::Cold,

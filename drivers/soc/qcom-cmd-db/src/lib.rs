@@ -181,6 +181,22 @@ pub fn read_address(id: &str) -> Option<u32> {
     database.find(id).map(|entry| entry.address)
 }
 
+/// Copy the opaque auxiliary payload associated with a Command DB resource.
+///
+/// Command DB clients define the layout of this payload.  ARC resources use
+/// an array of little-endian `u16` levels, while RPMh interconnect BCMs use a
+/// packed eight-byte descriptor.  Returning an owned copy keeps the read-only
+/// device mapping and its lock out of the caller's lifetime.
+pub fn read_aux_data(id: &str) -> Option<Vec<u8>> {
+    let database = COMMAND_DB.lock().as_ref()?.clone();
+    let entry = database.find(id)?;
+    let mut bytes = Vec::with_capacity(entry.data_length);
+    for offset in 0..entry.data_length {
+        bytes.push(database.read_u8(entry.data_offset.checked_add(offset)?)?);
+    }
+    Some(bytes)
+}
+
 /// Copy a Command DB auxiliary table interpreted as little-endian `u16`s.
 ///
 /// # Arguments

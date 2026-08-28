@@ -41,6 +41,7 @@ fn register_gpu_driver() {
 }
 
 fn register_drivers() {
+    qcom_sc7180_interconnect::force_link();
     register_gmu_driver();
     register_gpu_driver();
 }
