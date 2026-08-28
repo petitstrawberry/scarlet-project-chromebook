@@ -46,8 +46,8 @@ use scarlet::{
     device::{
         Device, DeviceType,
         graphics::{
-            FramebufferConfig, GpuDisplayResource, GpuLinearDisplayBacking, GraphicsDevice,
-            PixelFormat, output::DisplayRegion,
+            FramebufferConfig, GpuDisplayResource, GpuLinearDisplayBacking, GpuPresentOptions,
+            GraphicsDevice, PixelFormat, output::DisplayRegion,
         },
         iommu::{DmaContext, DmaMapping, IommuDomainConfig, IommuDomainType, IommuMapFlags},
         manager::{DeviceManager, DriverPriority, probe_defer},
@@ -77,6 +77,7 @@ const DSI_LANES: u8 = 4;
 const DSI_BITS_PER_PIXEL: u8 = 24;
 const MAXIMUM_SCANOUT_ADDRESS: usize = u32::MAX as usize;
 const SCANOUT_BUFFER_COUNT: usize = 2;
+const GPU_SCANOUT_CACHE_CAPACITY: usize = 4;
 const PRESENT_TIMEOUT_US: u64 = 50_000;
 
 #[derive(Clone, Copy)]
@@ -373,6 +374,8 @@ pub struct Sc7180GraphicsDevice {
     timing: DisplayTiming,
     scanout: [ContiguousPages; SCANOUT_BUFFER_COUNT],
     scanout_dma: [DmaMapping; SCANOUT_BUFFER_COUNT],
+    dma_context: DmaContext,
+    gpu_direct: Mutex<GpuDirectScanoutState>,
     gpu_staging: Mutex<GpuStagingState>,
     gpu_present_count: AtomicUsize,
     front: AtomicUsize,
@@ -384,6 +387,73 @@ struct GpuStagingState {
     source: Option<GpuLinearDisplayBacking>,
     initialized: [bool; SCANOUT_BUFFER_COUNT],
     previous_damage: Option<DisplayRegion>,
+}
+
+struct DirectGpuScanout {
+    backing: GpuLinearDisplayBacking,
+    mapping: DmaMapping,
+}
+
+struct GpuDirectScanoutState {
+    active: Option<GpuLinearDisplayBacking>,
+    mappings: Vec<DirectGpuScanout>,
+}
+
+impl GpuDirectScanoutState {
+    const fn new() -> Self {
+        Self {
+            active: None,
+            mappings: Vec::new(),
+        }
+    }
+
+    fn mapping_address(
+        &mut self,
+        dma_context: &DmaContext,
+        backing: &GpuLinearDisplayBacking,
+    ) -> Result<usize, &'static str> {
+        if let Some(entry) = self.mappings.iter().find(|entry| entry.backing == *backing) {
+            return dpu_dma_address(&entry.mapping);
+        }
+
+        let length = usize::try_from(backing.allocation_size())
+            .map_err(|_| "qcom-sc7180-mdss: GPU scanout allocation exceeds usize")?;
+        let granule = dma_context.mapping_granule();
+        if length == 0 || backing.physical_addr() % granule != 0 || length % granule != 0 {
+            return Err("qcom-sc7180-mdss: GPU scanout is not DMA aligned");
+        }
+        while self.mappings.len() >= GPU_SCANOUT_CACHE_CAPACITY {
+            let Some(index) = self.mappings.iter().position(|entry| {
+                self.active
+                    .as_ref()
+                    .is_none_or(|active| entry.backing != *active)
+            }) else {
+                return Err("qcom-sc7180-mdss: no inactive GPU scanout mapping is available");
+            };
+            self.mappings.remove(index);
+        }
+        let mapping = dma_context
+            .map_phys_owned(
+                backing.physical_addr(),
+                length,
+                IommuMapFlags::READ | IommuMapFlags::COHERENT,
+            )
+            .map_err(|_| "qcom-sc7180-mdss: failed to map direct GPU scanout")?;
+        let address = dpu_dma_address(&mapping)?;
+        self.mappings.push(DirectGpuScanout {
+            backing: backing.clone(),
+            mapping,
+        });
+        Ok(address)
+    }
+
+    fn mark_direct(&mut self, backing: &GpuLinearDisplayBacking) {
+        self.active = Some(backing.clone());
+    }
+
+    fn mark_staged(&mut self) {
+        self.active = None;
+    }
 }
 
 impl GpuStagingState {
@@ -478,6 +548,36 @@ impl Sc7180GraphicsDevice {
             return Err("qcom-sc7180-mdss: GPU scanout backing is undersized");
         }
         Ok(backing)
+    }
+
+    fn present_direct_gpu_backing(
+        &self,
+        backing: &GpuLinearDisplayBacking,
+    ) -> Result<bool, &'static str> {
+        let dma_address = {
+            let mut state = self.gpu_direct.lock();
+            match state.mapping_address(&self.dma_context, backing) {
+                Ok(address) => address,
+                Err(_) => {
+                    state.mark_staged();
+                    return Ok(false);
+                }
+            }
+        };
+
+        // GPU completion includes the canonical CCU retirement sequence.
+        // Order that completed producer writeback before selecting its memory
+        // as the DPU source, then retain both its mapping and owner in state.
+        arch::io_wmb();
+        self.engine.present(dma_address)?;
+        self.gpu_direct.lock().mark_direct(backing);
+        if self.gpu_present_count.fetch_add(1, Ordering::Relaxed) == 0 {
+            println!(
+                "[qcom-sc7180-mdss] direct GPU scanout enabled dma={:#x}",
+                dma_address,
+            );
+        }
+        Ok(true)
     }
 
     fn clamp_region(&self, region: DisplayRegion) -> Option<DisplayRegion> {
@@ -611,6 +711,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         self.clean_regions(&self.scanout[back], &[region])?;
         self.engine
             .present(dpu_dma_address(&self.scanout_dma[back])?)?;
+        self.gpu_direct.lock().mark_staged();
         self.gpu_staging.lock().reset();
         self.front.store(back, Ordering::Release);
         Ok(())
@@ -659,6 +760,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
 
         self.clean_regions(scanout, regions)?;
         self.engine.present(dpu_dma_address(scanout_dma)?)?;
+        self.gpu_direct.lock().mark_staged();
         self.gpu_staging.lock().reset();
         self.front.store(index, Ordering::Release);
         Ok(())
@@ -669,11 +771,28 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         resource: GpuDisplayResource,
         region: DisplayRegion,
     ) -> Result<(), &'static str> {
+        self.present_gpu_resource_region_with_options(
+            resource,
+            region,
+            GpuPresentOptions::default(),
+        )
+    }
+
+    fn present_gpu_resource_region_with_options(
+        &self,
+        resource: GpuDisplayResource,
+        region: DisplayRegion,
+        options: GpuPresentOptions,
+    ) -> Result<(), &'static str> {
         let backing = self.validate_gpu_backing(resource)?;
         let damage = self
             .clamp_region(region)
             .ok_or("qcom-sc7180-mdss: GPU damage region is empty")?;
         let _present = self.present_lock.lock();
+        if options.is_swapchain_buffer() && self.present_direct_gpu_backing(&backing)? {
+            self.gpu_staging.lock().reset();
+            return Ok(());
+        }
         let back = self.front.load(Ordering::Acquire) ^ 1;
         let mut staging = self.gpu_staging.lock();
         if staging
@@ -722,6 +841,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         let flip_start = time::current_time();
         self.engine
             .present(dpu_dma_address(&self.scanout_dma[back])?)?;
+        self.gpu_direct.lock().mark_staged();
         #[cfg(debug_assertions)]
         let flip_us = time::current_time().saturating_sub(flip_start);
         staging.source = Some(backing);
@@ -1091,6 +1211,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         timing,
         scanout,
         scanout_dma,
+        dma_context,
+        gpu_direct: Mutex::new(GpuDirectScanoutState::new()),
         gpu_staging: Mutex::new(GpuStagingState::new()),
         gpu_present_count: AtomicUsize::new(0),
         front: AtomicUsize::new(0),
