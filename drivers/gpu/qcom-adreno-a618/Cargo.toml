@@ -7,6 +7,14 @@ license = "GPL-2.0-only"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Production follows the conventional DRM-style boundary: isolate GPU virtual
+# memory, authorize submitted BOs/relocations, reject privileged packets, and
+# let CP protect enforce the register privilege boundary.  This opt-in mode is
+# retained for bring-up diagnostics when an exact SGFX pipeline-state audit is
+# useful, but it is intentionally not part of the normal submit hot path.
+strict-command-validation = []
+
 [dependencies]
 fdt = "0.1.5"
 scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false }

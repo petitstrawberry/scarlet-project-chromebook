@@ -195,7 +195,28 @@ struct AddressField {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AddressSource {
     Attachment,
-    CanonicalShader(ShaderVariant),
+    CanonicalShader(ShaderStage),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShaderStage {
+    Vertex,
+    Fragment,
+}
+
+fn address_source_matches(source: AddressSource, relocation: RelocationSource) -> bool {
+    match (source, relocation) {
+        (AddressSource::Attachment, RelocationSource::Attachment(_)) => true,
+        (
+            AddressSource::CanonicalShader(ShaderStage::Vertex),
+            RelocationSource::CanonicalShader(actual),
+        ) => actual.is_vertex(),
+        (
+            AddressSource::CanonicalShader(ShaderStage::Fragment),
+            RelocationSource::CanonicalShader(actual),
+        ) => !actual.is_vertex(),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,7 +336,7 @@ fn address_field_encoded(
 fn canonical_address_field(
     fields: &mut Vec<AddressField>,
     word_offset: u32,
-    variant: ShaderVariant,
+    stage: ShaderStage,
 ) -> Result<(), &'static str> {
     fields
         .try_reserve(1)
@@ -326,7 +347,7 @@ fn canonical_address_field(
         requires_complete_linear_image: false,
         required_size: Some(adreno_a6xx_shader_pack::SHADER_SIZE as u64),
         encoding: AddressEncoding::GpuVa64,
-        source: AddressSource::CanonicalShader(variant),
+        source: AddressSource::CanonicalShader(stage),
         a2d: None,
         image: None,
     });
@@ -467,10 +488,10 @@ fn validate_type4(
         (SP_UPDATE_CNTL, 1) => exact(payload, &[0x0000_00ff]),
         (SP_HS_CONFIG | SP_DS_CONFIG | SP_GS_CONFIG, 1) => exact(payload, &[0]),
         (SP_VS_PROGRAM_COUNTER_OFFSET, 7) if payload[0] == 0 && payload[3..] == [0; 4] => {
-            canonical_address_field(addresses, packet_word + 2, ShaderVariant::VsStride16Pos2)
+            canonical_address_field(addresses, packet_word + 2, ShaderStage::Vertex)
         }
         (SP_PS_PROGRAM_COUNTER_OFFSET, 7) if payload[0] == 0 && payload[3..] == [0; 4] => {
-            canonical_address_field(addresses, packet_word + 2, ShaderVariant::FsSolid)
+            canonical_address_field(addresses, packet_word + 2, ShaderStage::Fragment)
         }
         (SP_LB_PARAM_LIMIT, 1) => exact(payload, &[7]),
         (GRAS_CL_CNTL, 1) => exact(payload, &[0x80]),
@@ -640,24 +661,12 @@ fn validate_type7(
         (CP_LOAD_STATE6_GEOM, 3)
             if payload[0] == ((2 << 16) | (8 << 18) | (1 << 22)) && payload[1..3] == [0, 0] =>
         {
-            address_field(
-                addresses,
-                packet_word + 2,
-                ACCESS_READ,
-                false,
-                Some(adreno_a6xx_shader_pack::SHADER_SIZE as u64),
-            )
+            canonical_address_field(addresses, packet_word + 2, ShaderStage::Vertex)
         }
         (CP_LOAD_STATE6_FRAG, 3)
             if payload[0] == ((2 << 16) | (12 << 18) | (1 << 22)) && payload[1..3] == [0, 0] =>
         {
-            address_field(
-                addresses,
-                packet_word + 2,
-                ACCESS_READ,
-                false,
-                Some(adreno_a6xx_shader_pack::SHADER_SIZE as u64),
-            )
+            canonical_address_field(addresses, packet_word + 2, ShaderStage::Fragment)
         }
         (CP_LOAD_STATE6_GEOM, 23)
             if payload[0] == ((1 << 14) | (8 << 18) | (5 << 22)) && payload[1..3] == [0, 0] =>
@@ -1481,17 +1490,6 @@ fn address_by_word_mut(
     addresses.get_mut(index)
 }
 
-fn set_address_source(
-    addresses: &mut [AddressField],
-    word: u32,
-    source: AddressSource,
-) -> Result<(), &'static str> {
-    let address = address_by_word_mut(addresses, word)
-        .ok_or("qcom-adreno-a618: 3D address lacks relocation metadata")?;
-    address.source = source;
-    Ok(())
-}
-
 fn set_image_expectation(
     addresses: &mut [AddressField],
     word: u32,
@@ -1508,6 +1506,7 @@ fn set_image_expectation(
 fn validate_3d_sequences(
     packets: &[Packet<'_>],
     addresses: &mut [AddressField],
+    require_canonical_pipeline: bool,
 ) -> Result<(), &'static str> {
     let mut segment_start = 0usize;
     let mut segment_registers = Vec::new();
@@ -1525,33 +1524,31 @@ fn validate_3d_sequences(
             &packets[segment_start..packet_index],
             &mut segment_registers,
         );
-        let mut matched = None;
-        for candidate in PipelineVariant::ALL {
-            if segment_may_match_pipeline(&segment, candidate)
-                && segment_matches_pipeline(&segment, candidate)
-            {
-                if matched.is_some() {
-                    return Err("qcom-adreno-a618: ambiguous canonical 3D pipeline state");
+        if require_canonical_pipeline {
+            let mut matched = None;
+            for candidate in PipelineVariant::ALL {
+                if segment_may_match_pipeline(&segment, candidate)
+                    && segment_matches_pipeline(&segment, candidate)
+                {
+                    if matched.is_some() {
+                        return Err("qcom-adreno-a618: ambiguous canonical 3D pipeline state");
+                    }
+                    matched = Some(candidate);
                 }
-                matched = Some(candidate);
             }
+            matched.ok_or("qcom-adreno-a618: incomplete canonical 3D pipeline state")?;
         }
-        let link =
-            link_meta(matched.ok_or("qcom-adreno-a618: incomplete canonical 3D pipeline state")?);
-        let (_, vs_address) = segment_shader_program_layout(&segment, SP_VS_PROGRAM_COUNTER_OFFSET)
+
+        // The normal submit boundary does not attempt to recompile or bless a
+        // userspace graphics pipeline.  It still requires explicit VS/FS
+        // program state for every draw so a new context cannot inherit stale
+        // shader addresses.  The address-field scanner has already tagged
+        // these slots by stage and the relocation pass below resolves them to
+        // kernel-owned immutable shader objects.
+        segment_shader_program_layout(&segment, SP_VS_PROGRAM_COUNTER_OFFSET)
             .ok_or("qcom-adreno-a618: vertex shader program layout is missing")?;
-        let (_, fs_address) = segment_shader_program_layout(&segment, SP_PS_PROGRAM_COUNTER_OFFSET)
+        segment_shader_program_layout(&segment, SP_PS_PROGRAM_COUNTER_OFFSET)
             .ok_or("qcom-adreno-a618: fragment shader program layout is missing")?;
-        set_address_source(
-            addresses,
-            vs_address,
-            AddressSource::CanonicalShader(link.vs),
-        )?;
-        set_address_source(
-            addresses,
-            fs_address,
-            AddressSource::CanonicalShader(link.fs),
-        )?;
         let shader_preload_word = |wanted_opcode: u8, wanted_block: u32| {
             segment
                 .packets
@@ -1568,18 +1565,10 @@ fn validate_3d_sequences(
                 })
                 .map(|candidate| candidate.word_offset + 2)
         };
-        set_address_source(
-            addresses,
-            shader_preload_word(CP_LOAD_STATE6_GEOM, 8)
-                .ok_or("qcom-adreno-a618: vertex shader preload is missing")?,
-            AddressSource::CanonicalShader(link.vs),
-        )?;
-        set_address_source(
-            addresses,
-            shader_preload_word(CP_LOAD_STATE6_FRAG, 12)
-                .ok_or("qcom-adreno-a618: fragment shader preload is missing")?,
-            AddressSource::CanonicalShader(link.fs),
-        )?;
+        shader_preload_word(CP_LOAD_STATE6_GEOM, 8)
+            .ok_or("qcom-adreno-a618: vertex shader preload is missing")?;
+        shader_preload_word(CP_LOAD_STATE6_FRAG, 12)
+            .ok_or("qcom-adreno-a618: fragment shader preload is missing")?;
 
         let (pitch_packet, pitch) = segment
             .reg(RB_MRT_PITCH)
@@ -1846,20 +1835,16 @@ fn validate_pm4(
     validate_ccu_transitions(&packets)?;
     validate_render_retirement(&packets)?;
     validate_a2d_sequences(&packets, &mut addresses)?;
-    validate_3d_sequences(&packets, &mut addresses)?;
+    validate_3d_sequences(
+        &packets,
+        &mut addresses,
+        cfg!(feature = "strict-command-validation"),
+    )?;
     for (address, relocation) in addresses.iter().zip(relocations.iter().copied()) {
-        let source_matches = match (address.source, relocation.source) {
-            (AddressSource::Attachment, RelocationSource::Attachment(_)) => true,
-            (
-                AddressSource::CanonicalShader(expected),
-                RelocationSource::CanonicalShader(actual),
-            ) => expected == actual,
-            _ => false,
-        };
         if relocation.pm4_word_offset != address.word_offset
             || relocation.access != address.access
             || relocation.encoding != address.encoding
-            || !source_matches
+            || !address_source_matches(address.source, relocation.source)
         {
             return Err("qcom-adreno-a618: relocation does not match its PM4 address field");
         }
@@ -2092,10 +2077,32 @@ mod tests {
     };
 
     use super::{
-        CP_MEMCPY, CP_MEMCPY_MAX_DWORDS, LinearImage, RB_A2D_DEST_BUFFER_BASE, RejectedPacketKind,
-        ResolvedResource, diagnose_rejected_packet, relocate_one, validate_and_relocate,
-        validate_type7,
+        AddressSource, CP_MEMCPY, CP_MEMCPY_MAX_DWORDS, LinearImage, RB_A2D_DEST_BUFFER_BASE,
+        RejectedPacketKind, ResolvedResource, ShaderStage, address_source_matches,
+        diagnose_rejected_packet, relocate_one, validate_and_relocate, validate_type7,
     };
+
+    #[test]
+    fn canonical_shader_relocations_cannot_cross_pipeline_stages() {
+        use adreno_a6xx_shader_pack::ShaderVariant;
+
+        assert!(address_source_matches(
+            AddressSource::CanonicalShader(ShaderStage::Vertex),
+            RelocationSource::CanonicalShader(ShaderVariant::VsStride16Pos2),
+        ));
+        assert!(address_source_matches(
+            AddressSource::CanonicalShader(ShaderStage::Fragment),
+            RelocationSource::CanonicalShader(ShaderVariant::FsSolid),
+        ));
+        assert!(!address_source_matches(
+            AddressSource::CanonicalShader(ShaderStage::Vertex),
+            RelocationSource::CanonicalShader(ShaderVariant::FsSolid),
+        ));
+        assert!(!address_source_matches(
+            AddressSource::CanonicalShader(ShaderStage::Fragment),
+            RelocationSource::CanonicalShader(ShaderVariant::VsStride16Pos2),
+        ));
+    }
 
     #[test]
     fn canonical_pipeline_prefilter_identity_is_unique() {
