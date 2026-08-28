@@ -1304,7 +1304,36 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
     .unwrap();
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.words.len(), 1_838);
+    assert_eq!(artifact.words.len(), 1_766);
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        packets
+            .iter()
+            .filter(|packet| {
+                matches!(packet.header, Header::Type7 { opcode: 0x65, .. }) && packet.payload == [1]
+            })
+            .count(),
+        4,
+        "each draw must retain a canonical A6xx 3D baseline",
+    );
+    assert_eq!(
+        packets
+            .iter()
+            .filter(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: 0x46,
+                        count: 4
+                    }
+                ) && packet.payload.first() == Some(&0x1c)
+            })
+            .count(),
+        2,
+        "the A2D clear and the complete 3D draw batch retire depth once each",
+    );
 }
 
 #[test]

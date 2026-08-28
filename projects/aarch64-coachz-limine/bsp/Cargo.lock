@@ -186,6 +186,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-sc7180-cpufreq-hw"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-sc7180-dispcc"
 version = "0.1.0"
 dependencies = [
@@ -280,6 +287,7 @@ dependencies = [
  "scarlet-driver-qcom-qmp-usb3-dp",
  "scarlet-driver-qcom-qusb2-v2",
  "scarlet-driver-qcom-rpmh-rsc",
+ "scarlet-driver-qcom-sc7180-cpufreq-hw",
  "scarlet-driver-qcom-sc7180-dispcc",
  "scarlet-driver-qcom-sc7180-gcc-display",
  "scarlet-driver-qcom-sc7180-gpucc",

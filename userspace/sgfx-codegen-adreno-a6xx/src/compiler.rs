@@ -39,6 +39,7 @@ struct PassState {
 
 struct State<'a> {
     pass: Option<PassState>,
+    draw_batch_started: bool,
     pipeline: Option<&'a PipelineMeta>,
     vertex: Option<BufferBinding>,
     index: Option<IndexBinding>,
@@ -52,6 +53,7 @@ impl State<'_> {
     fn new() -> Self {
         Self {
             pass: None,
+            draw_batch_started: false,
             pipeline: None,
             vertex: None,
             index: None,
@@ -160,6 +162,7 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
                     area: pass.area,
                     has_depth: pass.depth.is_some(),
                 });
+                state.draw_batch_started = false;
                 state.pipeline = None;
                 state.vertex = None;
                 state.index = None;
@@ -171,6 +174,10 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
             Operation::EndRenderPass => {
                 if state.pass.take().is_none() {
                     return Err(CompileError::InvalidState);
+                }
+                if state.draw_batch_started {
+                    emitter.end_draw_batch()?;
+                    state.draw_batch_started = false;
                 }
                 state.pipeline = None;
                 state.vertex = None;
@@ -241,27 +248,33 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
             Operation::Draw {
                 vertex_count,
                 first_vertex,
-            } => emit_draw(
-                &mut emitter,
-                input,
-                &state,
-                DrawCall::NonIndexed {
-                    vertex_count: *vertex_count,
-                    first_vertex: *first_vertex,
-                },
-            )?,
+            } => {
+                begin_draw_batch_if_needed(&mut emitter, &mut state)?;
+                emit_draw(
+                    &mut emitter,
+                    input,
+                    &state,
+                    DrawCall::NonIndexed {
+                        vertex_count: *vertex_count,
+                        first_vertex: *first_vertex,
+                    },
+                )?;
+            }
             Operation::DrawIndexed {
                 index_count,
                 first_index,
                 base_vertex,
-            } => emit_draw_indexed(
-                &mut emitter,
-                input,
-                &state,
-                *index_count,
-                *first_index,
-                *base_vertex,
-            )?,
+            } => {
+                begin_draw_batch_if_needed(&mut emitter, &mut state)?;
+                emit_draw_indexed(
+                    &mut emitter,
+                    input,
+                    &state,
+                    *index_count,
+                    *first_index,
+                    *base_vertex,
+                )?;
+            }
         }
     }
 
@@ -269,6 +282,20 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
         return Err(CompileError::InvalidState);
     }
     emitter.finish()
+}
+
+fn begin_draw_batch_if_needed(
+    emitter: &mut Emitter,
+    state: &mut State<'_>,
+) -> Result<(), CompileError> {
+    require_inside_pass(state)?;
+    if !state.draw_batch_started {
+        emitter.begin_draw_batch()?;
+        state.draw_batch_started = true;
+    } else {
+        emitter.continue_draw_batch()?;
+    }
+    Ok(())
 }
 
 fn validate_tables(input: CompileInput<'_>) -> Result<(), CompileError> {

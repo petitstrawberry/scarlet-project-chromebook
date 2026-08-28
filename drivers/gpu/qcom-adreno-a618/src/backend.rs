@@ -15,9 +15,9 @@ use scarlet::{
             GPU_EXECUTION_SUPPORT_QUEUE, GPU_EXECUTION_SUPPORT_TIMELINE,
             GPU_IMAGE_FORMAT_BGRA8_UNORM, GPU_IMAGE_USAGE_PRESENTABLE,
             GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED, GPU_IMAGE_USAGE_TRANSFER_DST,
-            GPU_MAX_OPAQUE_COMMAND_SIZE, GpuBackend, GpuBackendBuffer, GpuBackendBufferInfo,
-            GpuBackendContext, GpuBackendContextInfo, GpuBackendDialectDescriptor,
-            GpuBackendDialectInfo, GpuBackendImage, GpuBackendImageInfo, GpuBackendImageLayout,
+            GpuBackend, GpuBackendBuffer, GpuBackendBufferInfo, GpuBackendContext,
+            GpuBackendContextInfo, GpuBackendDialectDescriptor, GpuBackendDialectInfo,
+            GpuBackendImage, GpuBackendImageInfo, GpuBackendImageLayout,
             GpuBackendLinearDisplayInfo, GpuBackendQueue, GpuBackendQueueInfo,
             GpuBackendSubmitError, GpuBufferCreateInfo, GpuDeviceInfo, GpuDeviceState,
             GpuImageBackingInfo, GpuImageCreateInfo, GpuImageUploadInfo,
@@ -52,6 +52,7 @@ const BACKEND_ID: &[u8] = b"qcom-adreno";
 const DIALECT_ID: &[u8] = b"adreno-a6xx-pm4-reloc-v1";
 const SQE_FIRMWARE_MAX_SIZE: usize = 256 * 1024;
 const RING_SIZE: usize = 32 * 1024;
+const A618_MAX_OPAQUE_COMMAND_SIZE: u32 = adreno_a6xx_submit_wire::MAX_SUBMIT_SIZE as u32;
 const GMEM_BASE: u64 = 0x10_0000;
 const GMEM_SIZE: u64 = 512 * 1024;
 const GPU_TIMEOUT_US: u64 = 1_000_000;
@@ -328,17 +329,21 @@ impl A618Core {
         Ok(())
     }
 
-    fn resolve_shader(&self, variant: ShaderVariant) -> Option<ResolvedResource> {
+    fn shader_pack_base(&self) -> Option<u64> {
         let hardware = self.hardware.lock();
         let pack = hardware.shader_pack.as_ref()?;
+        Some(pack.dma_addr())
+    }
+
+    fn resolve_shader_at(pack_base: u64, variant: ShaderVariant) -> Option<ResolvedResource> {
         let offset = variant.offset();
         let end = offset.checked_add(SHADER_SIZE)?;
-        if end > pack.requested_size() {
+        if end > PACK_SIZE {
             return None;
         }
         Some(ResolvedResource {
             attachment_token: 0,
-            gpu_va: pack.dma_addr().checked_add(offset as u64)?,
+            gpu_va: pack_base.checked_add(offset as u64)?,
             allocation_size: SHADER_SIZE as u64,
             allowed_access: adreno_a6xx_submit_wire::ACCESS_READ,
             linear_image: None,
@@ -1365,21 +1370,33 @@ impl A618ContextInner {
         Ok(())
     }
 
-    fn resolve(&self, attachment_token: u64) -> Option<ResolvedResource> {
-        let entry = self
-            .attachments
-            .lock()
-            .iter()
-            .find(|entry| entry.attachment_token == attachment_token)?
-            .resource
-            .clone();
-        Some(ResolvedResource {
-            attachment_token,
-            gpu_va: entry.gpu_va,
-            allocation_size: entry.allocation_size,
-            allowed_access: entry.allowed_access,
-            linear_image: entry.linear_image,
-        })
+    /// Copy the stable authority records once per submit so validation never
+    /// reacquires an IRQ spinlock or linearly scans the context registry for
+    /// every wire resource. `execution` serializes this snapshot with attach
+    /// and detach, while the copied records remain ordinary preemptible data.
+    fn attachment_snapshot(&self) -> Result<Vec<ResolvedResource>, &'static str> {
+        let attachment_count = self.attachments.lock().len();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(attachment_count)
+            .map_err(|_| "qcom-adreno-a618: attachment snapshot allocation failed")?;
+        let attachments = self.attachments.lock();
+        if attachments.len() != attachment_count {
+            return Err("qcom-adreno-a618: attachment registry changed during submit");
+        }
+        snapshot.extend(attachments.iter().map(|attachment| {
+            let entry = attachment.resource.as_ref();
+            ResolvedResource {
+                attachment_token: attachment.attachment_token,
+                gpu_va: entry.gpu_va,
+                allocation_size: entry.allocation_size,
+                allowed_access: entry.allowed_access,
+                linear_image: entry.linear_image,
+            }
+        }));
+        drop(attachments);
+        snapshot.sort_unstable_by_key(|entry| entry.attachment_token);
+        Ok(snapshot)
     }
 }
 
@@ -1461,7 +1478,7 @@ struct A618Queue {
 
 impl GpuBackendQueue for A618Queue {
     fn query_info(&self) -> GpuBackendQueueInfo {
-        GpuBackendQueueInfo::new(GPU_MAX_OPAQUE_COMMAND_SIZE)
+        GpuBackendQueueInfo::new(A618_MAX_OPAQUE_COMMAND_SIZE)
     }
 
     fn submit(&self, commands: &[u8]) -> Result<(), GpuBackendSubmitError> {
@@ -1474,10 +1491,26 @@ impl GpuBackendQueue for A618Queue {
             .core
             .ensure_shader_pack()
             .map_err(GpuBackendSubmitError::Unavailable)?;
+        let shader_pack_base =
+            self.context
+                .core
+                .shader_pack_base()
+                .ok_or(GpuBackendSubmitError::Unavailable(
+                    "qcom-adreno-a618: canonical shader pack is unavailable",
+                ))?;
+        let attachments = self
+            .context
+            .attachment_snapshot()
+            .map_err(GpuBackendSubmitError::Unavailable)?;
         let words = validate_and_relocate(
             commands,
-            |token| self.context.resolve(token),
-            |variant| self.context.core.resolve_shader(variant),
+            |token| {
+                let index = attachments
+                    .binary_search_by_key(&token, |entry| entry.attachment_token)
+                    .ok()?;
+                attachments.get(index).copied()
+            },
+            |variant| A618Core::resolve_shader_at(shader_pack_base, variant),
         )
         .map_err(|error| {
             early_println!("[a618] submit rejected: {}", error);
@@ -1591,7 +1624,7 @@ impl GpuBackend for A618Backend {
                     0
                 },
                 if ready {
-                    GPU_MAX_OPAQUE_COMMAND_SIZE
+                    A618_MAX_OPAQUE_COMMAND_SIZE
                 } else {
                     0
                 },
@@ -1624,6 +1657,7 @@ impl GpuBackend for A618Backend {
             &NEXT_CONTEXT_ID,
             "qcom-adreno-a618: context ID space exhausted",
         )?;
+        #[cfg(debug_assertions)]
         if let Some(task) = scarlet::task::mytask() {
             early_println!(
                 "[a618-context] create id={} task={} tgid={}",
@@ -1786,7 +1820,7 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         let ring = DmaAllocation::new(&dma_context, RING_SIZE, bidirectional_flags())?;
         let command = DmaAllocation::new(
             &dma_context,
-            GPU_MAX_OPAQUE_COMMAND_SIZE as usize,
+            A618_MAX_OPAQUE_COMMAND_SIZE as usize,
             IommuMapFlags::READ,
         )?;
         let fence = DmaAllocation::new(&dma_context, PAGE_SIZE, bidirectional_flags())?;

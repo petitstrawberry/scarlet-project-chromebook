@@ -23,8 +23,8 @@ pub const HEADER_SIZE: usize = 64;
 pub const RESOURCE_SIZE: usize = 32;
 /// Fixed v1 relocation record size.
 pub const RELOCATION_SIZE: usize = 32;
-/// Maximum payload accepted by Scarlet's opaque queue transport.
-pub const MAX_SUBMIT_SIZE: usize = 64 * 1024;
+/// Maximum A618 payload accepted by Scarlet's opaque queue transport.
+pub const MAX_SUBMIT_SIZE: usize = 256 * 1024;
 /// Maximum resources referenced by one v1 submission.
 pub const MAX_RESOURCES: usize = 1_024;
 /// Maximum relocations referenced by one v1 submission.

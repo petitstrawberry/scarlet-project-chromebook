@@ -247,6 +247,7 @@ pub(crate) struct Emitter {
     generated_objects: Vec<GeneratedObject>,
     ccu_sequence: Option<GeneratedObjectId>,
     event_sequence: u32,
+    draw_batch_active: bool,
     max_words: usize,
 }
 
@@ -259,6 +260,7 @@ impl Emitter {
             generated_objects: Vec::new(),
             ccu_sequence: None,
             event_sequence: 0,
+            draw_batch_active: false,
             max_words: max_words as usize,
         }
     }
@@ -529,7 +531,39 @@ impl Emitter {
         Ok(state)
     }
 
+    pub(crate) fn begin_draw_batch(&mut self) -> Result<(), CompileError> {
+        if self.draw_batch_active {
+            return Err(CompileError::InvalidState);
+        }
+        self.submission_begin_3d()?;
+        self.draw_batch_active = true;
+        Ok(())
+    }
+
+    pub(crate) fn end_draw_batch(&mut self) -> Result<(), CompileError> {
+        if !self.draw_batch_active {
+            return Err(CompileError::InvalidState);
+        }
+        self.submission_end()?;
+        self.draw_batch_active = false;
+        Ok(())
+    }
+
+    pub(crate) fn continue_draw_batch(&mut self) -> Result<(), CompileError> {
+        if !self.draw_batch_active {
+            return Err(CompileError::InvalidState);
+        }
+        // Keep every draw independently canonical for the kernel validator,
+        // but do not retire and invalidate the CCUs between draws targeting
+        // the same render pass. The restore baseline is register state only;
+        // dirty color data remains live until end_draw_batch().
+        self.restore_3d_baseline()
+    }
+
     pub(crate) fn draw(&mut self, draw: DrawState) -> Result<(), CompileError> {
+        if !self.draw_batch_active {
+            return Err(CompileError::InvalidState);
+        }
         let link = link_meta(draw.variant);
         let ShaderMeta::Vertex(vs) = shader_meta(link.vs) else {
             return Err(CompileError::InvalidPm4);
@@ -538,7 +572,6 @@ impl Emitter {
             return Err(CompileError::InvalidPm4);
         };
 
-        self.submission_begin_3d()?;
         self.emit_program_config(vs, fs)?;
         // CP tracks RB_RENDER_CNTL and inserts a required hang-workaround WFI
         // when render modes change.  A raw type-4 write bypasses that tracker.
@@ -731,7 +764,7 @@ impl Emitter {
                 self.push_word(indexed.max_indices)?;
             }
         }
-        self.submission_end()
+        Ok(())
     }
 
     fn emit_vs(&mut self, vs: VertexMeta, link: LinkMeta) -> Result<(), CompileError> {
@@ -916,6 +949,9 @@ impl Emitter {
     }
 
     fn submission_begin_2d(&mut self) -> Result<(), CompileError> {
+        if self.draw_batch_active {
+            return Err(CompileError::InvalidState);
+        }
         self.invalidate_submission_caches()?;
         self.wait_for_idle()?;
         self.packet4(RB_CCU_CNTL, &[0x0800_0000])?;
@@ -925,6 +961,10 @@ impl Emitter {
 
     fn submission_begin_3d(&mut self) -> Result<(), CompileError> {
         self.invalidate_submission_caches()?;
+        self.restore_3d_baseline()
+    }
+
+    fn restore_3d_baseline(&mut self) -> Result<(), CompileError> {
         // Start every self-contained draw from the upstream A6xx restore
         // baseline.  This backend has one synchronous context, so only state
         // reachable by this compact sysmem stream needs to be reset here.
@@ -1182,6 +1222,9 @@ impl Emitter {
     }
 
     pub(crate) fn finish(self) -> Result<RelocatablePm4, CompileError> {
+        if self.draw_batch_active {
+            return Err(CompileError::InvalidState);
+        }
         let mut previous_end = None;
         for fixup in &self.fixups {
             let end = fixup
@@ -1308,6 +1351,7 @@ mod tests {
             generated_objects: vec![],
             ccu_sequence: None,
             event_sequence: 0,
+            draw_batch_active: false,
             max_words: 3,
         };
 

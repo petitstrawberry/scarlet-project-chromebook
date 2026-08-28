@@ -832,8 +832,10 @@ fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
 }
 
 /// A618 can consume the complete IB while a misplaced WFI remains parked in
-/// front of dirty color-cache retirement. Pin every rendering operation to
-/// the upstream ordering instead of accepting the packets independently.
+/// front of dirty color-cache retirement. A2D blits remain self-contained,
+/// while consecutive 3D draws may share one render-pass retirement sequence.
+/// The canonical 3D validator independently requires a complete safe state
+/// segment before every draw.
 fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
     let packets = Packets::new(words)
         .collect::<Result<Vec<_>, _>>()
@@ -874,37 +876,63 @@ fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
             && is_wfi(&retirement[4])
     };
 
-    for (index, packet) in packets.iter().enumerate() {
-        let retirement = if matches!(
+    let mut pending_draw = false;
+    let mut index = 0usize;
+    while index < packets.len() {
+        let packet = &packets[index];
+        if matches!(
             packet.header,
             Header::Type7 {
                 opcode: CP_DRAW_INDX_OFFSET,
                 ..
             }
         ) {
-            packets.get(index + 1..index + 6)
-        } else if matches!(
+            pending_draw = true;
+            index += 1;
+            continue;
+        }
+
+        if matches!(
             packet.header,
             Header::Type7 {
                 opcode: opcode::BLIT,
                 ..
             }
         ) {
+            if pending_draw {
+                return Err(
+                    "qcom-adreno-a618: rendering operation lacks the complete A6xx sysmem epilogue",
+                );
+            }
             if !packets.get(index + 1).is_some_and(is_wfi) {
                 return Err("qcom-adreno-a618: A2D blit is not idle before retirement");
             }
-            packets.get(index + 2..index + 7)
-        } else {
+            let Some(retirement) = packets.get(index + 2..index + 7) else {
+                return Err("qcom-adreno-a618: rendering operation lacks sysmem retirement");
+            };
+            if !is_sysmem_retirement(retirement) {
+                return Err(
+                    "qcom-adreno-a618: rendering operation lacks the complete A6xx sysmem epilogue",
+                );
+            }
+            index += 7;
             continue;
-        };
-        let Some(retirement) = retirement else {
-            return Err("qcom-adreno-a618: rendering operation lacks sysmem retirement");
-        };
-        if !is_sysmem_retirement(retirement) {
-            return Err(
-                "qcom-adreno-a618: rendering operation lacks the complete A6xx sysmem epilogue",
-            );
         }
+
+        if pending_draw
+            && packets
+                .get(index..index.saturating_add(5))
+                .is_some_and(is_sysmem_retirement)
+        {
+            pending_draw = false;
+            index += 5;
+            continue;
+        }
+
+        index += 1;
+    }
+    if pending_draw {
+        return Err("qcom-adreno-a618: rendering operation lacks sysmem retirement");
     }
     Ok(())
 }
@@ -940,9 +968,7 @@ fn set_a2d_expectation(
     word_offset: u32,
     expectation: A2dExpectation,
 ) -> Result<(), &'static str> {
-    let address = addresses
-        .iter_mut()
-        .find(|address| address.word_offset == word_offset)
+    let address = address_by_word_mut(addresses, word_offset)
         .ok_or("qcom-adreno-a618: A2D address lacks relocation metadata")?;
     if address.a2d.replace(expectation).is_some() {
         return Err("qcom-adreno-a618: A2D address is reused by multiple blits");
@@ -1419,14 +1445,46 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
         }
 }
 
+/// Reject impossible pipeline candidates using state that the full matcher
+/// already requires.  A production UI draw used to run the packet-scanning
+/// matcher for all thirteen canonical variants even though stride, vertex
+/// fetch layout, sampler use, and blend mode narrow that set to at most three.
+/// This is only a prefilter: every surviving candidate still passes the exact
+/// canonical-state matcher below, so the accepted PM4 language is unchanged.
+fn segment_may_match_pipeline(
+    segment: &SegmentIndex<'_, '_, '_>,
+    variant: PipelineVariant,
+) -> bool {
+    let fixed = pipeline_state_meta(variant);
+    let reg = |wanted| segment.reg(wanted).map(|(_, payload)| payload);
+    reg(VFD_VERTEX_BUFFER_SIZE)
+        .is_some_and(|payload| payload.len() == 2 && payload[1] == fixed.stride)
+        && reg(VFD_FETCH_INSTR) == Some(fixed.vfd_fetch)
+        && reg(SP_PS_TSIZE) == Some(&[u32::from(fixed.uses_sampler)])
+        && reg(RB_MRT_CONTROL)
+            == Some(if fixed.source_over {
+                &[0x7e3, 0x0701_0706]
+            } else {
+                &[0x7e0, 0x0001_0001]
+            })
+}
+
+fn address_by_word_mut(
+    addresses: &mut [AddressField],
+    word_offset: u32,
+) -> Option<&mut AddressField> {
+    let index = addresses
+        .binary_search_by_key(&word_offset, |address| address.word_offset)
+        .ok()?;
+    addresses.get_mut(index)
+}
+
 fn set_address_source(
     addresses: &mut [AddressField],
     word: u32,
     source: AddressSource,
 ) -> Result<(), &'static str> {
-    let address = addresses
-        .iter_mut()
-        .find(|a| a.word_offset == word)
+    let address = address_by_word_mut(addresses, word)
         .ok_or("qcom-adreno-a618: 3D address lacks relocation metadata")?;
     address.source = source;
     Ok(())
@@ -1437,9 +1495,7 @@ fn set_image_expectation(
     word: u32,
     expectation: ImageExpectation,
 ) -> Result<(), &'static str> {
-    let address = addresses
-        .iter_mut()
-        .find(|a| a.word_offset == word)
+    let address = address_by_word_mut(addresses, word)
         .ok_or("qcom-adreno-a618: 3D image address lacks relocation metadata")?;
     if address.image.replace(expectation).is_some() {
         return Err("qcom-adreno-a618: 3D image address is reused");
@@ -1472,7 +1528,9 @@ fn validate_3d_sequences(
         );
         let mut matched = None;
         for candidate in PipelineVariant::ALL {
-            if segment_matches_pipeline(&segment, candidate) {
+            if segment_may_match_pipeline(&segment, candidate)
+                && segment_matches_pipeline(&segment, candidate)
+            {
                 if matched.is_some() {
                     return Err("qcom-adreno-a618: ambiguous canonical 3D pipeline state");
                 }
@@ -1625,9 +1683,7 @@ fn validate_3d_sequences(
         let (vertex_base, _) = segment
             .reg(VFD_VERTEX_BUFFER_BASE)
             .ok_or("qcom-adreno-a618: VFD buffer base is missing")?;
-        let vertex_address = addresses
-            .iter_mut()
-            .find(|a| a.word_offset == vertex_base + 1)
+        let vertex_address = address_by_word_mut(addresses, vertex_base + 1)
             .ok_or("qcom-adreno-a618: VFD address lacks relocation")?;
         vertex_address.required_size = Some(u64::from(vertex_layout[0]));
 
@@ -1772,6 +1828,12 @@ fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressFiel
     }
     if addresses.len() != decoded.relocation_len() {
         return Err("qcom-adreno-a618: every GPU address must have one relocation");
+    }
+    if !addresses
+        .windows(2)
+        .all(|pair| pair[0].word_offset < pair[1].word_offset)
+    {
+        return Err("qcom-adreno-a618: GPU address fields are not strictly ordered");
     }
     validate_memcpy_barriers(&words)?;
     validate_ccu_transitions(&words)?;
@@ -2755,7 +2817,7 @@ mod tests {
         );
         assert_eq!(
             super::validate_render_retirement(&idle_before_retirement),
-            Err("qcom-adreno-a618: rendering operation lacks the complete A6xx sysmem epilogue")
+            Err("qcom-adreno-a618: rendering operation lacks sysmem retirement")
         );
 
         // SWS writes its reused quad buffer and consumes it as vertex data in

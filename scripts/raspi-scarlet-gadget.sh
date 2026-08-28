@@ -132,6 +132,13 @@ disable_hid_link() {
   fi
 }
 
+remove_hid() {
+  disable_hid_link
+  if [[ -d "$hid_function" ]]; then
+    rmdir "$hid_function" || die "failed to remove disabled HID function"
+  fi
+}
+
 detach() {
   [[ -e "$gadget_root/UDC" ]] || return 0
   local bound
@@ -161,7 +168,7 @@ attach() {
   if [[ "$hid_enabled" == 1 ]]; then
     ensure_hid
   else
-    disable_hid_link
+    remove_hid
   fi
   printf '%s' "$image" > "$mass_lun/file"
   printf '%s' "$udc" > "$gadget_root/UDC"
@@ -183,7 +190,7 @@ replace_image() {
   if [[ "$hid_enabled" == 1 ]]; then
     ensure_hid
   else
-    disable_hid_link
+    remove_hid
   fi
   install -d -m 0755 "$runtime_dir"
   if [[ "$incoming" != "$current_image" ]]; then
@@ -198,7 +205,7 @@ status() {
   local udc=""
   local hid_configured=0
   [[ -e "$gadget_root/UDC" ]] && udc=$(cat "$gadget_root/UDC" 2>/dev/null || true)
-  [[ -L "$config_root/hid.usb0" ]] && hid_configured=1
+  [[ "$hid_enabled" == 1 && -L "$config_root/hid.usb0" ]] && hid_configured=1
   printf 'gadget=%s\n' "$gadget_name"
   printf 'udc=%s\n' "$udc"
   printf 'image=%s\n' "$current_image"
@@ -207,11 +214,12 @@ status() {
   fi
   printf 'hid_enabled=%s\n' "$hid_enabled"
   printf 'hid_configured=%s\n' "$hid_configured"
-  printf 'hid_device=%s\n' "$( [[ -c "$hid_device" ]] && echo "$hid_device" || echo unavailable )"
+  printf 'hid_device=%s\n' "$( [[ "$hid_enabled" == 1 && -c "$hid_device" ]] && echo "$hid_device" || echo unavailable )"
 }
 
 send_key() {
-  local key=${1:-}
+  local key="${1:-}"
+  [[ "$hid_enabled" == 1 ]] || die "HID support is disabled"
   [[ -c "$hid_device" ]] || die "HID device is unavailable: $hid_device"
 
   case "$key" in
@@ -255,8 +263,8 @@ usage: scarlet-gadget {attach|detach|replace|status|key|wait} [argument]
 
 Images live in /run/scarlet by default. `replace` detaches the USB LUN,
 atomically moves an incoming image to current.img, and re-attaches it.
-Set SCARLET_HID_ENABLED=1 to add a USB boot-keyboard function. `key` sends
-one boot-keyboard report through /dev/hidg0.
+The deployed configuration is storage-only; keyboard input is sent through
+the Chromebook EC over CCD.
 EOF
 }
 

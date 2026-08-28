@@ -25,6 +25,7 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-cmd-db" = { path = "../../drivers/soc/qcom-cmd-db", enabled = true }
 "scarlet-driver-qcom-rpmh-rsc" = { path = "../../drivers/soc/qcom-rpmh-rsc", enabled = true }
 "scarlet-driver-qcom-sc7180-rpmhcc" = { path = "../../drivers/clk/qcom-sc7180-rpmhcc", enabled = true }
+"scarlet-driver-qcom-sc7180-cpufreq-hw" = { path = "../../drivers/cpufreq/qcom-sc7180-hw", enabled = true }
 "scarlet-driver-qcom-sc7180-rpmhpd" = { path = "../../drivers/pmdomain/qcom-sc7180-rpmhpd", enabled = true }
 "scarlet-driver-qcom-sc7180-gpucc" = { path = "../../drivers/clk/qcom-sc7180-gpucc", enabled = true }
 "scarlet-driver-qcom-adreno-a618" = { path = "../../drivers/gpu/qcom-adreno-a618", enabled = true }

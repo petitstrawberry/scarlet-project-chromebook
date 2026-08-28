@@ -48,7 +48,11 @@ status() {
     printf 'image_sha256=missing\n'
   fi
   printf 'controller=ssh-command\n'
-  printf 'keys=ctrl-l,enter,ctrl-d,release\n'
+  if [[ "${hid_enabled:-0}" == 1 ]]; then
+    printf 'keys=ctrl-l,enter,ctrl-d,release\n'
+  else
+    printf 'keys=disabled (EC keyboard injection is active on host)\n'
+  fi
 }
 
 usage() {

@@ -43,7 +43,4 @@ expect_failure 'boot launcher rejects an invalid delay' \
     "$script_dir/raspi-scarlet-boot.sh" --delay-ms invalid
 expect_failure 'boot launcher rejects an invalid key' \
     "$script_dir/raspi-scarlet-boot.sh" --key invalid
-expect_failure 'boot launcher rejects an invalid keyboard backend' \
-    "$script_dir/raspi-scarlet-boot.sh" --keyboard-backend invalid
-
 printf 'PASS: serial helper static checks complete\n'

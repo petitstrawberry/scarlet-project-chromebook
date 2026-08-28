@@ -3,12 +3,13 @@
 #![no_std]
 
 //! SC7180 GCC bootstrap and the clock/reset subset used by display, USB, and
-//! the CoachZ trackpad I2C serial engine.
+//! the CoachZ trackpad I2C serial engine, and CPU frequency hardware.
 //!
 //! The driver deliberately covers only the GCC resources consumed by Scarlet's
-//! SC7180 display, primary USB path, and CoachZ trackpad. Firmware may leave
-//! these resources in an arbitrary enabled state, so all enabling operations
-//! preserve unrelated register bits and are safe to repeat during handoff.
+//! SC7180 display, primary USB path, CoachZ trackpad, and CPU DVFS block.
+//! Firmware may leave these resources in an arbitrary enabled state, so all
+//! enabling operations preserve unrelated register bits and are safe to repeat
+//! during handoff.
 
 extern crate alloc;
 
@@ -40,6 +41,8 @@ const GCC_DISP_XO_BRANCH: usize = 0x0b030;
 const GCC_GPU_CFG_AHB_BRANCH: usize = 0x71004;
 const GCC_GPU_MISC: usize = 0x71028;
 const GCC_CLOCK_VOTE: usize = 0x52000;
+const GCC_GPLL0_OUT_MAIN: u32 = 1;
+const GCC_GPLL0_OUT_MAIN_RATE: u64 = 600_000_000;
 
 const GCC_USB30_PRIM_GDSCR: usize = 0x0f004;
 const GCC_USB30_PRIM_MASTER_CMD_RCGR: usize = 0x0f01c;
@@ -492,6 +495,7 @@ impl Clk for Sc7180UsbClock {
 }
 
 struct Sc7180GccProvider {
+    gpll0_out_main: ClkHandle,
     clocks: [ClkHandle; USB_CLOCKS.len()],
     trackpad_i2c_clock: ClkHandle,
     gpu_clocks: [ClkHandle; GPU_CLOCKS.len()],
@@ -517,6 +521,7 @@ impl Sc7180GccProvider {
             }))
         });
         Self {
+            gpll0_out_main: ClkHandle::new(Arc::new(Sc7180Gpll0MainClock)),
             clocks,
             trackpad_i2c_clock,
             gpu_clocks,
@@ -679,6 +684,9 @@ impl ClkProvider for Sc7180GccProvider {
         let [id] = spec else {
             return Err(ClkError::InvalidSpecifier);
         };
+        if *id == GCC_GPLL0_OUT_MAIN {
+            return Ok(self.gpll0_out_main.clone());
+        }
         if *id == GCC_QUPV3_WRAP1_S1_CLK {
             return Ok(self.trackpad_i2c_clock.clone());
         }
@@ -690,6 +698,36 @@ impl ClkProvider for Sc7180GccProvider {
             .position(|clock| clock.id == *id)
             .map(|index| self.clocks[index].clone())
             .ok_or(ClkError::ClockNotFound)
+    }
+}
+
+struct Sc7180Gpll0MainClock;
+
+impl Clk for Sc7180Gpll0MainClock {
+    fn name(&self) -> &'static str {
+        "gpll0_out_main"
+    }
+
+    fn enable(&self) -> Result<(), ClkError> {
+        Ok(())
+    }
+
+    fn disable(&self) {}
+
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    fn recalc_rate(&self, _parent_rate: u64) -> u64 {
+        GCC_GPLL0_OUT_MAIN_RATE
+    }
+
+    fn round_rate(&self, rate: u64, _parent_rate: u64) -> Result<u64, ClkError> {
+        if rate == GCC_GPLL0_OUT_MAIN_RATE {
+            Ok(rate)
+        } else {
+            Err(ClkError::InvalidRate)
+        }
     }
 }
 

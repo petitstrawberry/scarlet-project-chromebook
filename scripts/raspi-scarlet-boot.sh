@@ -4,7 +4,6 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 delay_ms="${SCARLET_ALTFW_KEY_DELAY_MS:-5000}"
 key="${SCARLET_ALTFW_KEY:-ctrl-l}"
-key_backend="${SCARLET_KEYBOARD_BACKEND:-ec}"
 device="${SCARLET_CCD_DEVICE:-18d1:5014}"
 serial="${SCARLET_CCD_SERIAL:-}"
 
@@ -18,14 +17,12 @@ selected keyboard shortcut after the Developer Mode screen has appeared.
 Options:
   --delay-ms MS       Delay after apreset before sending the key (default: 5000).
   --key KEY           ctrl-l, enter, ctrl-d, or release (default: ctrl-l).
-  --keyboard-backend BACKEND
-                      ec or hid (default: ec).
   --device VID:PID    CCD USB device (default: 18d1:5014).
   --serial SERIAL     CCD serial number passed to the EC one-shot helper.
   -h, --help          Show this help text.
 
 Environment overrides: SCARLET_ALTFW_KEY_DELAY_MS, SCARLET_ALTFW_KEY,
-SCARLET_KEYBOARD_BACKEND, SCARLET_CCD_DEVICE, SCARLET_CCD_SERIAL.
+SCARLET_CCD_DEVICE, SCARLET_CCD_SERIAL.
 EOF
 }
 
@@ -53,11 +50,6 @@ while [[ "$#" -gt 0 ]]; do
       key=$2
       shift 2
       ;;
-    --keyboard-backend)
-      [[ "$#" -ge 2 ]] || die '--keyboard-backend requires ec or hid'
-      key_backend=$2
-      shift 2
-      ;;
     --device)
       [[ "$#" -ge 2 ]] || die '--device requires VID:PID'
       device=$2
@@ -80,10 +72,6 @@ case "$delay_ms" in
   ''|*[!0-9]*) die "delay must be a non-negative integer in milliseconds" ;;
 esac
 valid_key "$key" || die "unknown key '$key'"
-case "$key_backend" in
-  ec|hid) ;;
-  *) die "unknown keyboard backend '$key_backend' (expected ec or hid)" ;;
-esac
 
 ec_args=(--interface 2 --device "$device")
 if [[ -n "$serial" ]]; then
@@ -126,12 +114,7 @@ send_ec_key() {
   esac
 }
 
-if [[ "$key_backend" == ec ]]; then
-  echo "Waiting $delay_ms ms, then injecting EC keyboard key '$key'..." >&2
-  wait_before_key
-  send_ec_key "$key"
-else
-  echo "Scheduling Pi HID key '$key' after $delay_ms ms..." >&2
-  "$script_dir/raspi-scarlet-control.sh" schedule-key "$delay_ms" "$key"
-fi
+echo "Waiting $delay_ms ms, then injecting EC keyboard key '$key'..." >&2
+wait_before_key
+send_ec_key "$key"
 echo "Reset/key sequence started." >&2

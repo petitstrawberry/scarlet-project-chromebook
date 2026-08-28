@@ -131,17 +131,12 @@ impl RawBuffer {
         if !raw.cpu_visible() || raw.allocated_size() < logical_size {
             return Err(HandleError::Unsupported);
         }
-        let mapping_len = usize::try_from(raw.allocated_size())
-            .map_err(|_| HandleError::InvalidParameter)?;
+        let mapping_len =
+            usize::try_from(raw.allocated_size()).map_err(|_| HandleError::InvalidParameter)?;
         let mapping = raw.as_handle().as_memory_mapping()?;
-        let mapping_address = mapping.mmap(
-            0,
-            mapping_len,
-            prot::READ | prot::WRITE,
-            flags::SHARED,
-            0,
-        )
-        .map_err(|_| HandleError::SystemError(-1))?;
+        let mapping_address = mapping
+            .mmap(0, mapping_len, prot::READ | prot::WRITE, flags::SHARED, 0)
+            .map_err(|_| HandleError::SystemError(-1))?;
         let attachment_token = match context.raw.attach_buffer(&raw) {
             Ok(token) => token,
             Err(error) => {

@@ -1,5 +1,5 @@
 [Unit]
-Description=Scarlet RAM-backed USB storage and HID gadget
+Description=Scarlet RAM-backed USB storage gadget
 After=local-fs.target
 ConditionPathIsDirectory=/sys/kernel/config
 

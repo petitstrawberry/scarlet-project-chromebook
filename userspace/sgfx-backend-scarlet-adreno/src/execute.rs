@@ -1,6 +1,7 @@
 //! Full SGFX command normalization and A6xx queue submission.
 
 use alloc::{borrow::Cow, vec, vec::Vec};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use gpu_raw::GpuImageBgraRect;
 use sgfx_codegen_adreno_a6xx as codegen;
@@ -12,9 +13,50 @@ use crate::{ContextInner, IrSubmitError, UnsupportedIrFeature, ir, wire};
 const IMAGE_OBJECT_BASE: u32 = 1;
 const BUFFER_OBJECT_BASE: u32 = 1 << 16;
 const PIPELINE_OBJECT_BASE: u32 = 1 << 24;
-// A canonical A618 draw expands to several hundred PM4 words. Keep each
-// physical submit comfortably below Scarlet's bounded 64 KiB queue payload.
-const MAX_DRAWS_PER_SUBMIT: usize = 8;
+// A canonical A618 draw expands to several hundred PM4 words. Production
+// ScarletUI batches of 112 draws stay below the A618-specific 256 KiB queue
+// budget while nearly halving synchronous submit/validation round trips versus
+// the previous 64-draw cap. This is only the optimistic limit: the submission
+// path bisects any unusually resource-heavy chunk whose exact wire encoding
+// exceeds the negotiated ABI limit.
+const MAX_DRAWS_PER_SUBMIT: usize = 112;
+const MAX_TEXTURED_DRAWS_PER_SUBMIT: usize = 112;
+
+fn submit_trace_enabled() -> bool {
+    static TRACE_CACHE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let cached = TRACE_CACHE.load(Ordering::Relaxed);
+    if cached != u8::MAX {
+        return cached != 0;
+    }
+    #[cfg(feature = "std")]
+    let value = std::env::var("SGFX_ADRENO_TRACE").ok();
+    #[cfg(not(feature = "std"))]
+    let value = std::env::var("SGFX_ADRENO_TRACE");
+    let enabled = value.as_deref().is_some_and(|value| {
+        matches!(
+            value,
+            "1" | "true" | "TRUE" | "debug" | "DEBUG" | "trace" | "TRACE"
+        )
+    });
+    TRACE_CACHE.store(enabled as u8, Ordering::Relaxed);
+    enabled
+}
+
+#[cfg(feature = "std")]
+fn monotonic_time_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(not(feature = "std"))]
+fn monotonic_time_ns() -> u64 {
+    std::syscall::syscall0(std::syscall::Syscall::MonotonicTime) as u64
+}
 
 #[derive(Clone, Copy)]
 struct GeneratedProgress {
@@ -57,21 +99,21 @@ impl ContextResources {
                     offset,
                     data,
                 } => {
-                    let object =
-                        self.ensure_buffer(*buffer, &mut resources, &mut external_bindings)?;
-                    // CP_MEMCPY operates in dwords. Preserve the complete SGFX
-                    // byte-write contract by using the coherent CPU mapping for
-                    // unaligned tails, and use pure-codegen PM4 for canonical
-                    // aligned uploads.
-                    if *offset & 3 == 0 && data.len() & 3 == 0 {
-                        operations.push(codegen::Operation::WriteBuffer {
-                            destination: object,
-                            offset: *offset,
-                            data,
-                        });
-                    } else {
-                        self.write_buffer(*buffer, *offset, data)?;
-                    }
+                    // Every A618 SGFX buffer is CPU-visible and mapped into
+                    // the GPU SMMU domain with the coherent attribute. Drain
+                    // earlier GPU work to preserve IR ordering, then update the
+                    // retained shared mapping directly. Encoding CP_MEMCPY for
+                    // dynamic UI data duplicated the host copy and generated
+                    // thousands of relocation/authority records per frame.
+                    self.submit_operations(
+                        context,
+                        queue,
+                        &resources,
+                        &pipelines,
+                        &mut operations,
+                        &external_bindings,
+                    )?;
+                    self.write_buffer(*buffer, *offset, data)?;
                 }
                 ir::Command::WriteTexture { texture, write } => {
                     let descriptor = self.resources.texture(*texture)?;
@@ -216,16 +258,51 @@ impl ContextResources {
         if operations.is_empty() {
             return Ok(());
         }
-        let chunks = split_submission_operations(operations)?;
-        for chunk in chunks {
-            self.submit_one(
+        let chunks = split_submission_operations(operations, MAX_DRAWS_PER_SUBMIT)?;
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(chunks.len())
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        pending.extend(chunks.into_iter().rev());
+        while let Some(chunk) = pending.pop() {
+            let result = self.submit_one(
                 context,
                 queue,
                 resources,
                 pipelines,
                 &chunk,
                 external_bindings,
-            )?;
+            );
+            match result {
+                Ok(()) => {}
+                Err(
+                    error @ IrSubmitError::SubmitWire(adreno_a6xx_submit_wire::Error::InvalidSize),
+                ) => {
+                    let draw_count = chunk
+                        .iter()
+                        .filter(|operation| {
+                            matches!(
+                                operation,
+                                codegen::Operation::Draw { .. }
+                                    | codegen::Operation::DrawIndexed { .. }
+                            )
+                        })
+                        .count();
+                    if draw_count <= 1 {
+                        return Err(error);
+                    }
+                    let retry_limit = (draw_count / 2).max(1);
+                    let retry = split_submission_operations(&chunk, retry_limit)?;
+                    if retry.len() <= 1 {
+                        return Err(error);
+                    }
+                    pending
+                        .try_reserve(retry.len())
+                        .map_err(|_| IrSubmitError::OutOfMemory)?;
+                    pending.extend(retry.into_iter().rev());
+                }
+                Err(error) => return Err(error),
+            }
         }
         operations.clear();
         Ok(())
@@ -240,20 +317,51 @@ impl ContextResources {
         operations: &[codegen::Operation<'data>],
         external_bindings: &[BoundObject],
     ) -> Result<(), IrSubmitError> {
+        let trace = submit_trace_enabled();
+        let started = if trace { monotonic_time_ns() } else { 0 };
         let compiled = codegen::compile(codegen::CompileInput {
             capabilities: context.device.codegen_capabilities,
             resources,
             pipelines,
             operations,
         })?;
+        let compiled_at = if trace { monotonic_time_ns() } else { 0 };
         let mut bindings = Vec::new();
         bindings
             .try_reserve_exact(external_bindings.len())
             .map_err(|_| IrSubmitError::OutOfMemory)?;
         bindings.extend_from_slice(external_bindings);
         let progress = self.materialize_generated(&compiled, &mut bindings)?;
+        let materialized_at = if trace { monotonic_time_ns() } else { 0 };
         let payload = wire::encode(&compiled, &bindings)?;
-        if let Err(error) = queue.submit(&payload) {
+        let encoded_at = if trace { monotonic_time_ns() } else { 0 };
+        let result = queue.submit(&payload);
+        let submitted_at = if trace { monotonic_time_ns() } else { 0 };
+        if trace {
+            let draws = operations
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation,
+                        codegen::Operation::Draw { .. } | codegen::Operation::DrawIndexed { .. }
+                    )
+                })
+                .count();
+            std::println!(
+                "[a618-userspace-path] ops={} draws={} wire={} words={} resources={} relocs={} compile_us={} materialize_us={} encode_us={} queue_us={}",
+                operations.len(),
+                draws,
+                payload.len(),
+                compiled.words.len(),
+                compiled.accesses.len(),
+                compiled.fixups.len(),
+                compiled_at.saturating_sub(started) / 1_000,
+                materialized_at.saturating_sub(compiled_at) / 1_000,
+                encoded_at.saturating_sub(materialized_at) / 1_000,
+                submitted_at.saturating_sub(encoded_at) / 1_000,
+            );
+        }
+        if let Err(error) = result {
             if let Some(progress) = progress {
                 match self.read_scratch_u32(progress.offset) {
                     Ok(actual) => std::println!(
@@ -502,7 +610,13 @@ impl RenderReplayState {
 
 fn split_submission_operations<'data>(
     source: &[codegen::Operation<'data>],
+    max_draws: usize,
 ) -> Result<Vec<Vec<codegen::Operation<'data>>>, IrSubmitError> {
+    if max_draws == 0 {
+        return Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::ResourceState,
+        ));
+    }
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut pass = None;
@@ -562,7 +676,12 @@ fn split_submission_operations<'data>(
                 current.push(operation.clone());
             }
             codegen::Operation::Draw { .. } | codegen::Operation::DrawIndexed { .. } => {
-                if draws == MAX_DRAWS_PER_SUBMIT {
+                let draw_limit = if replay.texture.is_some() {
+                    max_draws.min(MAX_TEXTURED_DRAWS_PER_SUBMIT)
+                } else {
+                    max_draws
+                };
+                if draws >= draw_limit {
                     let mut continuation = pass.ok_or(IrSubmitError::Unsupported(
                         UnsupportedIrFeature::ResourceState,
                     ))?;
@@ -810,8 +929,8 @@ mod tests {
     use alloc::borrow::Cow;
 
     use super::{
-        MAX_DRAWS_PER_SUBMIT, prepare_bgra_upload, require_texture_upload_format,
-        split_submission_operations,
+        MAX_DRAWS_PER_SUBMIT, MAX_TEXTURED_DRAWS_PER_SUBMIT, prepare_bgra_upload,
+        require_texture_upload_format, split_submission_operations,
     };
     use crate::{IrSubmitError, UnsupportedIrFeature, ir};
 
@@ -839,7 +958,7 @@ mod tests {
         }
         source.push(super::codegen::Operation::EndRenderPass);
 
-        let chunks = split_submission_operations(&source).unwrap();
+        let chunks = split_submission_operations(&source, MAX_DRAWS_PER_SUBMIT).unwrap();
         assert_eq!(chunks.len(), 2);
         assert_eq!(
             chunks[0]
@@ -886,6 +1005,51 @@ mod tests {
             chunks[1].last(),
             Some(super::codegen::Operation::EndRenderPass)
         ));
+    }
+
+    #[test]
+    fn textured_render_pass_uses_the_smaller_wire_budget() {
+        let target = super::codegen::ObjectId::new(7);
+        let texture = super::codegen::ObjectId::new(8);
+        let area = ir::PixelRect::new(0, 0, 64, 64).unwrap();
+        let pass = super::codegen::RenderPass {
+            target,
+            area,
+            load: ir::LoadOp::Load,
+            store: ir::StoreOp::Store,
+            depth: None,
+        };
+        let mut source = vec![
+            super::codegen::Operation::BeginRenderPass(pass),
+            super::codegen::Operation::SetTexture(texture),
+        ];
+        for first_vertex in 0..=MAX_TEXTURED_DRAWS_PER_SUBMIT {
+            source.push(super::codegen::Operation::Draw {
+                vertex_count: 3,
+                first_vertex: first_vertex as u32,
+            });
+        }
+        source.push(super::codegen::Operation::EndRenderPass);
+
+        let chunks = split_submission_operations(&source, MAX_DRAWS_PER_SUBMIT).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0]
+                .iter()
+                .filter(|operation| matches!(operation, super::codegen::Operation::Draw { .. }))
+                .count(),
+            MAX_TEXTURED_DRAWS_PER_SUBMIT
+        );
+        assert!(chunks[1].iter().any(
+            |operation| matches!(operation, super::codegen::Operation::SetTexture(bound) if *bound == texture)
+        ));
+        assert_eq!(
+            chunks[1]
+                .iter()
+                .filter(|operation| matches!(operation, super::codegen::Operation::Draw { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
