@@ -20,7 +20,9 @@ use scarlet::{
 use crate::{
     firmware,
     hfi::{HfiPowerTable, LegacyHfi},
+    hfi_abi::HfiPerfLevel,
     memory::{DmaAllocation, bidirectional_flags},
+    opp::{OperatingPoint, read_gmu_operating_points},
     registers::*,
 };
 
@@ -30,8 +32,6 @@ const DUMMY_SIZE: usize = 0x1000;
 const DEBUG_SIZE: usize = 0x4000;
 const LOG_SIZE: usize = 0x4000;
 const GMU_FIRMWARE_MAX_SIZE: usize = 0x8000;
-const GPU_LEVEL: u16 = 0x30;
-const GMU_LEVEL: u16 = 0x30;
 const REGISTER_TIMEOUT_US: u64 = 10_000;
 
 const OOB_GPU_SET_REQUEST: u32 = 16;
@@ -82,6 +82,9 @@ pub(crate) struct A618Gmu {
     debug: DmaAllocation,
     log: DmaAllocation,
     hfi: LegacyHfi,
+    gmu_operating_points: Vec<OperatingPoint>,
+    power: Option<HfiPowerTable>,
+    current_gpu_index: Option<usize>,
     phandle: u32,
     ready: bool,
     active: bool,
@@ -99,6 +102,7 @@ impl A618Gmu {
         pdc_sequence_mapping: MmioMapping,
         dma_context: DmaContext,
         clocks: EnabledClocks,
+        gmu_operating_points: Vec<OperatingPoint>,
         phandle: u32,
     ) -> Result<Self, &'static str> {
         let dummy = DmaAllocation::new(&dma_context, DUMMY_SIZE, bidirectional_flags())?;
@@ -123,6 +127,9 @@ impl A618Gmu {
             debug,
             log,
             hfi,
+            gmu_operating_points,
+            power: None,
+            current_gpu_index: None,
             phandle,
             ready: false,
             active: false,
@@ -143,6 +150,40 @@ impl A618Gmu {
         self.ready
     }
 
+    /// Install the GPU OPPs before the first lazy hardware bring-up.
+    ///
+    /// The GMU platform node is probed separately from the GPU node, so the
+    /// two Linux OPP tables can only be joined after both devices exist.
+    pub(crate) fn configure_gpu_operating_points(
+        &mut self,
+        gpu_operating_points: Vec<OperatingPoint>,
+    ) -> Result<(), &'static str> {
+        if self.active || self.ready {
+            return Err("qcom-adreno-a618: cannot replace OPPs while the GMU is active");
+        }
+        let power = build_power_table(&gpu_operating_points, &self.gmu_operating_points)?;
+        let minimum = power
+            .gx_levels
+            .get(1)
+            .ok_or("qcom-adreno-a618: GPU OPP table has no active level")?;
+        let maximum = power
+            .gx_levels
+            .last()
+            .ok_or("qcom-adreno-a618: GPU OPP table is empty")?;
+        early_println!(
+            "[qcom-adreno-a618] OPP table gpu-levels={} range={}..{} kHz gmu-levels={} initial-index={} dt-peak={} kB/s",
+            power.gx_levels.len(),
+            minimum.frequency_khz,
+            maximum.frequency_khz,
+            power.cx_levels.len(),
+            power.initial_gpu_index,
+            power.peak_kbps.unwrap_or(0),
+        );
+        self.power = Some(power);
+        self.current_gpu_index = None;
+        Ok(())
+    }
+
     pub(crate) fn ensure_ready(&mut self) -> Result<(), &'static str> {
         if self.ready {
             return Ok(());
@@ -155,15 +196,22 @@ impl A618Gmu {
         self.dma_context
             .restore_iommu()
             .map_err(|_| "qcom-adreno-a618: failed to restore GMU IOMMU")?;
-        let power = build_power_table()?;
+        let power = self
+            .power
+            .clone()
+            .ok_or("qcom-adreno-a618: GPU OPP table was not configured")?;
         let firmware = firmware::load(firmware::GMU_FIRMWARE_PATH, GMU_FIRMWARE_MAX_SIZE)?;
+        let initial = power
+            .gx_levels
+            .get(power.initial_gpu_index)
+            .ok_or("qcom-adreno-a618: initial GPU OPP index is invalid")?;
         early_println!(
-            "[qcom-adreno-a618] GMU inputs firmware={} gx=[{:#x},{:#x}] cx=[{:#x},{:#x}]",
+            "[qcom-adreno-a618] GMU inputs firmware={} gpu-levels={} gmu-levels={} initial={} kHz vote={:#x}",
             firmware.len(),
-            power.gx_votes[0],
-            power.gx_votes[1],
-            power.cx_votes[0],
-            power.cx_votes[1],
+            power.gx_levels.len(),
+            power.cx_levels.len(),
+            initial.frequency_khz,
+            initial.vote,
         );
 
         self.active = true;
@@ -194,7 +242,7 @@ impl A618Gmu {
                 "[qcom-adreno-a618] GMU CM3 ready init={:#010x}",
                 self.registers.read(GMU_CM3_FW_INIT_RESULT),
             );
-            self.enable_gfx_rail(power.gx_votes[1])?;
+            self.enable_gfx_rail(initial.vote)?;
             early_println!("[qcom-adreno-a618] GMU GX rail acknowledged");
             self.enable_sptprac()?;
             early_println!(
@@ -213,9 +261,9 @@ impl A618Gmu {
                 self.registers,
                 self.debug.dma_addr() as u32,
                 self.debug.allocation_size() as u32,
-                power,
+                &power,
             )?;
-            self.set_frequency(1)?;
+            self.set_performance_index(power.initial_gpu_index)?;
             self.registers
                 .update(GMU_POWER_COUNTER_SELECT_0, 0xff, 1 << 5);
             self.registers.write(GMU_POWER_COUNTER_ENABLE, 1);
@@ -239,11 +287,17 @@ impl A618Gmu {
             return Err(error);
         }
         self.ready = true;
+        let frequency_khz = self
+            .current_gpu_index
+            .and_then(|index| self.power.as_ref()?.gx_levels.get(index))
+            .map(|level| level.frequency_khz)
+            .unwrap_or(0);
         early_println!(
-            "[qcom-adreno-a618] GMU ready hfi={:#x} debug={:#x} log={:#x}",
+            "[qcom-adreno-a618] GMU ready hfi={:#x} debug={:#x} log={:#x} gpu={} kHz",
             self.hfi.dma_addr(),
             self.debug.dma_addr(),
             self.log.dma_addr(),
+            frequency_khz,
         );
         Ok(())
     }
@@ -514,16 +568,30 @@ impl A618Gmu {
         )
     }
 
-    fn set_frequency(&self, index: u32) -> Result<(), &'static str> {
+    fn set_performance_index(&mut self, index: usize) -> Result<(), &'static str> {
+        let level_count = self
+            .power
+            .as_ref()
+            .map(|power| power.gx_levels.len())
+            .ok_or("qcom-adreno-a618: GPU OPP table was not configured")?;
+        if index == 0 || index >= level_count {
+            return Err("qcom-adreno-a618: GPU performance index is out of range");
+        }
+        if !self.active {
+            return Err("qcom-adreno-a618: GMU is inactive during frequency change");
+        }
+        let index_u32 = u32::try_from(index)
+            .map_err(|_| "qcom-adreno-a618: GPU performance index exceeds register width")?;
         self.registers.write(GMU_DCVS_ACK_OPTION, 0);
         self.registers
-            .write(GMU_DCVS_PERF_SETTING, (3 << 28) | index);
+            .write(GMU_DCVS_PERF_SETTING, (3 << 28) | index_u32);
         self.registers.write(GMU_DCVS_BW_SETTING, 0xff);
         self.set_oob(OOB_DCVS_REQUEST, OOB_DCVS_ACK)?;
         self.clear_oob(OOB_DCVS_ACK);
         if self.registers.read(GMU_DCVS_RETURN) != 0 {
-            return Err("qcom-adreno-a618: GMU rejected initial frequency vote");
+            return Err("qcom-adreno-a618: GMU rejected frequency vote");
         }
+        self.current_gpu_index = Some(index);
         Ok(())
     }
 
@@ -621,21 +689,42 @@ fn gmu_chip_id() -> u32 {
     (chip_id & 0xffff_0000) | ((chip_id << 4) & 0xf000) | ((chip_id << 8) & 0x0f00)
 }
 
-fn build_power_table() -> Result<HfiPowerTable, &'static str> {
-    let gx_secondary = if scarlet_driver_qcom_cmd_db::read_aux_u16("gmxc.lvl").is_some() {
-        "gmxc.lvl"
-    } else {
-        "mx.lvl"
-    };
+fn build_hfi_levels(
+    operating_points: &[OperatingPoint],
+    primary_id: &str,
+) -> Result<Vec<HfiPerfLevel>, &'static str> {
+    let mut levels = Vec::with_capacity(operating_points.len() + 1);
+    levels.push(HfiPerfLevel {
+        vote: build_vote(0, primary_id, "mx.lvl")?,
+        frequency_khz: 0,
+    });
+    for point in operating_points {
+        levels.push(HfiPerfLevel {
+            vote: build_vote(point.level, primary_id, "mx.lvl")?,
+            frequency_khz: point.frequency_khz,
+        });
+    }
+    Ok(levels)
+}
+
+fn build_power_table(
+    gpu_operating_points: &[OperatingPoint],
+    gmu_operating_points: &[OperatingPoint],
+) -> Result<HfiPowerTable, &'static str> {
+    let gx_levels = build_hfi_levels(gpu_operating_points, "gfx.lvl")?;
+    let initial_gpu_index = gx_levels
+        .len()
+        .checked_sub(1)
+        .filter(|index| *index != 0)
+        .ok_or("qcom-adreno-a618: GPU OPP table has no active level")?;
     Ok(HfiPowerTable {
-        gx_votes: [
-            build_vote(0, "gfx.lvl", gx_secondary)?,
-            build_vote(GPU_LEVEL, "gfx.lvl", gx_secondary)?,
-        ],
-        cx_votes: [
-            build_vote(0, "cx.lvl", "mx.lvl")?,
-            build_vote(GMU_LEVEL, "cx.lvl", "mx.lvl")?,
-        ],
+        gx_levels,
+        cx_levels: build_hfi_levels(gmu_operating_points, "cx.lvl")?,
+        initial_gpu_index,
+        peak_kbps: gpu_operating_points
+            .iter()
+            .filter_map(|point| point.peak_kbps)
+            .max(),
     })
 }
 
@@ -723,6 +812,7 @@ fn enable_clocks(device: &PlatformDeviceInfo) -> Result<EnabledClocks, &'static 
 }
 
 pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+    let gmu_operating_points = read_gmu_operating_points(device)?;
     let gpucc = match gpucc_phandle(device)
         .and_then(scarlet_driver_qcom_sc7180_gpucc::get_sc7180_gpucc_by_phandle)
     {
@@ -782,6 +872,7 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         pdc_sequence_mapping,
         dma_context,
         clocks,
+        gmu_operating_points,
         phandle,
     )?;
     GMUS.lock().push(Arc::new(Mutex::new(gmu)));

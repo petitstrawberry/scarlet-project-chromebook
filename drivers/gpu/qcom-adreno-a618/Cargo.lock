@@ -86,6 +86,7 @@ dependencies = [
  "adreno-a6xx-pm4",
  "adreno-a6xx-shader-pack",
  "adreno-a6xx-submit-wire",
+ "fdt",
  "scarlet",
  "scarlet-driver-qcom-cmd-db",
  "scarlet-driver-qcom-sc7180-gpucc",

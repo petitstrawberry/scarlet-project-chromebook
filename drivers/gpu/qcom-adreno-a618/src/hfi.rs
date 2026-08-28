@@ -8,8 +8,8 @@ use scarlet::{arch, device::iommu::DmaContext, time};
 
 use crate::{
     hfi_abi::{
-        COMMAND_HEADER_WORD, QUEUE_WORDS, RESPONSE_HEADER_WORD, ack_matches, bandwidth_table,
-        initialize_legacy_table, performance_table,
+        COMMAND_HEADER_WORD, HfiPerfLevel, QUEUE_WORDS, RESPONSE_HEADER_WORD, ack_matches,
+        bandwidth_table, initialize_legacy_table, performance_table,
     },
     memory::{DmaAllocation, bidirectional_flags},
     registers::{
@@ -36,11 +36,15 @@ const HFI_MSG_CMD: u32 = 0;
 const MESSAGE_INTERRUPT: u32 = 1;
 const HFI_TIMEOUT_US: u64 = 1_000_000;
 
-/// Minimal, conservative power table used until OPP parsing is generalized.
-#[derive(Debug, Clone, Copy)]
+/// Linux-compatible HFI v1 performance table built from device-tree OPPs.
+#[derive(Debug, Clone)]
 pub(crate) struct HfiPowerTable {
-    pub(crate) gx_votes: [u32; 2],
-    pub(crate) cx_votes: [u32; 2],
+    pub(crate) gx_levels: Vec<HfiPerfLevel>,
+    pub(crate) cx_levels: Vec<HfiPerfLevel>,
+    pub(crate) initial_gpu_index: usize,
+    // A618's HFI bandwidth table contains only an off entry. Linux applies
+    // this OPP value through the separate SC7180 RPMh interconnect provider.
+    pub(crate) peak_kbps: Option<u32>,
 }
 
 pub(crate) struct LegacyHfi {
@@ -201,7 +205,7 @@ impl LegacyHfi {
         registers: GmuRegisters,
         debug_iova: u32,
         debug_size: u32,
-        power: HfiPowerTable,
+        power: &HfiPowerTable,
     ) -> Result<(), &'static str> {
         self.send(
             registers,
@@ -216,7 +220,7 @@ impl LegacyHfi {
         self.send(
             registers,
             HFI_H2F_MSG_PERF_TABLE,
-            performance_table(power.gx_votes, power.cx_votes),
+            performance_table(&power.gx_levels, &power.cx_levels)?,
         )?;
         self.send(registers, HFI_H2F_MSG_BW_TABLE, bandwidth_table())?;
         self.send(registers, HFI_H2F_MSG_TEST, vec![0])?;

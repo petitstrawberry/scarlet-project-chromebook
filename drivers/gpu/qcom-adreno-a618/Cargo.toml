@@ -8,6 +8,7 @@ license = "GPL-2.0-only"
 path = "src/lib.rs"
 
 [dependencies]
+fdt = "0.1.5"
 scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false }
 scarlet-driver-qcom-sc7180-gpucc = { path = "../../clk/qcom-sc7180-gpucc" }
 scarlet-driver-qcom-cmd-db = { path = "../../soc/qcom-cmd-db" }

@@ -41,6 +41,7 @@ use crate::{
     firmware,
     gmu::{self, A618Gmu},
     memory::{DmaAllocation, bidirectional_flags},
+    opp::read_gpu_operating_points,
     registers::*,
     submit::{LinearImage, ResolvedResource, diagnose_rejected_packet, validate_and_relocate},
 };
@@ -1786,6 +1787,9 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         Some(gmu) => gmu,
         None => return probe_defer(),
     };
+    let gpu_operating_points = read_gpu_operating_points(device)?;
+    gmu.lock()
+        .configure_gpu_operating_points(gpu_operating_points)?;
     let resource = device
         .get_resources()
         .iter()

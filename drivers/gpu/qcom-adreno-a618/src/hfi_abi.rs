@@ -2,6 +2,8 @@
 
 //! Pure legacy A618 HFI v1 layouts, kept separate for byte-golden testing.
 
+extern crate alloc;
+
 use alloc::{vec, vec::Vec};
 
 pub(crate) const TABLE_HEADER_WORDS: usize = 6;
@@ -24,9 +26,23 @@ const HFI_MSG_CMD: u32 = 0;
 const HFI_MSG_ACK: u32 = 1;
 const HFI_MSG_ACK_V1: u32 = 2;
 
-// SC7180 CoachZ OPP minima, expressed in the HFI v1 ABI's kHz units.
-const A618_MIN_GPU_FREQ_KHZ: u32 = 180_000;
-const A618_MIN_GMU_FREQ_KHZ: u32 = 200_000;
+pub(crate) const MAX_GPU_LEVELS: usize = 16;
+pub(crate) const MAX_GMU_LEVELS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HfiPerfLevel {
+    pub(crate) vote: u32,
+    pub(crate) frequency_khz: u32,
+}
+
+fn levels_are_valid(levels: &[HfiPerfLevel], maximum: usize) -> bool {
+    !levels.is_empty()
+        && levels.len() <= maximum
+        && levels[0].frequency_khz == 0
+        && levels
+            .windows(2)
+            .all(|pair| pair[0].frequency_khz < pair[1].frequency_khz)
+}
 
 fn initialize_queue(words: &mut [u32], header: usize, iova: u32, id: u32) {
     words[header + Q_STATUS] = 1;
@@ -57,18 +73,29 @@ pub(crate) fn initialize_legacy_table(
     Ok(())
 }
 
-pub(crate) fn performance_table(gx_votes: [u32; 2], cx_votes: [u32; 2]) -> Vec<u32> {
-    let mut message = vec![0; 3 + 16 * 2 + 4 * 2];
-    message[1] = 2;
-    message[2] = 2;
-    message[3] = gx_votes[0];
-    message[5] = gx_votes[1];
-    message[6] = A618_MIN_GPU_FREQ_KHZ;
-    let cx = 3 + 16 * 2;
-    message[cx] = cx_votes[0];
-    message[cx + 2] = cx_votes[1];
-    message[cx + 3] = A618_MIN_GMU_FREQ_KHZ;
-    message
+pub(crate) fn performance_table(
+    gx_levels: &[HfiPerfLevel],
+    cx_levels: &[HfiPerfLevel],
+) -> Result<Vec<u32>, &'static str> {
+    if !levels_are_valid(gx_levels, MAX_GPU_LEVELS) || !levels_are_valid(cx_levels, MAX_GMU_LEVELS)
+    {
+        return Err("qcom-adreno-a618: HFI performance table level count is invalid");
+    }
+    let mut message = vec![0; 3 + MAX_GPU_LEVELS * 2 + MAX_GMU_LEVELS * 2];
+    message[1] = gx_levels.len() as u32;
+    message[2] = cx_levels.len() as u32;
+    for (index, level) in gx_levels.iter().enumerate() {
+        let offset = 3 + index * 2;
+        message[offset] = level.vote;
+        message[offset + 1] = level.frequency_khz;
+    }
+    let cx = 3 + MAX_GPU_LEVELS * 2;
+    for (index, level) in cx_levels.iter().enumerate() {
+        let offset = cx + index * 2;
+        message[offset] = level.vote;
+        message[offset + 1] = level.frequency_khz;
+    }
+    Ok(message)
 }
 
 pub(crate) fn bandwidth_table() -> Vec<u32> {
@@ -146,12 +173,67 @@ mod tests {
 
     #[test]
     fn coachz_perf_v1_table_has_canonical_43_dwords() {
-        let table = performance_table([0x11, 0x22], [0x33, 0x44]);
+        let gx_levels = [
+            HfiPerfLevel {
+                vote: 0x11,
+                frequency_khz: 0,
+            },
+            HfiPerfLevel {
+                vote: 0x22,
+                frequency_khz: 180_000,
+            },
+            HfiPerfLevel {
+                vote: 0x55,
+                frequency_khz: 800_000,
+            },
+        ];
+        let cx_levels = [
+            HfiPerfLevel {
+                vote: 0x33,
+                frequency_khz: 0,
+            },
+            HfiPerfLevel {
+                vote: 0x44,
+                frequency_khz: 200_000,
+            },
+        ];
+        let table = performance_table(&gx_levels, &cx_levels).unwrap();
         assert_eq!(table.len(), 43);
-        assert_eq!(&table[..7], &[0, 2, 2, 0x11, 0, 0x22, 180_000]);
+        assert_eq!(
+            &table[..9],
+            &[0, 3, 2, 0x11, 0, 0x22, 180_000, 0x55, 800_000]
+        );
         assert_eq!(&table[35..39], &[0x33, 0, 0x44, 200_000]);
-        assert!(table[7..35].iter().all(|word| *word == 0));
+        assert!(table[9..35].iter().all(|word| *word == 0));
         assert!(table[39..].iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    fn perf_v1_rejects_counts_that_firmware_cannot_represent() {
+        let level = HfiPerfLevel {
+            vote: 0,
+            frequency_khz: 0,
+        };
+        assert!(performance_table(&[], &[level]).is_err());
+        assert!(performance_table(&[level], &[]).is_err());
+        assert!(performance_table(&[level; 17], &[level]).is_err());
+        assert!(performance_table(&[level], &[level; 5]).is_err());
+        assert!(
+            performance_table(
+                &[
+                    HfiPerfLevel {
+                        vote: 1,
+                        frequency_khz: 180_000,
+                    },
+                    HfiPerfLevel {
+                        vote: 2,
+                        frequency_khz: 800_000,
+                    },
+                ],
+                &[level],
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod gmu;
 mod hfi;
 mod hfi_abi;
 mod memory;
+mod opp;
 mod registers;
 mod submit;
 
