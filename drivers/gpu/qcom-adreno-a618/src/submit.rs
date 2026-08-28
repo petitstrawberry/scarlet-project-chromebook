@@ -726,10 +726,9 @@ fn validate_type7(
 /// packet can consume its destination.  Userspace currently uses CP_MEMCPY for
 /// per-frame vertex uploads, so accepting an unpaired copy would permit a
 /// deterministic GPU data race even though each packet is individually safe.
-fn validate_memcpy_barriers(words: &[u32]) -> Result<(), &'static str> {
+fn validate_memcpy_barriers(packets: &[Packet<'_>]) -> Result<(), &'static str> {
     let mut require_wait = false;
-    for packet in Packets::new(words) {
-        let packet = packet.map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
+    for packet in packets.iter().copied() {
         if require_wait {
             match packet.header {
                 Header::Type7 {
@@ -766,7 +765,7 @@ fn validate_memcpy_barriers(words: &[u32]) -> Result<(), &'static str> {
 /// A6xx cannot invalidate a CCU that may still contain dirty data.  Accept
 /// only the two sequences emitted by this dialect: color clean/invalidate at
 /// submission start, or the complete sysmem color+depth retirement chain.
-fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
+fn validate_ccu_transitions(packets: &[Packet<'_>]) -> Result<(), &'static str> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Transition {
         Idle,
@@ -776,8 +775,7 @@ fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
     }
 
     let mut transition = Transition::Idle;
-    for packet in Packets::new(words) {
-        let packet = packet.map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
+    for packet in packets.iter().copied() {
         let addressed = |event| {
             matches!(
                 packet.header,
@@ -836,10 +834,7 @@ fn validate_ccu_transitions(words: &[u32]) -> Result<(), &'static str> {
 /// while consecutive 3D draws may share one render-pass retirement sequence.
 /// The canonical 3D validator independently requires a complete safe state
 /// segment before every draw.
-fn validate_render_retirement(words: &[u32]) -> Result<(), &'static str> {
-    let packets = Packets::new(words)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "qcom-adreno-a618: malformed PM4 retirement stream")?;
+fn validate_render_retirement(packets: &[Packet<'_>]) -> Result<(), &'static str> {
     let is_addressed = |packet: &Packet<'_>, event| {
         matches!(
             packet.header,
@@ -977,12 +972,11 @@ fn set_a2d_expectation(
 }
 
 fn validate_a2d_sequences(
-    words: &[u32],
+    packets: &[Packet<'_>],
     addresses: &mut [AddressField],
 ) -> Result<(), &'static str> {
     let mut state = A2dState::default();
-    for packet in Packets::new(words) {
-        let packet = packet.map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
+    for packet in packets.iter().copied() {
         match packet.header {
             Header::Type4 { register, .. } => match register {
                 RB_A2D_BLT_CNTL => {
@@ -1504,12 +1498,9 @@ fn set_image_expectation(
 }
 
 fn validate_3d_sequences(
-    words: &[u32],
+    packets: &[Packet<'_>],
     addresses: &mut [AddressField],
 ) -> Result<(), &'static str> {
-    let packets: Vec<_> = Packets::new(words)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "qcom-adreno-a618: malformed 3D packet stream")?;
     let mut segment_start = 0usize;
     let mut segment_registers = Vec::new();
     for (packet_index, packet) in packets.iter().copied().enumerate() {
@@ -1811,12 +1802,20 @@ pub(crate) fn diagnose_rejected_packet(bytes: &[u8]) -> Option<RejectedPacket> {
     None
 }
 
-fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressField>), &'static str> {
+fn validate_pm4(
+    decoded: DecodedSubmit<'_>,
+    relocations: &[Relocation],
+) -> Result<(Vec<u32>, Vec<AddressField>), &'static str> {
     let words = copy_pm4(decoded)?;
+    let packets = Packets::new(&words)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
 
     let mut addresses = Vec::new();
-    for packet in Packets::new(&words) {
-        let packet = packet.map_err(|_| "qcom-adreno-a618: malformed PM4 packet stream")?;
+    addresses
+        .try_reserve_exact(decoded.relocation_len())
+        .map_err(|_| "qcom-adreno-a618: PM4 address validation allocation failed")?;
+    for packet in packets.iter().copied() {
         match packet.header {
             Header::Type4 { register, .. } => {
                 validate_type4(register, packet.payload, packet.word_offset, &mut addresses)?
@@ -1826,7 +1825,7 @@ fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressFiel
             }
         }
     }
-    if addresses.len() != decoded.relocation_len() {
+    if addresses.len() != relocations.len() {
         return Err("qcom-adreno-a618: every GPU address must have one relocation");
     }
     if !addresses
@@ -1835,15 +1834,12 @@ fn validate_pm4(decoded: DecodedSubmit<'_>) -> Result<(Vec<u32>, Vec<AddressFiel
     {
         return Err("qcom-adreno-a618: GPU address fields are not strictly ordered");
     }
-    validate_memcpy_barriers(&words)?;
-    validate_ccu_transitions(&words)?;
-    validate_render_retirement(&words)?;
-    validate_a2d_sequences(&words, &mut addresses)?;
-    validate_3d_sequences(&words, &mut addresses)?;
-    for (index, address) in addresses.iter().enumerate() {
-        let relocation = decoded
-            .relocation(index)
-            .ok_or("qcom-adreno-a618: relocation table is incomplete")?;
+    validate_memcpy_barriers(&packets)?;
+    validate_ccu_transitions(&packets)?;
+    validate_render_retirement(&packets)?;
+    validate_a2d_sequences(&packets, &mut addresses)?;
+    validate_3d_sequences(&packets, &mut addresses)?;
+    for (address, relocation) in addresses.iter().zip(relocations.iter().copied()) {
         let source_matches = match (address.source, relocation.source) {
             (AddressSource::Attachment, RelocationSource::Attachment(_)) => true,
             (
@@ -1948,11 +1944,19 @@ pub(crate) fn validate_and_relocate(
             }),
         });
     }
-    let (mut words, addresses) = validate_pm4(decoded)?;
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(decoded.relocation_len())
+        .map_err(|_| "qcom-adreno-a618: relocation validation allocation failed")?;
     for index in 0..decoded.relocation_len() {
-        let relocation = decoded
-            .relocation(index)
-            .ok_or("qcom-adreno-a618: relocation table is incomplete")?;
+        relocations.push(
+            decoded
+                .relocation(index)
+                .ok_or("qcom-adreno-a618: relocation table is incomplete")?,
+        );
+    }
+    let (mut words, addresses) = validate_pm4(decoded, &relocations)?;
+    for (index, relocation) in relocations.iter().copied().enumerate() {
         let resource = match relocation.source {
             RelocationSource::Attachment(resource_index) => *resources
                 .get(resource_index as usize)
