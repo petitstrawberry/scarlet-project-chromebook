@@ -82,7 +82,6 @@ dependencies = [
 name = "scarlet-driver-qcom-sc7180-interconnect"
 version = "0.1.0"
 dependencies = [
- "fdt",
  "scarlet",
  "scarlet-driver-qcom-cmd-db",
  "scarlet-driver-qcom-rpmh-rsc",
