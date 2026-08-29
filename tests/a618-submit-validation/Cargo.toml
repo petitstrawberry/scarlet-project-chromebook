@@ -5,6 +5,10 @@ edition = "2024"
 license = "GPL-2.0-only"
 publish = false
 
+[features]
+default = ["strict-command-validation"]
+strict-command-validation = []
+
 [lib]
 path = "src/lib.rs"
 

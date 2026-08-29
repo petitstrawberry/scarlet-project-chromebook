@@ -1222,6 +1222,101 @@ fn segment_shader_program_layout(
     Some((word_offset, word_offset + 2))
 }
 
+fn segment_shader_preload_word(
+    segment: &SegmentIndex<'_, '_, '_>,
+    wanted_opcode: u8,
+    wanted_block: u32,
+) -> Option<u32> {
+    segment
+        .packets
+        .iter()
+        .copied()
+        .find(|candidate| {
+            matches!(candidate.header, Header::Type7 { opcode, .. } if opcode == wanted_opcode)
+                && candidate.payload.len() == 3
+                && (candidate.payload[0] >> 14) & 3 == 0
+                && (candidate.payload[0] >> 16) & 3 == 2
+                && (candidate.payload[0] >> 18) & 0xf == wanted_block
+        })
+        .map(|candidate| candidate.word_offset + 2)
+}
+
+fn relocation_is_shader(
+    relocations: &[Relocation],
+    word_offset: u32,
+    expected: ShaderVariant,
+) -> bool {
+    relocations.iter().any(|relocation| {
+        relocation.pm4_word_offset == word_offset
+            && relocation.source == RelocationSource::CanonicalShader(expected)
+    })
+}
+
+/// Validate the compact delta emitted after one complete canonical draw.
+///
+/// Strict command validation still pins the inherited shader pair exactly,
+/// while allowing only address, bounds, uniforms, texture bindings, and the
+/// synchronization packets that may legitimately vary between compatible
+/// draws. Every packet continues through the production allowlist and range
+/// validator before this check.
+fn segment_matches_retained_pipeline(
+    segment: &SegmentIndex<'_, '_, '_>,
+    relocations: &[Relocation],
+    variant: PipelineVariant,
+) -> bool {
+    let link = link_meta(variant);
+    let Some((_, vs_program)) =
+        segment_shader_program_layout(segment, SP_VS_PROGRAM_COUNTER_OFFSET)
+    else {
+        return false;
+    };
+    let Some((_, fs_program)) =
+        segment_shader_program_layout(segment, SP_PS_PROGRAM_COUNTER_OFFSET)
+    else {
+        return false;
+    };
+    let Some(vs_preload) = segment_shader_preload_word(segment, CP_LOAD_STATE6_GEOM, 8) else {
+        return false;
+    };
+    let Some(fs_preload) = segment_shader_preload_word(segment, CP_LOAD_STATE6_FRAG, 12) else {
+        return false;
+    };
+    if !relocation_is_shader(relocations, vs_program, link.vs)
+        || !relocation_is_shader(relocations, vs_preload, link.vs)
+        || !relocation_is_shader(relocations, fs_program, link.fs)
+        || !relocation_is_shader(relocations, fs_preload, link.fs)
+    {
+        return false;
+    }
+
+    segment.packets.iter().all(|packet| match packet.header {
+        Header::Type4 { register, .. } => matches!(
+            register,
+            RB_MRT_PITCH
+                | RB_MRT_BASE
+                | GRAS_CL_VIEWPORT_XOFFSET
+                | GRAS_SC_SCREEN_SCISSOR_TL
+                | GRAS_SC_VIEWPORT_SCISSOR_TL
+                | GRAS_SC_WINDOW_SCISSOR_TL
+                | VFD_INDEX_OFFSET
+                | VFD_VERTEX_BUFFER_BASE
+                | VFD_VERTEX_BUFFER_SIZE
+                | SP_VS_PROGRAM_COUNTER_OFFSET
+                | SP_VS_PVT_MEM_STACK_OFFSET
+                | SP_PS_PROGRAM_COUNTER_OFFSET
+                | SP_PS_PVT_MEM_STACK_OFFSET
+                | SP_PS_SAMPLER_BASE
+                | SP_PS_TEXMEMOBJ_BASE
+        ),
+        Header::Type7 { opcode, .. } => match opcode {
+            CP_LOAD_STATE6_GEOM | CP_LOAD_STATE6_FRAG | CP_MEM_WRITE => true,
+            opcode::WAIT_FOR_IDLE | opcode::WAIT_MEM_WRITES => true,
+            opcode::EVENT_WRITE => packet.payload == [EVENT_CACHE_INVALIDATE],
+            _ => false,
+        },
+    })
+}
+
 fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: PipelineVariant) -> bool {
     let packets = segment.packets;
     let link = link_meta(variant);
@@ -1506,10 +1601,12 @@ fn set_image_expectation(
 fn validate_3d_sequences(
     packets: &[Packet<'_>],
     addresses: &mut [AddressField],
+    relocations: &[Relocation],
     require_canonical_pipeline: bool,
 ) -> Result<(), &'static str> {
     let mut segment_start = 0usize;
     let mut segment_registers = Vec::new();
+    let mut retained_pipeline = None;
     for (packet_index, packet) in packets.iter().copied().enumerate() {
         if !matches!(
             packet.header,
@@ -1536,7 +1633,15 @@ fn validate_3d_sequences(
                     matched = Some(candidate);
                 }
             }
-            matched.ok_or("qcom-adreno-a618: incomplete canonical 3D pipeline state")?;
+            match matched {
+                Some(variant) => retained_pipeline = Some(variant),
+                None if retained_pipeline.is_some_and(|variant| {
+                    segment_matches_retained_pipeline(&segment, relocations, variant)
+                }) => {}
+                None => {
+                    return Err("qcom-adreno-a618: incomplete canonical 3D pipeline state");
+                }
+            }
         }
 
         // The normal submit boundary does not attempt to recompile or bless a
@@ -1549,25 +1654,9 @@ fn validate_3d_sequences(
             .ok_or("qcom-adreno-a618: vertex shader program layout is missing")?;
         segment_shader_program_layout(&segment, SP_PS_PROGRAM_COUNTER_OFFSET)
             .ok_or("qcom-adreno-a618: fragment shader program layout is missing")?;
-        let shader_preload_word = |wanted_opcode: u8, wanted_block: u32| {
-            segment
-                .packets
-                .iter()
-                .copied()
-                .find(|candidate| {
-                    matches!(
-                        candidate.header,
-                        Header::Type7 { opcode, .. } if opcode == wanted_opcode
-                    ) && candidate.payload.len() == 3
-                        && (candidate.payload[0] >> 14) & 3 == 0
-                        && (candidate.payload[0] >> 16) & 3 == 2
-                        && (candidate.payload[0] >> 18) & 0xf == wanted_block
-                })
-                .map(|candidate| candidate.word_offset + 2)
-        };
-        shader_preload_word(CP_LOAD_STATE6_GEOM, 8)
+        segment_shader_preload_word(&segment, CP_LOAD_STATE6_GEOM, 8)
             .ok_or("qcom-adreno-a618: vertex shader preload is missing")?;
-        shader_preload_word(CP_LOAD_STATE6_FRAG, 12)
+        segment_shader_preload_word(&segment, CP_LOAD_STATE6_FRAG, 12)
             .ok_or("qcom-adreno-a618: fragment shader preload is missing")?;
 
         let (pitch_packet, pitch) = segment
@@ -1838,6 +1927,7 @@ fn validate_pm4(
     validate_3d_sequences(
         &packets,
         &mut addresses,
+        relocations,
         cfg!(feature = "strict-command-validation"),
     )?;
     for (address, relocation) in addresses.iter().zip(relocations.iter().copied()) {
@@ -2867,8 +2957,11 @@ mod tests {
             retirement_start..retirement_wfi + 1,
             core::iter::once(wfi).chain(clean_and_invalidate),
         );
+        let idle_before_retirement_packets = Packets::new(&idle_before_retirement)
+            .collect::<Result<std::vec::Vec<_>, _>>()
+            .unwrap();
         assert_eq!(
-            super::validate_render_retirement(&idle_before_retirement),
+            super::validate_render_retirement(&idle_before_retirement_packets),
             Err("qcom-adreno-a618: rendering operation lacks sysmem retirement")
         );
 

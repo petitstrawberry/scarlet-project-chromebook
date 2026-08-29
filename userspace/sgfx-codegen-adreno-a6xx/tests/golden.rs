@@ -1304,7 +1304,7 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
     .unwrap();
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.words.len(), 1_766);
+    assert_eq!(artifact.words.len(), 1_607);
     let packets = Packets::new(&artifact.words)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -1315,8 +1315,8 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
                 matches!(packet.header, Header::Type7 { opcode: 0x65, .. }) && packet.payload == [1]
             })
             .count(),
-        4,
-        "each draw must retain a canonical A6xx 3D baseline",
+        1,
+        "one render pass must establish the A6xx 3D baseline once",
     );
     assert_eq!(
         packets

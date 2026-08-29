@@ -190,6 +190,7 @@ const SP_WINDOW_OFFSET: u32 = 0xb4d1;
 const SP_UPDATE_CNTL: u32 = 0xbb08;
 const SP_PS_CONST_CONFIG: u32 = 0xbb10;
 
+#[derive(Clone, Copy)]
 pub(crate) struct DrawState {
     pub(crate) variant: PipelineVariant,
     pub(crate) target: Surface,
@@ -230,7 +231,7 @@ pub(crate) struct IndexedDraw {
     pub(crate) vertex_size: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Surface {
     pub(crate) object: ObjectId,
     pub(crate) plane_offset: u64,
@@ -248,6 +249,7 @@ pub(crate) struct Emitter {
     ccu_sequence: Option<GeneratedObjectId>,
     event_sequence: u32,
     draw_batch_active: bool,
+    last_draw: Option<DrawState>,
     max_words: usize,
 }
 
@@ -261,6 +263,7 @@ impl Emitter {
             ccu_sequence: None,
             event_sequence: 0,
             draw_batch_active: false,
+            last_draw: None,
             max_words: max_words as usize,
         }
     }
@@ -537,6 +540,7 @@ impl Emitter {
         }
         self.submission_begin_3d()?;
         self.draw_batch_active = true;
+        self.last_draw = None;
         Ok(())
     }
 
@@ -546,6 +550,7 @@ impl Emitter {
         }
         self.submission_end()?;
         self.draw_batch_active = false;
+        self.last_draw = None;
         Ok(())
     }
 
@@ -553,16 +558,25 @@ impl Emitter {
         if !self.draw_batch_active {
             return Err(CompileError::InvalidState);
         }
-        // Keep every draw independently canonical for the kernel validator,
-        // but do not retire and invalidate the CCUs between draws targeting
-        // the same render pass. The restore baseline is register state only;
-        // dirty color data remains live until end_draw_batch().
-        self.restore_3d_baseline()
+        // A6xx graphics state persists across draws in one IB. The first draw
+        // establishes the complete sysmem baseline; subsequent draws emit the
+        // bounded safety state required by the kernel plus actual deltas.
+        // Replaying the restore baseline here made a retained UI frame scale
+        // with hundreds of redundant register writes.
+        Ok(())
     }
 
     pub(crate) fn draw(&mut self, draw: DrawState) -> Result<(), CompileError> {
         if !self.draw_batch_active {
             return Err(CompileError::InvalidState);
+        }
+        if self
+            .last_draw
+            .is_some_and(|previous| Self::fixed_draw_state_matches(previous, draw))
+        {
+            self.draw_with_retained_fixed_state(draw)?;
+            self.last_draw = Some(draw);
+            return Ok(());
         }
         let link = link_meta(draw.variant);
         let ShaderMeta::Vertex(vs) = shader_meta(link.vs) else {
@@ -748,6 +762,151 @@ impl Emitter {
                 let initiator = match indexed.format {
                     // CP_DRAW_INDX_OFFSET uses the A4xx+ initiator layout:
                     // TRIANGLE_LIST | DMA | INDEX4_SIZE_16/32_BIT.
+                    IndexFormat::Uint16 => 0x404,
+                    IndexFormat::Uint32 => 0x804,
+                };
+                self.push_word(
+                    type7(CP_DRAW_INDX_OFFSET, 7).map_err(|_| CompileError::InvalidPm4)?,
+                )?;
+                self.extend_words(&[initiator, 1, indexed.index_count, indexed.first_index])?;
+                self.address_words(
+                    ObjectRef::External(indexed.index),
+                    indexed.index_offset,
+                    indexed.index_size,
+                    Access::READ,
+                )?;
+                self.push_word(indexed.max_indices)?;
+            }
+        }
+        self.last_draw = Some(draw);
+        Ok(())
+    }
+
+    fn fixed_draw_state_matches(previous: DrawState, next: DrawState) -> bool {
+        previous.variant == next.variant
+            && previous.target == next.target
+            && previous.area == next.area
+            && previous.stride == next.stride
+            && previous.attributes == next.attributes
+            && previous.source_over == next.source_over
+            && previous.cull == next.cull
+    }
+
+    fn draw_with_retained_fixed_state(&mut self, draw: DrawState) -> Result<(), CompileError> {
+        let link = link_meta(draw.variant);
+        let ShaderMeta::Vertex(vs) = shader_meta(link.vs) else {
+            return Err(CompileError::InvalidPm4);
+        };
+        let ShaderMeta::Fragment(fs) = shader_meta(link.fs) else {
+            return Err(CompileError::InvalidPm4);
+        };
+
+        // Keep each draw independently bounded for the production validator.
+        // Fixed blend, raster, linkage, and sample state is inherited from the
+        // preceding compatible draw, while addresses and dimensions remain
+        // explicit in this segment.
+        self.packet4(
+            RB_MRT_PITCH,
+            &[
+                draw.target.stride >> 6,
+                u32::try_from(draw.target.plane_size >> 6).map_err(|_| CompileError::Overflow)?,
+            ],
+        )?;
+        self.address_register(
+            RB_MRT_BASE,
+            ObjectRef::External(draw.target.object),
+            draw.target.plane_offset,
+            draw.target.plane_size,
+            Access::WRITE,
+        )?;
+
+        let target_area = PixelRect::new(0, 0, draw.target.width, draw.target.height)
+            .map_err(|_| CompileError::InvalidResource)?;
+        let target_br = pack_xy(draw.target.width - 1, draw.target.height - 1);
+        let area_br = pack_xy(
+            draw.area.x() + draw.area.width() - 1,
+            draw.area.y() + draw.area.height() - 1,
+        );
+        let scissor_br = pack_xy(
+            draw.scissor.x() + draw.scissor.width() - 1,
+            draw.scissor.y() + draw.scissor.height() - 1,
+        );
+        self.packet4(GRAS_CL_VIEWPORT_XOFFSET, &viewport_transform(target_area))?;
+        self.packet4(
+            GRAS_SC_SCREEN_SCISSOR_TL,
+            &[pack_xy(draw.area.x(), draw.area.y()), area_br],
+        )?;
+        self.packet4(GRAS_SC_VIEWPORT_SCISSOR_TL, &[pack_xy(0, 0), target_br])?;
+        self.packet4(
+            GRAS_SC_WINDOW_SCISSOR_TL,
+            &[pack_xy(draw.scissor.x(), draw.scissor.y()), scissor_br],
+        )?;
+
+        let vertex_offset = match draw.draw {
+            DrawCall::NonIndexed { first_vertex, .. } => first_vertex,
+            DrawCall::Indexed(indexed) => indexed.base_vertex,
+        };
+        self.packet4(VFD_INDEX_OFFSET, &[vertex_offset, 0])?;
+        self.address_register(
+            VFD_VERTEX_BUFFER_BASE,
+            ObjectRef::External(draw.vertex),
+            draw.vertex_offset,
+            draw.vertex_size,
+            Access::READ,
+        )?;
+        self.packet4(
+            VFD_VERTEX_BUFFER_SIZE,
+            &[
+                u32::try_from(draw.vertex_size).map_err(|_| CompileError::Overflow)?,
+                draw.stride,
+            ],
+        )?;
+
+        // The safety validator currently requires immutable shader authority
+        // to be explicit at every draw boundary. These compact address bursts
+        // are retained until the validator grows submission-local state.
+        self.emit_vs_program(vs, link.vs)?;
+        self.emit_fs_program(fs, link.fs)?;
+        self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms)?;
+        self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
+
+        let texture_changed = self.last_draw.is_none_or(|previous| {
+            previous.texture != draw.texture || previous.linear_sampler != draw.linear_sampler
+        });
+        if texture_changed && let Some(texture) = draw.texture {
+            let sampler = if draw.linear_sampler {
+                SAMPLER_CLAMP_LINEAR
+            } else {
+                SAMPLER_CLAMP_NEAREST
+            };
+            let state = self.texture_state_backing(texture, sampler)?;
+            self.load_indirect(
+                CP_LOAD_STATE6_FRAG,
+                4,
+                0,
+                1,
+                ObjectRef::Generated(state),
+                64,
+                16,
+            )?;
+            self.load_indirect(
+                CP_LOAD_STATE6_FRAG,
+                4,
+                1,
+                1,
+                ObjectRef::Generated(state),
+                0,
+                64,
+            )?;
+        }
+
+        self.wait_for_idle()?;
+        match draw.draw {
+            DrawCall::NonIndexed { vertex_count, .. } => {
+                self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, vertex_count])?;
+            }
+            DrawCall::Indexed(indexed) => {
+                let initiator = match indexed.format {
                     IndexFormat::Uint16 => 0x404,
                     IndexFormat::Uint32 => 0x804,
                 };
@@ -1352,6 +1511,7 @@ mod tests {
             ccu_sequence: None,
             event_sequence: 0,
             draw_batch_active: false,
+            last_draw: None,
             max_words: 3,
         };
 
