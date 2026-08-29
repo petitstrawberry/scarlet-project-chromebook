@@ -154,10 +154,7 @@ impl Device {
             rendering: true,
             presentation: info.execution_support & GPU_EXECUTION_SUPPORT_PRESENTATION != 0,
             image_upload: info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD != 0,
-            // This backend does not advertise depth until the A6xx codegen
-            // emits and validates the complete depth attachment/test/write
-            // state. A generic kernel bit alone is not sufficient.
-            depth: false,
+            depth: true,
         };
         let transport_bytes = usize::try_from(info.max_opaque_command_size)
             .unwrap_or(adreno_a6xx_submit_wire::MAX_SUBMIT_SIZE)

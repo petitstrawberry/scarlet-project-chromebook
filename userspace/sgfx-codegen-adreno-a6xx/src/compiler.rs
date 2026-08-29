@@ -2,6 +2,7 @@
 
 use alloc::{vec, vec::Vec};
 
+use adreno_a6xx_layout::{DEPTH32_LAYER_ALIGNMENT, TILE_MODE_3, depth32_tile6_3_layout};
 use adreno_a6xx_shader_pack::PipelineVariant;
 use sgfx_core::ir::{
     AddressMode, BlendState, BufferUsage, CullMode, DepthLoadOp, DrawUniforms, FilterMode,
@@ -34,7 +35,7 @@ struct IndexBinding {
 struct PassState {
     target: ObjectId,
     area: PixelRect,
-    has_depth: bool,
+    depth: Option<ObjectId>,
 }
 
 struct State<'a> {
@@ -147,20 +148,28 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
                     input.capabilities.max_linear_pitch,
                 )?;
                 validate_rect(pass.area, target)?;
-                if let Some(depth) = pass.depth {
+                let depth = if let Some(depth) = pass.depth {
                     let depth_resource = find_resource(input.resources, depth.target)?;
-                    require_depth_image(depth_resource, target.width, target.height)?;
-                    if matches!(depth.load, DepthLoadOp::Clear(_)) {
-                        return Err(CompileError::UnsupportedFeature);
+                    let depth_target = require_depth_surface(
+                        depth_resource,
+                        target.width,
+                        target.height,
+                        input.capabilities.max_linear_pitch,
+                    )?;
+                    if let DepthLoadOp::Clear(value) = depth.load {
+                        emitter.clear_depth(depth_target, pass.area, value)?;
                     }
-                }
+                    Some(depth.target)
+                } else {
+                    None
+                };
                 if let LoadOp::Clear(color) = pass.load {
                     emitter.clear(target, pass.area, color)?;
                 }
                 state.pass = Some(PassState {
                     target: pass.target,
                     area: pass.area,
-                    has_depth: pass.depth.is_some(),
+                    depth,
                 });
                 state.draw_batch_started = false;
                 state.pipeline = None;
@@ -362,7 +371,7 @@ fn validate_image_layout(
     image: &ImageMeta,
     max_pitch: u32,
 ) -> Result<(), CompileError> {
-    if image.modifier != ImageModifier::Linear || image.planes.len() != 1 {
+    if image.planes.len() != 1 {
         return Err(CompileError::UnsupportedFeature);
     }
     let plane = image.planes[0];
@@ -371,13 +380,33 @@ fn validate_image_layout(
         .width()
         .checked_mul(image.storage_format.bytes_per_pixel())
         .ok_or(CompileError::Overflow)?;
-    if plane.stride < row_bytes || plane.stride > max_pitch || plane.stride & 63 != 0 {
-        return Err(CompileError::InvalidResource);
-    }
-    let required = u64::from(plane.stride)
-        .checked_mul(u64::from(image.extent.height() - 1))
-        .and_then(|bytes| bytes.checked_add(u64::from(row_bytes)))
-        .ok_or(CompileError::Overflow)?;
+    let required = match image.modifier {
+        ImageModifier::Linear => {
+            if image.storage_format == TextureFormat::Depth32Float {
+                return Err(CompileError::UnsupportedFeature);
+            }
+            if plane.stride < row_bytes || plane.stride > max_pitch || plane.stride & 63 != 0 {
+                return Err(CompileError::InvalidResource);
+            }
+            u64::from(plane.stride)
+                .checked_mul(u64::from(image.extent.height() - 1))
+                .and_then(|bytes| bytes.checked_add(u64::from(row_bytes)))
+                .ok_or(CompileError::Overflow)?
+        }
+        ImageModifier::A6xxTile6_3Depth => {
+            if image.storage_format != TextureFormat::Depth32Float
+                || plane.offset & (DEPTH32_LAYER_ALIGNMENT - 1) != 0
+            {
+                return Err(CompileError::InvalidResource);
+            }
+            let layout = depth32_tile6_3_layout(image.extent.width(), image.extent.height())
+                .ok_or(CompileError::Overflow)?;
+            if plane.stride != layout.row_pitch || plane.size != layout.layer_size {
+                return Err(CompileError::InvalidResource);
+            }
+            layout.layer_size
+        }
+    };
     let plane_end = plane
         .offset
         .checked_add(plane.size)
@@ -396,7 +425,10 @@ fn require_image_surface(
     let ResourceKind::Image(image) = &resource.kind else {
         return Err(CompileError::InvalidResource);
     };
-    if !image.usage.contains(required) || image.storage_format != TextureFormat::Bgra8Unorm {
+    if !image.usage.contains(required)
+        || image.storage_format != TextureFormat::Bgra8Unorm
+        || image.modifier != ImageModifier::Linear
+    {
         return Err(CompileError::InvalidResource);
     }
     validate_image_layout(resource.size, image, max_pitch)?;
@@ -408,6 +440,7 @@ fn require_image_surface(
         width: image.extent.width(),
         height: image.extent.height(),
         stride: plane.stride,
+        tile_mode: 0,
         alpha_mask: image.format == TextureFormat::R8Unorm,
     })
 }
@@ -426,22 +459,35 @@ fn require_target_surface(
     require_image_surface(resource, required, max_pitch)
 }
 
-fn require_depth_image(
+fn require_depth_surface(
     resource: &ResourceMeta,
     width: u32,
     height: u32,
-) -> Result<(), CompileError> {
+    max_pitch: u32,
+) -> Result<Surface, CompileError> {
     let ResourceKind::Image(image) = &resource.kind else {
         return Err(CompileError::InvalidResource);
     };
     if image.format != TextureFormat::Depth32Float
+        || image.modifier != ImageModifier::A6xxTile6_3Depth
         || !image.usage.contains(TextureUsage::RENDER_ATTACHMENT)
         || image.extent.width() != width
         || image.extent.height() != height
     {
         return Err(CompileError::InvalidResource);
     }
-    Ok(())
+    validate_image_layout(resource.size, image, max_pitch)?;
+    let plane = image.planes[0];
+    Ok(Surface {
+        object: resource.id,
+        plane_offset: plane.offset,
+        plane_size: plane.size,
+        width,
+        height,
+        stride: plane.stride,
+        tile_mode: TILE_MODE_3,
+        alpha_mask: false,
+    })
 }
 
 fn validate_rect(rect: PixelRect, surface: Surface) -> Result<(), CompileError> {
@@ -518,11 +564,7 @@ fn emit_draw(
         }
         DrawCall::Indexed(indexed) => (indexed.vertex_size, indexed.index_count),
     };
-    if draw_count == 0
-        || pass.has_depth
-        || pipeline.descriptor.depth_state().is_some()
-        || !draw_count.is_multiple_of(3)
-    {
+    if draw_count == 0 || !draw_count.is_multiple_of(3) {
         return Err(CompileError::UnsupportedFeature);
     }
     let target_resource = find_resource(input.resources, pass.target)?;
@@ -583,6 +625,26 @@ fn emit_draw(
     } else {
         0
     };
+    let depth = match (pass.depth, pipeline.descriptor.depth_state()) {
+        (Some(depth), Some(depth_state)) => {
+            if depth_state.format() != TextureFormat::Depth32Float {
+                return Err(CompileError::InvalidResource);
+            }
+            let resource = find_resource(input.resources, depth)?;
+            Some(crate::emit::DepthDrawState {
+                target: require_depth_surface(
+                    resource,
+                    target.width,
+                    target.height,
+                    input.capabilities.max_linear_pitch,
+                )?,
+                compare: depth_state.compare(),
+                write_enabled: depth_state.write_enabled(),
+            })
+        }
+        (None, Some(_)) => return Err(CompileError::InvalidState),
+        (_, None) => None,
+    };
     emitter.draw(DrawState {
         variant,
         target,
@@ -598,6 +660,7 @@ fn emit_draw(
         linear_sampler,
         source_over,
         cull,
+        depth,
         draw,
     })
 }
@@ -872,7 +935,9 @@ fn validate_pipeline_descriptor(pipeline: &PipelineMeta) -> Result<(), CompileEr
     let descriptor = &pipeline.descriptor;
     if descriptor.target_format() != TextureFormat::Bgra8Unorm
         || descriptor.topology() != PrimitiveTopology::TriangleList
-        || descriptor.depth_state().is_some()
+        || descriptor
+            .depth_state()
+            .is_some_and(|depth| depth.format() != TextureFormat::Depth32Float)
         || !matches!(descriptor.vertex_buffer().stride(), 16 | 24 | 28 | 32 | 40)
     {
         return Err(CompileError::UnsupportedFeature);

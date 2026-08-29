@@ -27,10 +27,14 @@ const CP_SKIP_IB2_ENABLE_LOCAL: u8 = 0x23;
 const EVENT_CCU_INVALIDATE_DEPTH: u32 = 0x18;
 const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_FLUSH_DEPTH_TS: u32 = 0x1c;
+const EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
+const FORMAT_32_FLOAT: u32 = 0x4a;
+const DEPTH_FORMAT_32: u32 = 4;
+const A2D_IFMT_FLOAT32: u32 = 4;
 const A2D_COLOR_SWAP_WXYZ: u32 = 1 << 10;
 const MRT_COLOR_SWAP_WXYZ: u32 = 1 << 13;
 const RB_CCU_CNTL: u32 = 0x8e07;
@@ -114,6 +118,7 @@ const RB_BIN_CONTROL2: u32 = 0x88d3;
 const RB_WINDOW_OFFSET2: u32 = 0x88d4;
 const RB_RESOLVE_GMEM_BUFFER_INFO: u32 = 0x88d5;
 const RB_COLOR_FLAG_BUFFER_ADDR: u32 = 0x8903;
+const RB_DEPTH_FLAG_BUFFER_BASE: u32 = 0x8900;
 const VPC_RAST_CNTL: u32 = 0x9108;
 const VPC_VARYING_INTERP_MODE: u32 = 0x9200;
 const VPC_VARYING_REPLACE_MODE: u32 = 0x9208;
@@ -230,6 +235,8 @@ fn address_source_matches(source: AddressSource, relocation: RelocationSource) -
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct A2dExpectation {
+    format: LinearImageFormat,
+    modifier: ImageModifier,
     row_pitch: u32,
     required_width: u32,
     required_height: u32,
@@ -237,6 +244,8 @@ struct A2dExpectation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImageExpectation {
+    format: LinearImageFormat,
+    modifier: ImageModifier,
     row_pitch: u32,
     width: u32,
     height: u32,
@@ -252,7 +261,21 @@ struct ArrayPitchExpectation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinearImageFormat {
+    Bgra8Unorm,
+    Depth32Float,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageModifier {
+    Linear,
+    Tile6_3Depth,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinearImage {
+    pub(crate) format: LinearImageFormat,
+    pub(crate) modifier: ImageModifier,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) row_pitch: u32,
@@ -299,6 +322,50 @@ fn exact(values: &[u32], expected: &[u32]) -> Result<(), &'static str> {
     } else {
         Err("qcom-adreno-a618: unsafe PM4 register value")
     }
+}
+
+fn a2d_control_format(value: u32) -> Option<LinearImageFormat> {
+    let common = (0xf << 20) | (1 << 16);
+    let color = (FORMAT_8_8_8_8_UNORM << 8) | common;
+    let depth = (A2D_IFMT_FLOAT32 << 24) | (FORMAT_32_FLOAT << 8) | common | (1 << 7);
+    match value {
+        value if value == color || value == color | (1 << 7) => Some(LinearImageFormat::Bgra8Unorm),
+        value if value == depth => Some(LinearImageFormat::Depth32Float),
+        _ => None,
+    }
+}
+
+fn a2d_destination_format(value: u32) -> Option<(LinearImageFormat, ImageModifier)> {
+    match value {
+        value if value == FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ => {
+            Some((LinearImageFormat::Bgra8Unorm, ImageModifier::Linear))
+        }
+        value if value == FORMAT_32_FLOAT | (adreno_a6xx_layout::TILE_MODE_3 << 8) => {
+            Some((LinearImageFormat::Depth32Float, ImageModifier::Tile6_3Depth))
+        }
+        _ => None,
+    }
+}
+
+fn a2d_output_format(value: u32) -> Option<LinearImageFormat> {
+    match value {
+        value if value == (FORMAT_8_8_8_8_UNORM << 3) | (0xf << 12) => {
+            Some(LinearImageFormat::Bgra8Unorm)
+        }
+        value if value == (FORMAT_32_FLOAT << 3) | (0xf << 12) => {
+            Some(LinearImageFormat::Depth32Float)
+        }
+        _ => None,
+    }
+}
+
+fn safe_depth_control(value: u32) -> bool {
+    if value == 0 {
+        return true;
+    }
+    let compare = (value >> 2) & 7;
+    let expected_read = !matches!(compare, 0 | 7);
+    value & !0x5f == 0 && value & 1 != 0 && (value & (1 << 6) != 0) == expected_read
 }
 
 fn address_field(
@@ -409,30 +476,28 @@ fn validate_type4(
     match (register, payload.len()) {
         (RB_CCU_CNTL, 1) => exact(payload, &[0x0800_0000]),
         (RB_DBG_ECO_CNTL, 1) => exact(payload, &[0x0410_0000]),
-        (RB_A2D_BLT_CNTL, 1) | (GRAS_A2D_BLT_CNTL, 1) => {
-            let allowed = (FORMAT_8_8_8_8_UNORM << 8) | (0xf << 20) | (1 << 7) | (1 << 16);
-            if payload[0] & !allowed == 0
-                && payload[0] & (FORMAT_8_8_8_8_UNORM << 8) == FORMAT_8_8_8_8_UNORM << 8
-                && payload[0] & (0xf << 20) == 0xf << 20
-                && payload[0] & (1 << 16) != 0
-            {
-                Ok(())
-            } else {
-                Err("qcom-adreno-a618: unsafe A2D control value")
-            }
+        (RB_A2D_BLT_CNTL, 1) | (GRAS_A2D_BLT_CNTL, 1)
+            if a2d_control_format(payload[0]).is_some() =>
+        {
+            Ok(())
         }
         (RB_A2D_PIXEL_CNTL, 1) => exact(payload, &[0]),
-        (RB_A2D_DEST_BUFFER_INFO, 1) => {
-            exact(payload, &[FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ])
-        }
+        (RB_A2D_DEST_BUFFER_INFO, 1) if a2d_destination_format(payload[0]).is_some() => Ok(()),
         (RB_A2D_DEST_BUFFER_BASE, 2) => {
             address_field(addresses, packet_word + 1, ACCESS_WRITE, true, None)
         }
         (RB_A2D_DEST_BUFFER_PITCH, 1) if payload[0] != 0 && payload[0] & !0x3fff == 0 => Ok(()),
-        (RB_A2D_CLEAR_COLOR_DW0, 4) if payload.iter().all(|word| *word <= 0xff) => Ok(()),
+        (RB_A2D_CLEAR_COLOR_DW0, 4)
+            if payload.iter().all(|word| *word <= 0xff)
+                || (payload[1..] == [0; 3]
+                    && f32::from_bits(payload[0]).is_finite()
+                    && (0.0..=1.0).contains(&f32::from_bits(payload[0]))) =>
+        {
+            Ok(())
+        }
         (GRAS_A2D_SRC_XMIN, 4) if payload.iter().all(|value| value & 0xff == 0) => Ok(()),
         (GRAS_A2D_DEST_TL, 2) | (GRAS_A2D_SCISSOR_TL, 2) => Ok(()),
-        (SP_A2D_OUTPUT_INFO, 1) => exact(payload, &[(FORMAT_8_8_8_8_UNORM << 3) | (0xf << 12)]),
+        (SP_A2D_OUTPUT_INFO, 1) if a2d_output_format(payload[0]).is_some() => Ok(()),
         (TPL1_A2D_SRC_TEXTURE_INFO, 1) => exact(
             payload,
             &[FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ | (1 << 20) | (1 << 22)],
@@ -463,9 +528,7 @@ fn validate_type4(
             | VFD_RENDER_MODE
             | GRAS_CL_ARRAY_SIZE
             | GRAS_CL_VS_CLIP_CULL_DISTANCE
-            | GRAS_SU_DEPTH_BUFFER_INFO
             | GRAS_SU_VS_SIV_CNTL
-            | GRAS_SU_DEPTH_CNTL
             | GRAS_SU_STENCIL_CNTL
             | GRAS_LRZ_PS_INPUT_CNTL
             | GRAS_LRZ_PS_SAMPLEFREQ_CNTL
@@ -475,7 +538,6 @@ fn validate_type4(
             | RB_MRT_BASE_GMEM
             | RB_ALPHA_TEST_CNTL
             | RB_DEPTH_PLANE_CNTL
-            | RB_DEPTH_CNTL
             | RB_STENCIL_CNTL
             | RB_STENCIL_BUFFER_INFO
             | RB_STENCIL_REF_CNTL
@@ -488,6 +550,9 @@ fn validate_type4(
             | SP_GFX_USIZE,
             1,
         ) => exact(payload, &[0]),
+        (GRAS_SU_DEPTH_BUFFER_INFO, 1) if matches!(payload[0], 0 | DEPTH_FORMAT_32) => Ok(()),
+        (GRAS_SU_DEPTH_CNTL, 1) if matches!(payload[0], 0 | 1) => Ok(()),
+        (RB_DEPTH_CNTL, 1) if safe_depth_control(payload[0]) => Ok(()),
         (VFD_MODE_CNTL, 1) => exact(payload, &[3]),
         (VPC_SO_OVERRIDE, 1) => exact(payload, &[0]),
         (PC_MODE_CNTL, 1) => exact(payload, &[0x1f]),
@@ -513,10 +578,27 @@ fn validate_type4(
         (TPL1_RAS_MSAA_CNTL, 2) => exact(payload, &[0, 4]),
         (GRAS_SC_RAS_MSAA_CNTL | RB_RAS_MSAA_CNTL, 3) => exact(payload, &[0, 4, 0]),
         (TPL1_MSAA_SAMPLE_POS_CNTL, 1) => exact(payload, &[0]),
-        (RB_DEPTH_BUFFER_INFO, 6) => exact(payload, &[0; 6]),
+        (RB_DEPTH_BUFFER_INFO, 6) if payload == [0; 6] => Ok(()),
+        (RB_DEPTH_BUFFER_INFO, 6)
+            if payload[0] == DEPTH_FORMAT_32
+                && payload[1] != 0
+                && payload[1] <= 0x3fff
+                && payload[2] != 0
+                && payload[2] <= 0x0fff_ffff
+                && payload[3..] == [0; 3] =>
+        {
+            address_field(
+                addresses,
+                packet_word + 4,
+                ACCESS_READ | ACCESS_WRITE,
+                false,
+                None,
+            )
+        }
         (RB_DEPTH_BOUND_MIN, 2) => exact(payload, &[0, 1.0_f32.to_bits()]),
         (RB_STENCIL_MASK, 2) => exact(payload, &[0, 0]),
         (RB_COLOR_FLAG_BUFFER_ADDR, 3) => exact(payload, &[0; 3]),
+        (RB_DEPTH_FLAG_BUFFER_BASE, 3) => exact(payload, &[0; 3]),
         (VPC_VARYING_INTERP_MODE | VPC_VARYING_REPLACE_MODE, 8) => exact(payload, &[0; 8]),
         (RB_MRT_CONTROL, 2) if matches!(payload, [0x7e0, 0x0001_0001] | [0x7e3, 0x0701_0706]) => {
             Ok(())
@@ -625,7 +707,11 @@ fn validate_type7(
             Ok(())
         }
         (opcode::EVENT_WRITE, 4)
-            if [EVENT_CCU_FLUSH_COLOR_TS, EVENT_CCU_FLUSH_DEPTH_TS].contains(&payload[0])
+            if [
+                EVENT_CCU_FLUSH_COLOR_TS | EVENT_WRITE_TIMESTAMP,
+                EVENT_CCU_FLUSH_DEPTH_TS | EVENT_WRITE_TIMESTAMP,
+            ]
+            .contains(&payload[0])
                 && payload[1..3] == [0, 0]
                 && payload[3] != 0 =>
         {
@@ -801,7 +887,7 @@ fn validate_ccu_transitions(packets: &[Packet<'_>]) -> Result<(), &'static str> 
                     opcode: opcode::EVENT_WRITE,
                     count: 4,
                 }
-            ) && packet.payload.first() == Some(&event)
+            ) && packet.payload.first() == Some(&(event | EVENT_WRITE_TIMESTAMP))
         };
         let plain = |event| {
             matches!(
@@ -860,7 +946,7 @@ fn validate_render_retirement(packets: &[Packet<'_>]) -> Result<(), &'static str
                 opcode: opcode::EVENT_WRITE,
                 count: 4,
             }
-        ) && packet.payload.first() == Some(&event)
+        ) && packet.payload.first() == Some(&(event | EVENT_WRITE_TIMESTAMP))
     };
     let is_plain_event = |packet: &Packet<'_>, event| {
         matches!(
@@ -956,9 +1042,10 @@ struct A2dState {
     solid: Option<bool>,
     gras_control: Option<u32>,
     rb_control: Option<u32>,
+    control_format: Option<LinearImageFormat>,
     pixel_control: bool,
-    output_info: bool,
-    destination_info: bool,
+    output_format: Option<LinearImageFormat>,
+    destination_format: Option<(LinearImageFormat, ImageModifier)>,
     destination_word: Option<u32>,
     destination_pitch: Option<u32>,
     destination_tl: Option<u32>,
@@ -1000,11 +1087,14 @@ fn validate_a2d_sequences(
                 RB_A2D_BLT_CNTL => {
                     state.rb_control = Some(packet.payload[0]);
                     state.solid = Some(packet.payload[0] & (1 << 7) != 0);
+                    state.control_format = a2d_control_format(packet.payload[0]);
                 }
                 GRAS_A2D_BLT_CNTL => state.gras_control = Some(packet.payload[0]),
                 RB_A2D_PIXEL_CNTL => state.pixel_control = true,
-                SP_A2D_OUTPUT_INFO => state.output_info = true,
-                RB_A2D_DEST_BUFFER_INFO => state.destination_info = true,
+                SP_A2D_OUTPUT_INFO => state.output_format = a2d_output_format(packet.payload[0]),
+                RB_A2D_DEST_BUFFER_INFO => {
+                    state.destination_format = a2d_destination_format(packet.payload[0])
+                }
                 RB_A2D_CLEAR_COLOR_DW0 => state.clear_color = true,
                 RB_A2D_DEST_BUFFER_BASE => state.destination_word = Some(packet.word_offset + 1),
                 RB_A2D_DEST_BUFFER_PITCH => {
@@ -1060,8 +1150,9 @@ fn validate_a2d_sequences(
                     || state.gras_control != state.rb_control
                     || state.solid.is_none()
                     || !state.pixel_control
-                    || !state.output_info
-                    || !state.destination_info
+                    || state.control_format.is_none()
+                    || state.output_format != state.control_format
+                    || state.destination_format.map(|(format, _)| format) != state.control_format
                 {
                     return Err("qcom-adreno-a618: incomplete A2D control state");
                 }
@@ -1090,6 +1181,14 @@ fn validate_a2d_sequences(
                         .destination_word
                         .ok_or("qcom-adreno-a618: A2D destination base is missing")?,
                     A2dExpectation {
+                        format: state
+                            .destination_format
+                            .ok_or("qcom-adreno-a618: A2D destination format is missing")?
+                            .0,
+                        modifier: state
+                            .destination_format
+                            .ok_or("qcom-adreno-a618: A2D destination format is missing")?
+                            .1,
                         row_pitch: state
                             .destination_pitch
                             .ok_or("qcom-adreno-a618: A2D destination pitch is missing")?,
@@ -1133,6 +1232,8 @@ fn validate_a2d_sequences(
                             .source_word
                             .ok_or("qcom-adreno-a618: A2D source base is missing")?,
                         A2dExpectation {
+                            format: LinearImageFormat::Bgra8Unorm,
+                            modifier: ImageModifier::Linear,
                             row_pitch: state
                                 .source_pitch
                                 .ok_or("qcom-adreno-a618: A2D source pitch is missing")?,
@@ -1339,6 +1440,39 @@ fn segment_matches_retained_pipeline(segment: &SegmentIndex<'_, '_, '_>) -> bool
     })
 }
 
+fn segment_depth_state_is_canonical(segment: &SegmentIndex<'_, '_, '_>) -> bool {
+    let reg = |wanted| segment.reg(wanted).map(|(_, payload)| payload);
+    if reg(RB_DEPTH_PLANE_CNTL) != Some(&[0])
+        || reg(GRAS_SU_DEPTH_PLANE_CNTL) != Some(&[0])
+        || reg(RB_DEPTH_BOUND_MIN) != Some(&[0, 1.0_f32.to_bits()])
+        || reg(RB_STENCIL_BUFFER_INFO) != Some(&[0])
+    {
+        return false;
+    }
+    let Some(info) = reg(RB_DEPTH_BUFFER_INFO) else {
+        return false;
+    };
+    if info == [0; 6] {
+        return reg(RB_DEPTH_CNTL) == Some(&[0])
+            && reg(GRAS_SU_DEPTH_CNTL) == Some(&[0])
+            && reg(GRAS_SU_DEPTH_BUFFER_INFO) == Some(&[0])
+            && reg(RB_DEPTH_FLAG_BUFFER_BASE).is_none();
+    }
+    info.len() == 6
+        && info[0] == DEPTH_FORMAT_32
+        && info[1] != 0
+        && info[1] <= 0x3fff
+        && info[2] != 0
+        && info[2] <= 0x0fff_ffff
+        && info[3..] == [0; 3]
+        && reg(RB_DEPTH_CNTL).is_some_and(|control| {
+            control.len() == 1 && control[0] != 0 && safe_depth_control(control[0])
+        })
+        && reg(GRAS_SU_DEPTH_CNTL) == Some(&[1])
+        && reg(GRAS_SU_DEPTH_BUFFER_INFO) == Some(&[DEPTH_FORMAT_32])
+        && reg(RB_DEPTH_FLAG_BUFFER_BASE) == Some(&[0, 0, 0])
+}
+
 fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: PipelineVariant) -> bool {
     let packets = segment.packets;
     let link = link_meta(variant);
@@ -1503,14 +1637,7 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
         && reg(GRAS_SU_STENCIL_CNTL) == Some(&[0])
         && reg(RB_STENCIL_REF_CNTL) == Some(&[0])
         && reg(RB_STENCIL_MASK) == Some(&[0, 0])
-        && reg(RB_DEPTH_CNTL) == Some(&[0])
-        && reg(GRAS_SU_DEPTH_CNTL) == Some(&[0])
-        && reg(RB_DEPTH_PLANE_CNTL) == Some(&[0])
-        && reg(GRAS_SU_DEPTH_PLANE_CNTL) == Some(&[0])
-        && reg(RB_DEPTH_BOUND_MIN) == Some(&[0, 1.0_f32.to_bits()])
-        && reg(RB_DEPTH_BUFFER_INFO) == Some(&[0, 0, 0, 0, 0, 0])
-        && reg(GRAS_SU_DEPTH_BUFFER_INFO) == Some(&[0])
-        && reg(RB_STENCIL_BUFFER_INFO) == Some(&[0])
+        && segment_depth_state_is_canonical(segment)
         && reg(TPL1_RAS_MSAA_CNTL) == Some(&[0, 4])
         && reg(GRAS_SC_RAS_MSAA_CNTL) == Some(&[0, 4, 0])
         && reg(RB_RAS_MSAA_CNTL) == Some(&[0, 4, 0])
@@ -1639,6 +1766,7 @@ fn validate_3d_sequences(
     let mut retained_pipeline = None;
     let mut shader_state_initialized = false;
     let mut target_state = None;
+    let mut depth_state_initialized = false;
     for (packet_index, packet) in packets.iter().copied().enumerate() {
         if !matches!(
             packet.header,
@@ -1758,6 +1886,8 @@ fn validate_3d_sequences(
                 addresses,
                 base_packet + 1,
                 ImageExpectation {
+                    format: LinearImageFormat::Bgra8Unorm,
+                    modifier: ImageModifier::Linear,
                     row_pitch,
                     width: (viewport[1] & 0xffff).saturating_add(1),
                     height: (viewport[1] >> 16).saturating_add(1),
@@ -1777,6 +1907,46 @@ fn validate_3d_sequences(
         } else {
             return Err("qcom-adreno-a618: incomplete target state transition");
         };
+
+        if let Some((depth_packet, depth_info)) = segment.reg(RB_DEPTH_BUFFER_INFO) {
+            if !segment_depth_state_is_canonical(&segment) {
+                return Err("qcom-adreno-a618: incomplete canonical depth state");
+            }
+            depth_state_initialized = true;
+            if depth_info != [0; 6] {
+                let width = (target.viewport[1] & 0xffff).saturating_add(1);
+                let height = (target.viewport[1] >> 16).saturating_add(1);
+                let row_pitch = depth_info[1]
+                    .checked_mul(64)
+                    .ok_or("qcom-adreno-a618: depth pitch overflows")?;
+                let array_pitch = u64::from(depth_info[2]) << 6;
+                let Some(layout) = adreno_a6xx_layout::depth32_tile6_3_layout(width, height) else {
+                    return Err("qcom-adreno-a618: depth target layout overflows");
+                };
+                if row_pitch != layout.row_pitch || array_pitch != layout.layer_size {
+                    return Err("qcom-adreno-a618: depth array pitch does not match target");
+                }
+                set_image_expectation(
+                    addresses,
+                    depth_packet + 4,
+                    ImageExpectation {
+                        format: LinearImageFormat::Depth32Float,
+                        modifier: ImageModifier::Tile6_3Depth,
+                        row_pitch,
+                        width,
+                        height,
+                        exact_extent: true,
+                        pitch_align: None,
+                        array_pitch: Some(ArrayPitchExpectation {
+                            bytes: array_pitch,
+                            alignment: adreno_a6xx_layout::DEPTH32_LAYER_ALIGNMENT,
+                        }),
+                    },
+                )?;
+            }
+        } else if !(retained_delta && depth_state_initialized) {
+            return Err("qcom-adreno-a618: depth state is not initialized");
+        }
 
         let (_, window) = segment
             .reg(GRAS_SC_WINDOW_SCISSOR_TL)
@@ -1846,6 +2016,8 @@ fn validate_3d_sequences(
                 addresses,
                 descriptor_packet + 8,
                 ImageExpectation {
+                    format: LinearImageFormat::Bgra8Unorm,
+                    modifier: ImageModifier::Linear,
                     row_pitch,
                     width,
                     height,
@@ -1881,6 +2053,8 @@ fn validate_3d_sequences(
                 addresses,
                 descriptor_packet + 7,
                 ImageExpectation {
+                    format: LinearImageFormat::Bgra8Unorm,
+                    modifier: ImageModifier::Linear,
                     row_pitch,
                     width,
                     height,
@@ -2043,6 +2217,19 @@ fn relocate_one(
     Ok(())
 }
 
+fn image_footprint(image: LinearImage) -> Option<u64> {
+    match (image.format, image.modifier) {
+        (LinearImageFormat::Bgra8Unorm, ImageModifier::Linear) => {
+            u64::from(image.row_pitch).checked_mul(u64::from(image.height))
+        }
+        (LinearImageFormat::Depth32Float, ImageModifier::Tile6_3Depth) => {
+            let layout = adreno_a6xx_layout::depth32_tile6_3_layout(image.width, image.height)?;
+            (layout.row_pitch == image.row_pitch).then_some(layout.layer_size)
+        }
+        _ => None,
+    }
+}
+
 /// Decode, authorize, validate, and relocate into a kernel-owned dword vector.
 pub(crate) fn validate_and_relocate(
     bytes: &[u8],
@@ -2118,16 +2305,15 @@ pub(crate) fn validate_and_relocate(
             return Err("qcom-adreno-a618: relocation size does not match PM4 operation");
         }
         if address.requires_complete_linear_image {
-            let image = resource.linear_image.ok_or(
-                "qcom-adreno-a618: A2D address must cover one complete linear BGRA8 image",
-            )?;
+            let image = resource
+                .linear_image
+                .ok_or("qcom-adreno-a618: A2D address must cover one complete linear image")?;
             let row_bytes = image
                 .width
                 .checked_mul(4)
                 .ok_or("qcom-adreno-a618: image row size overflows")?;
-            let layout_size = u64::from(image.row_pitch)
-                .checked_mul(u64::from(image.height))
-                .ok_or("qcom-adreno-a618: image layout size overflows")?;
+            let layout_size =
+                image_footprint(image).ok_or("qcom-adreno-a618: image layout is not supported")?;
             if image.width == 0
                 || image.height == 0
                 || image.row_pitch < row_bytes
@@ -2140,15 +2326,21 @@ pub(crate) fn validate_and_relocate(
             let expectation = address
                 .a2d
                 .ok_or("qcom-adreno-a618: A2D relocation lacks semantic bounds")?;
-            let accessed_bytes = u64::from(expectation.required_height.saturating_sub(1))
-                .checked_mul(u64::from(expectation.row_pitch))
-                .and_then(|bytes| {
-                    u64::from(expectation.required_width)
-                        .checked_mul(4)
-                        .and_then(|row| bytes.checked_add(row))
-                })
-                .ok_or("qcom-adreno-a618: A2D byte range overflows")?;
+            let accessed_bytes = if image.modifier == ImageModifier::Linear {
+                u64::from(expectation.required_height.saturating_sub(1))
+                    .checked_mul(u64::from(expectation.row_pitch))
+                    .and_then(|bytes| {
+                        u64::from(expectation.required_width)
+                            .checked_mul(4)
+                            .and_then(|row| bytes.checked_add(row))
+                    })
+                    .ok_or("qcom-adreno-a618: A2D byte range overflows")?
+            } else {
+                image.visible_size
+            };
             if expectation.row_pitch != image.row_pitch
+                || expectation.format != image.format
+                || expectation.modifier != image.modifier
                 || expectation.required_width == 0
                 || expectation.required_height == 0
                 || expectation.required_width > image.width
@@ -2159,12 +2351,11 @@ pub(crate) fn validate_and_relocate(
             }
         }
         if let Some(expectation) = address.image {
-            let image = resource.linear_image.ok_or(
-                "qcom-adreno-a618: 3D image address must cover one complete linear BGRA8 image",
-            )?;
-            let layout_size = u64::from(image.row_pitch)
-                .checked_mul(u64::from(image.height))
-                .ok_or("qcom-adreno-a618: 3D image layout size overflows")?;
+            let image = resource
+                .linear_image
+                .ok_or("qcom-adreno-a618: 3D image address must cover one complete linear image")?;
+            let layout_size = image_footprint(image)
+                .ok_or("qcom-adreno-a618: 3D image layout is not supported")?;
             if image.width == 0
                 || image.height == 0
                 || image.row_pitch
@@ -2175,6 +2366,8 @@ pub(crate) fn validate_and_relocate(
                 || layout_size != image.visible_size
                 || relocation.resource_offset != 0
                 || relocation.required_size != image.visible_size
+                || expectation.format != image.format
+                || expectation.modifier != image.modifier
                 || expectation.row_pitch != image.row_pitch
                 || expectation.width == 0
                 || expectation.height == 0
@@ -2215,21 +2408,23 @@ mod tests {
         encode, encoded_len,
     };
     use sgfx_codegen_adreno_a6xx::{
-        Access, Capabilities, CompileInput, ImageMeta, ImageModifier, ObjectId, ObjectRef,
-        Operation, PipelineId, PipelineMeta, PlaneLayout, RelocatablePm4, RenderPass, ResourceKind,
-        ResourceMeta, compile,
+        Access, Capabilities, CompileInput, DepthAttachment, ImageMeta, ImageModifier, ObjectId,
+        ObjectRef, Operation, PipelineId, PipelineMeta, PlaneLayout, RelocatablePm4, RenderPass,
+        ResourceKind, ResourceMeta, compile,
     };
     use sgfx_core::ir::{
-        AddressMode, BlendState, BufferUsage, Color, CullMode, DrawUniforms, Extent2D, FilterMode,
-        FragmentProgram, FrontFace, IndexFormat, LoadOp, PixelRect, PrimitiveTopology, RasterState,
-        RenderPipelineDesc, SamplerDesc, StoreOp, TextureFormat, TextureSampleMode, TextureUsage,
-        Transform, VertexAttribute, VertexBufferLayout, VertexFormat,
+        AddressMode, BlendState, BufferUsage, Color, CompareFunction, CullMode, DepthLoadOp,
+        DepthState, DrawUniforms, Extent2D, FilterMode, FragmentProgram, FrontFace, IndexFormat,
+        LoadOp, PixelRect, PrimitiveTopology, RasterState, RenderPipelineDesc, SamplerDesc,
+        StoreOp, TextureFormat, TextureSampleMode, TextureUsage, Transform, VertexAttribute,
+        VertexBufferLayout, VertexFormat,
     };
 
     use super::{
-        AddressSource, CP_MEMCPY, CP_MEMCPY_MAX_DWORDS, LinearImage, RB_A2D_DEST_BUFFER_BASE,
-        RejectedPacketKind, ResolvedResource, ShaderStage, address_source_matches,
-        diagnose_rejected_packet, relocate_one, validate_and_relocate, validate_type7,
+        AddressSource, CP_MEMCPY, CP_MEMCPY_MAX_DWORDS, ImageModifier as KernelImageModifier,
+        LinearImage, LinearImageFormat, RB_A2D_DEST_BUFFER_BASE, RejectedPacketKind,
+        ResolvedResource, ShaderStage, address_source_matches, diagnose_rejected_packet,
+        relocate_one, validate_and_relocate, validate_type7,
     };
 
     #[test]
@@ -2291,6 +2486,7 @@ mod tests {
     const SOURCE: ObjectId = ObjectId::new(1);
     const BUFFER: ObjectId = ObjectId::new(2);
     const ALPHA: ObjectId = ObjectId::new(3);
+    const DEPTH: ObjectId = ObjectId::new(4);
 
     fn token(object: ObjectRef) -> u64 {
         match object {
@@ -2390,24 +2586,62 @@ mod tests {
         }
     }
 
+    fn depth_image(id: ObjectId) -> ResourceMeta {
+        ResourceMeta {
+            id,
+            size: 0x1000,
+            kind: ResourceKind::Image(ImageMeta {
+                format: TextureFormat::Depth32Float,
+                storage_format: TextureFormat::Depth32Float,
+                extent: Extent2D::new(16, 16).unwrap(),
+                usage: TextureUsage::RENDER_ATTACHMENT,
+                modifier: ImageModifier::A6xxTile6_3Depth,
+                planes: std::vec![PlaneLayout {
+                    offset: 0,
+                    stride: 256,
+                    size: 0x1000,
+                }],
+            }),
+        }
+    }
+
     fn accept_codegen(artifact: &RelocatablePm4) -> Result<std::vec::Vec<u32>, &'static str> {
+        accept_codegen_with_depth_format(artifact, LinearImageFormat::Depth32Float)
+    }
+
+    fn accept_codegen_with_depth_format(
+        artifact: &RelocatablePm4,
+        depth_format: LinearImageFormat,
+    ) -> Result<std::vec::Vec<u32>, &'static str> {
         let bytes = wire_from_codegen(artifact);
         validate_and_relocate(
             &bytes,
             |attachment_token| {
+                let is_depth = attachment_token == token(ObjectRef::External(DEPTH));
                 let is_image = attachment_token == token(ObjectRef::External(TARGET))
                     || attachment_token == token(ObjectRef::External(SOURCE))
-                    || attachment_token == token(ObjectRef::External(ALPHA));
+                    || attachment_token == token(ObjectRef::External(ALPHA))
+                    || is_depth;
                 Some(ResolvedResource {
                     attachment_token,
                     gpu_va: 0x1_0000_0000 + attachment_token * 0x1_0000,
                     allocation_size: 0x1000,
                     allowed_access: ACCESS_READ | ACCESS_WRITE,
                     linear_image: is_image.then_some(LinearImage {
+                        format: if is_depth {
+                            depth_format
+                        } else {
+                            LinearImageFormat::Bgra8Unorm
+                        },
+                        modifier: if is_depth && depth_format == LinearImageFormat::Depth32Float {
+                            KernelImageModifier::Tile6_3Depth
+                        } else {
+                            KernelImageModifier::Linear
+                        },
                         width: 16,
                         height: 16,
-                        row_pitch: 64,
-                        visible_size: 0x400,
+                        row_pitch: if is_depth { 256 } else { 64 },
+                        visible_size: if is_depth { 0x1000 } else { 0x400 },
                     }),
                 })
             },
@@ -2469,6 +2703,8 @@ mod tests {
                 allocation_size: 0x1000,
                 allowed_access: ACCESS_WRITE,
                 linear_image: Some(LinearImage {
+                    format: LinearImageFormat::Bgra8Unorm,
+                    modifier: KernelImageModifier::Linear,
                     width: 16,
                     height: 16,
                     row_pitch: 64,
@@ -2918,6 +3154,105 @@ mod tests {
         })
         .unwrap();
         assert!(accept_codegen(&upload).is_ok());
+    }
+
+    #[test]
+    fn canonical_depth32_clear_test_and_write_are_accepted_end_to_end() {
+        const PIPELINE: PipelineId = PipelineId::new(17);
+        let resources = [
+            image(TARGET, TextureUsage::RENDER_ATTACHMENT),
+            depth_image(DEPTH),
+            ResourceMeta {
+                id: BUFFER,
+                size: 120,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                },
+            },
+        ];
+        let pipeline = RenderPipelineDesc::new(
+            TextureFormat::Bgra8Unorm,
+            PrimitiveTopology::TriangleList,
+            VertexBufferLayout::new(
+                40,
+                std::vec![
+                    VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                    VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+                ],
+            )
+            .unwrap(),
+            FragmentProgram::VertexColor,
+            BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+            RasterState::new(CullMode::Back, FrontFace::CounterClockwise),
+        )
+        .unwrap()
+        .with_depth_stencil(DepthState::new(
+            TextureFormat::Depth32Float,
+            CompareFunction::Less,
+            true,
+        ))
+        .unwrap();
+        let pipelines = [PipelineMeta {
+            id: PIPELINE,
+            descriptor: pipeline,
+        }];
+        let operations = [
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: PixelRect::new(0, 0, 16, 16).unwrap(),
+                load: LoadOp::Clear(Color::rgba(0.1, 0.2, 0.3, 1.0).unwrap()),
+                store: StoreOp::Store,
+                depth: Some(DepthAttachment {
+                    target: DEPTH,
+                    load: DepthLoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+            }),
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            },
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::Draw {
+                vertex_count: 3,
+                first_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &operations,
+        })
+        .unwrap();
+        assert!(accept_codegen(&artifact).is_ok());
+        assert_eq!(
+            accept_codegen_with_depth_format(&artifact, LinearImageFormat::Bgra8Unorm),
+            Err("qcom-adreno-a618: A2D state exceeds the authorized image layout")
+        );
+
+        let mut unsafe_depth_control = artifact.clone();
+        let packet = Packets::new(&unsafe_depth_control.words)
+            .collect::<Result<std::vec::Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .find(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type4 {
+                        register: super::RB_DEPTH_CNTL,
+                        ..
+                    }
+                ) && packet.payload != [0]
+            })
+            .unwrap();
+        unsafe_depth_control.words[packet.word_offset as usize + 1] |= 1 << 7;
+        assert!(accept_codegen(&unsafe_depth_control).is_err());
     }
 
     #[test]

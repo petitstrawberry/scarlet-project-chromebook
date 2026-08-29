@@ -872,6 +872,15 @@ fn append_image_resource(
     metadata
         .try_reserve(1)
         .map_err(|_| IrSubmitError::OutOfMemory)?;
+    let modifier = if image.layout.modifier == gpu_raw::GPU_IMAGE_MODIFIER_LINEAR {
+        codegen::ImageModifier::Linear
+    } else if image.layout.modifier == adreno_a6xx_layout::IMAGE_MODIFIER_TILE6_3_DEPTH {
+        codegen::ImageModifier::A6xxTile6_3Depth
+    } else {
+        return Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::ImageLayout,
+        ));
+    };
     metadata.push(codegen::ResourceMeta {
         id,
         size: image.allocation_size(),
@@ -885,7 +894,7 @@ fn append_image_resource(
             },
             extent: descriptor.extent(),
             usage,
-            modifier: codegen::ImageModifier::Linear,
+            modifier,
             planes,
         }),
     });

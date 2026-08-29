@@ -1,15 +1,16 @@
 use adreno_a6xx_pm4::{Header, Packets, opcode};
 use adreno_a6xx_shader_pack::ShaderVariant;
 use sgfx_codegen_adreno_a6xx::{
-    Access, Capabilities, CompileError, CompileInput, GeneratedObjectKind, ImageMeta,
-    ImageModifier, ObjectId, ObjectRef, Operation, PipelineId, PipelineMeta, PlaneLayout,
-    RenderPass, ResourceKind, ResourceMeta, compile,
+    Access, Capabilities, CompileError, CompileInput, DepthAttachment, GeneratedObjectKind,
+    ImageMeta, ImageModifier, ObjectId, ObjectRef, Operation, PipelineId, PipelineMeta,
+    PlaneLayout, RenderPass, ResourceKind, ResourceMeta, compile,
 };
 use sgfx_core::ir::{
-    AddressMode, BlendState, BufferUsage, Color, CullMode, DrawUniforms, Extent2D, FilterMode,
-    FragmentProgram, FrontFace, IndexFormat, LoadOp, PrimitiveTopology, RasterState,
-    RenderPipelineDesc, SamplerDesc, StoreOp, TextureFormat, TextureSampleMode, TextureUsage,
-    Transform, VertexAttribute, VertexBufferLayout, VertexFormat,
+    AddressMode, BlendState, BufferUsage, Color, CompareFunction, CullMode, DepthLoadOp,
+    DepthState, DrawUniforms, Extent2D, FilterMode, FragmentProgram, FrontFace, IndexFormat,
+    LoadOp, PrimitiveTopology, RasterState, RenderPipelineDesc, SamplerDesc, StoreOp,
+    TextureFormat, TextureSampleMode, TextureUsage, Transform, VertexAttribute, VertexBufferLayout,
+    VertexFormat,
 };
 
 const TARGET: ObjectId = ObjectId::new(0);
@@ -17,6 +18,7 @@ const SOURCE: ObjectId = ObjectId::new(1);
 const VERTICES: ObjectId = ObjectId::new(2);
 const ALPHA: ObjectId = ObjectId::new(3);
 const INDICES: ObjectId = ObjectId::new(4);
+const DEPTH: ObjectId = ObjectId::new(5);
 const PIPELINE: PipelineId = PipelineId::new(0);
 
 fn rect(x: u32, y: u32, width: u32, height: u32) -> sgfx_core::ir::PixelRect {
@@ -150,6 +152,7 @@ fn assert_ccu_clean_before_every_color_invalidate(
     const EVENT_WRITE_4: u32 = 0x7046_0004;
     const CCU_CLEAN_COLOR: u32 = 0x1d;
     const CCU_CLEAN_DEPTH: u32 = 0x1c;
+    const EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
     const CCU_INVALIDATE_COLOR: u32 = 0x19;
     const CCU_INVALIDATE_DEPTH: u32 = 0x18;
 
@@ -170,7 +173,11 @@ fn assert_ccu_clean_before_every_color_invalidate(
         .enumerate()
         .filter_map(|(position, words)| {
             (words[0] == EVENT_WRITE_4
-                && matches!(words[1], CCU_CLEAN_COLOR | CCU_CLEAN_DEPTH)
+                && matches!(
+                    words[1],
+                    value if value == CCU_CLEAN_COLOR | EVENT_WRITE_TIMESTAMP
+                        || value == CCU_CLEAN_DEPTH | EVENT_WRITE_TIMESTAMP
+                )
                 && words[2] == 0
                 && words[3] == 0
                 && words[4] != 0)
@@ -204,17 +211,22 @@ fn assert_ccu_clean_before_every_color_invalidate(
             continue;
         }
         if packet.payload == [CCU_INVALIDATE_COLOR] {
-            let immediately_clean = packets
-                .get(index.wrapping_sub(1))
-                .is_some_and(|previous| previous.payload.first() == Some(&CCU_CLEAN_COLOR));
+            let immediately_clean = packets.get(index.wrapping_sub(1)).is_some_and(|previous| {
+                previous.payload.first() == Some(&(CCU_CLEAN_COLOR | EVENT_WRITE_TIMESTAMP))
+            });
             let clean_before_depth = index >= 2
-                && packets[index - 2].payload.first() == Some(&CCU_CLEAN_COLOR)
-                && packets[index - 1].payload.first() == Some(&CCU_CLEAN_DEPTH);
+                && packets[index - 2].payload.first()
+                    == Some(&(CCU_CLEAN_COLOR | EVENT_WRITE_TIMESTAMP))
+                && packets[index - 1].payload.first()
+                    == Some(&(CCU_CLEAN_DEPTH | EVENT_WRITE_TIMESTAMP));
             assert!(immediately_clean || clean_before_depth);
         } else if packet.payload == [CCU_INVALIDATE_DEPTH] {
             assert!(index >= 2);
             assert_eq!(packets[index - 2].payload.len(), 4);
-            assert_eq!(packets[index - 2].payload.first(), Some(&CCU_CLEAN_DEPTH));
+            assert_eq!(
+                packets[index - 2].payload.first(),
+                Some(&(CCU_CLEAN_DEPTH | EVENT_WRITE_TIMESTAMP))
+            );
             assert_eq!(packets[index - 1].payload, [CCU_INVALIDATE_COLOR]);
         }
     }
@@ -250,7 +262,7 @@ fn clear_is_a_golden_address_free_stream() {
         artifact.words.as_slice(),
         &[
             0x7046_0004,
-            0x1d,
+            0x4000_001d,
             0,
             0,
             1,
@@ -297,12 +309,12 @@ fn clear_is_a_golden_address_free_stream() {
             3,
             0x7026_8000,
             0x7046_0004,
-            0x1d,
+            0x4000_001d,
             0,
             0,
             2,
             0x7046_0004,
-            0x1c,
+            0x4000_001c,
             0,
             0,
             3,
@@ -313,6 +325,122 @@ fn clear_is_a_golden_address_free_stream() {
             0x7026_8000,
         ]
     );
+}
+
+#[test]
+fn depth32_clear_test_and_write_are_a_relocatable_sysmem_stream() {
+    let mut resources = resources();
+    resources.push(ResourceMeta {
+        id: DEPTH,
+        size: 4096,
+        kind: ResourceKind::Image(ImageMeta {
+            format: TextureFormat::Depth32Float,
+            storage_format: TextureFormat::Depth32Float,
+            extent: Extent2D::new(16, 16).unwrap(),
+            usage: TextureUsage::RENDER_ATTACHMENT,
+            modifier: ImageModifier::A6xxTile6_3Depth,
+            planes: vec![PlaneLayout {
+                offset: 0,
+                stride: 256,
+                size: 4096,
+            }],
+        }),
+    });
+    let mut pipeline = pipeline();
+    pipeline.descriptor = pipeline
+        .descriptor
+        .with_depth_stencil(DepthState::new(
+            TextureFormat::Depth32Float,
+            CompareFunction::Less,
+            true,
+        ))
+        .unwrap();
+    let operations = [
+        Operation::BeginRenderPass(RenderPass {
+            target: TARGET,
+            area: rect(0, 0, 16, 16),
+            load: LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 1.0).unwrap()),
+            store: StoreOp::Store,
+            depth: Some(DepthAttachment {
+                target: DEPTH,
+                load: DepthLoadOp::Clear(1.0),
+                store: StoreOp::Store,
+            }),
+        }),
+        Operation::SetPipeline(PIPELINE),
+        Operation::SetVertexBuffer {
+            buffer: VERTICES,
+            offset: 0,
+        },
+        Operation::SetUniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+        )),
+        Operation::Draw {
+            vertex_count: 3,
+            first_vertex: 0,
+        },
+        Operation::EndRenderPass,
+    ];
+    let artifact = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 4096),
+        resources: &resources,
+        pipelines: &[pipeline],
+        operations: &operations,
+    })
+    .unwrap();
+
+    assert_well_formed(&artifact);
+    assert_ccu_clean_before_every_color_invalidate(&artifact);
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(packets.iter().any(|packet| {
+        matches!(
+            packet.header,
+            Header::Type4 {
+                register: 0x8c00,
+                count: 1
+            }
+        ) && packet.payload == [0x04f1_4a80]
+    }));
+    let depth_layout = packets
+        .iter()
+        .find(|packet| {
+            matches!(
+                packet.header,
+                Header::Type4 {
+                    register: 0x8872,
+                    count: 6
+                }
+            ) && packet.payload[0] == 4
+        })
+        .unwrap();
+    assert_eq!(depth_layout.payload, [4, 4, 64, 0, 0, 0]);
+    assert!(artifact.fixups.iter().any(|fixup| {
+        fixup.word_offset == depth_layout.word_offset + 4
+            && fixup.object == ObjectRef::External(DEPTH)
+            && fixup.required_size == 4096
+            && fixup.access == Access::READ | Access::WRITE
+    }));
+    assert!(packets.iter().any(|packet| {
+        matches!(
+            packet.header,
+            Header::Type4 {
+                register: 0x8c17,
+                count: 1
+            }
+        ) && packet.payload == [0x34a]
+    }));
+    assert!(packets.iter().any(|packet| {
+        matches!(
+            packet.header,
+            Header::Type4 {
+                register: 0x8871,
+                count: 1
+            }
+        ) && packet.payload == [0x47]
+    }));
 }
 
 #[test]
@@ -343,7 +471,7 @@ fn copy_is_a_golden_stream_with_ccu_sequence_and_two_surfaces() {
         artifact.words.as_slice(),
         &[
             0x7046_0004,
-            0x1d,
+            0x4000_001d,
             0,
             0,
             1,
@@ -399,12 +527,12 @@ fn copy_is_a_golden_stream_with_ccu_sequence_and_two_surfaces() {
             3,
             0x7026_8000,
             0x7046_0004,
-            0x1d,
+            0x4000_001d,
             0,
             0,
             2,
             0x7046_0004,
-            0x1c,
+            0x4000_001c,
             0,
             0,
             3,
@@ -1367,7 +1495,7 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
                         opcode: 0x46,
                         count: 4
                     }
-                ) && packet.payload.first() == Some(&0x1c)
+                ) && packet.payload.first() == Some(&0x4000_001c)
             })
             .count(),
         2,

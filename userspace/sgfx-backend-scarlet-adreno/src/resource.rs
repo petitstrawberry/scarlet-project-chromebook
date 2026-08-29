@@ -3,6 +3,9 @@
 use alloc::{rc::Rc, vec::Vec};
 use core::ptr;
 
+use adreno_a6xx_layout::{
+    DEPTH32_LAYER_ALIGNMENT, IMAGE_MODIFIER_TILE6_3_DEPTH, is_depth32_tile6_3_layout,
+};
 use gpu_raw::{
     GPU_BUFFER_FLAG_CPU_VISIBLE, GPU_IMAGE_FORMAT_BGRA8_UNORM, GPU_IMAGE_FORMAT_DEPTH32_FLOAT,
     GPU_IMAGE_MODIFIER_LINEAR, GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT,
@@ -92,7 +95,7 @@ impl RawImage {
         height: u32,
     ) -> HandleResult<Self> {
         let layout = raw.query_layout()?;
-        validate_linear_layout(&layout, width, height, logical_format)?;
+        validate_image_layout(&layout, width, height, logical_format)?;
         let attachment_token = context.raw.attach_image(&raw)?;
         if attachment_token == 0 {
             return Err(HandleError::InvalidParameter);
@@ -494,14 +497,13 @@ fn image_create_parameters(descriptor: ir::TextureDesc) -> HandleResult<(u32, u3
     Ok((format, usage))
 }
 
-fn validate_linear_layout(
+fn validate_image_layout(
     layout: &GpuImageLayout,
     width: u32,
     height: u32,
     logical_format: ir::TextureFormat,
 ) -> HandleResult<()> {
-    if layout.modifier != GPU_IMAGE_MODIFIER_LINEAR
-        || layout.plane_count != 1
+    if layout.plane_count != 1
         || layout.total_size == 0
         || layout.alignment == 0
         || !layout.alignment.is_power_of_two()
@@ -513,24 +515,36 @@ fn validate_linear_layout(
     let minimum_pitch = width
         .checked_mul(physical_bytes_per_pixel)
         .ok_or(HandleError::InvalidParameter)?;
-    let minimum_size = u64::from(plane.row_pitch)
-        .checked_mul(u64::from(height))
-        .ok_or(HandleError::InvalidParameter)?;
     let plane_end = plane
         .offset
         .checked_add(plane.size)
         .ok_or(HandleError::InvalidParameter)?;
-    if plane.row_pitch < minimum_pitch
-        || plane.size < minimum_size
-        || plane_end > layout.total_size
+    if plane_end > layout.total_size
         || plane.block_width != 1
         || plane.block_height != 1
         || u32::from(plane.bytes_per_block) != physical_bytes_per_pixel
     {
         return Err(HandleError::Unsupported);
     }
-    if logical_format == ir::TextureFormat::Depth32Float && plane.bytes_per_block != 4 {
-        return Err(HandleError::Unsupported);
+    if logical_format == ir::TextureFormat::Depth32Float {
+        if layout.modifier != IMAGE_MODIFIER_TILE6_3_DEPTH
+            || layout.alignment != DEPTH32_LAYER_ALIGNMENT
+            || plane.offset & (DEPTH32_LAYER_ALIGNMENT - 1) != 0
+            || !is_depth32_tile6_3_layout(width, height, plane.row_pitch, plane.size)
+            || u64::from(plane.array_pitch) != plane.size
+        {
+            return Err(HandleError::Unsupported);
+        }
+    } else {
+        let minimum_size = u64::from(plane.row_pitch)
+            .checked_mul(u64::from(height))
+            .ok_or(HandleError::InvalidParameter)?;
+        if layout.modifier != GPU_IMAGE_MODIFIER_LINEAR
+            || plane.row_pitch < minimum_pitch
+            || plane.size < minimum_size
+        {
+            return Err(HandleError::Unsupported);
+        }
     }
     Ok(())
 }
@@ -546,9 +560,10 @@ fn empty_slots<T>(length: usize) -> Result<Vec<Option<T>>, IrSubmitError> {
 
 #[cfg(test)]
 mod tests {
+    use adreno_a6xx_layout::IMAGE_MODIFIER_TILE6_3_DEPTH;
     use gpu_raw::{GPU_IMAGE_MODIFIER_LINEAR, GpuImageLayout, GpuImagePlaneLayout};
 
-    use super::validate_linear_layout;
+    use super::validate_image_layout;
     use crate::{HandleError, ir};
 
     fn sample_layout() -> GpuImageLayout {
@@ -573,7 +588,7 @@ mod tests {
     #[test]
     fn accepts_queried_linear_layout_with_padded_pitch() {
         assert_eq!(
-            validate_linear_layout(&sample_layout(), 8, 16, ir::TextureFormat::Bgra8Unorm),
+            validate_image_layout(&sample_layout(), 8, 16, ir::TextureFormat::Bgra8Unorm),
             Ok(())
         );
     }
@@ -583,7 +598,30 @@ mod tests {
         let mut layout = sample_layout();
         layout.planes[0].offset = 64;
         assert_eq!(
-            validate_linear_layout(&layout, 8, 16, ir::TextureFormat::Bgra8Unorm),
+            validate_image_layout(&layout, 8, 16, ir::TextureFormat::Bgra8Unorm),
+            Err(HandleError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn accepts_canonical_tile6_3_depth_layout() {
+        let mut layout = sample_layout();
+        layout.modifier = IMAGE_MODIFIER_TILE6_3_DEPTH;
+        layout.total_size = 4096;
+        layout.alignment = 4096;
+        layout.planes[0].size = 4096;
+        layout.planes[0].row_pitch = 256;
+        layout.planes[0].array_pitch = 4096;
+        assert_eq!(
+            validate_image_layout(&layout, 16, 16, ir::TextureFormat::Depth32Float),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_linear_depth_layout() {
+        assert_eq!(
+            validate_image_layout(&sample_layout(), 8, 16, ir::TextureFormat::Depth32Float),
             Err(HandleError::Unsupported)
         );
     }

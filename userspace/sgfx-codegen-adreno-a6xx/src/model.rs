@@ -95,6 +95,8 @@ impl Capabilities {
 pub enum ImageModifier {
     /// One or more uncompressed linear planes.
     Linear,
+    /// Uncompressed A6xx TILE6_3 depth memory.
+    A6xxTile6_3Depth,
 }
 
 /// Immutable layout of one image plane in an external allocation.

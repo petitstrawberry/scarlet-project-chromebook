@@ -13,14 +13,15 @@ use scarlet::{
             GPU_EXECUTION_SUPPORT_ADDRESS_SPACE, GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD,
             GPU_EXECUTION_SUPPORT_MEMORY, GPU_EXECUTION_SUPPORT_PRESENTATION,
             GPU_EXECUTION_SUPPORT_QUEUE, GPU_EXECUTION_SUPPORT_TIMELINE,
-            GPU_IMAGE_FORMAT_BGRA8_UNORM, GPU_IMAGE_USAGE_PRESENTABLE,
+            GPU_IMAGE_FORMAT_BGRA8_UNORM, GPU_IMAGE_FORMAT_DEPTH32_FLOAT,
+            GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT, GPU_IMAGE_USAGE_PRESENTABLE,
             GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED, GPU_IMAGE_USAGE_TRANSFER_DST,
             GpuBackend, GpuBackendBuffer, GpuBackendBufferInfo, GpuBackendContext,
             GpuBackendContextInfo, GpuBackendDialectDescriptor, GpuBackendDialectInfo,
             GpuBackendImage, GpuBackendImageInfo, GpuBackendImageLayout,
-            GpuBackendLinearDisplayInfo, GpuBackendQueue, GpuBackendQueueInfo,
-            GpuBackendSubmitError, GpuBufferCreateInfo, GpuDeviceInfo, GpuDeviceState,
-            GpuImageBackingInfo, GpuImageCreateInfo, GpuImageUploadInfo,
+            GpuBackendImagePlaneLayout, GpuBackendLinearDisplayInfo, GpuBackendQueue,
+            GpuBackendQueueInfo, GpuBackendSubmitError, GpuBufferCreateInfo, GpuDeviceInfo,
+            GpuDeviceState, GpuImageBackingInfo, GpuImageCreateInfo, GpuImageUploadInfo,
             register_gpu_control_device,
         },
         graphics::{GpuDisplayResource, PixelFormat},
@@ -34,6 +35,9 @@ use scarlet::{
     time, vm,
 };
 
+use adreno_a6xx_layout::{
+    DEPTH32_LAYER_ALIGNMENT, IMAGE_MODIFIER_TILE6_3_DEPTH, depth32_tile6_3_layout,
+};
 use adreno_a6xx_pm4::{opcode, type4, type7};
 use adreno_a6xx_shader_pack::{PACK_SIZE, SHADER_ALIGNMENT, SHADER_SIZE, ShaderVariant, copy_pack};
 use qcom_sc7180_interconnect::GpuMemoryPath;
@@ -44,7 +48,10 @@ use crate::{
     memory::{DmaAllocation, bidirectional_flags},
     opp::read_gpu_operating_points,
     registers::*,
-    submit::{LinearImage, ResolvedResource, diagnose_rejected_packet, validate_and_relocate},
+    submit::{
+        ImageModifier, LinearImage, LinearImageFormat, ResolvedResource, diagnose_rejected_packet,
+        validate_and_relocate,
+    },
 };
 
 const GPU_IOVA_BASE: u64 = 0x1_0000_0000;
@@ -89,24 +96,21 @@ fn completion_commands(fence_address: u64, sequence: u32) -> Result<[u32; 7], &'
     ])
 }
 
-fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 12], &'static str> {
+fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 10], &'static str> {
     let event_header = type7(opcode::EVENT_WRITE, 1)
         .map_err(|_| "qcom-adreno-a618: failed to encode kernel CCU invalidate")?;
     let indirect_header = type7(CP_INDIRECT_BUFFER, 3)
         .map_err(|_| "qcom-adreno-a618: failed to encode kernel indirect buffer")?;
-    let wait_mem_writes_header = type7(opcode::WAIT_MEM_WRITES, 0)
-        .map_err(|_| "qcom-adreno-a618: failed to encode kernel memory-write barrier")?;
-    let wait_for_me_header = type7(opcode::WAIT_FOR_ME, 0)
-        .map_err(|_| "qcom-adreno-a618: failed to encode kernel ME barrier")?;
 
     // Linux emits CACHE_INVALIDATE after a page-table switch and before the
     // next userspace IB, then unconditionally invalidates both CCUs.  Scarlet's
     // command mappings can reuse an IOVA after the previous process exits, so
     // the UCHE invalidate is required even though the SMMU TLB was invalidated
-    // on the CPU side.  After the IB, serialize asynchronous CP memory writes
-    // and then make the parser wait for the micro-engine.  Mesa uses the same
-    // WAIT_MEM_WRITES -> WAIT_FOR_ME order before a following memory signal;
-    // without the front-end barrier, CACHE_FLUSH_TS can overtake the ME.
+    // on the CPU side.  Do not append front-end waits after the IB: Linux's
+    // A6xx submit path proceeds directly to the scratch fence and
+    // CACHE_FLUSH_TS, whose event semantics retire the preceding work.  Extra
+    // WAIT_MEM_WRITES/WAIT_FOR_ME packets fault after an addressed depth-CCU
+    // flush on A618 and add a full-pipeline stall to every submission.
     Ok([
         event_header,
         EVENT_CACHE_INVALIDATE,
@@ -118,8 +122,6 @@ fn submission_commands(command_address: u64, word_count: u32) -> Result<[u32; 12
         command_address as u32,
         (command_address >> 32) as u32,
         word_count,
-        wait_mem_writes_header,
-        wait_for_me_header,
     ])
 }
 
@@ -1640,7 +1642,7 @@ impl GpuBackend for A618Backend {
             0,
             BACKEND_ID,
             if ready {
-                b"A618 CoachZ linear BGRA8"
+                b"A618 CoachZ linear BGRA8 + TILE6_3 D32"
             } else {
                 b"A618 unavailable"
             },
@@ -1692,8 +1694,34 @@ impl GpuBackend for A618Backend {
         &self,
         create: GpuImageCreateInfo,
     ) -> Result<GpuBackendImageLayout, &'static str> {
-        if create.format != GPU_IMAGE_FORMAT_BGRA8_UNORM {
-            return Err("qcom-adreno-a618: only BGRA8 images are supported");
+        if !matches!(
+            create.format,
+            GPU_IMAGE_FORMAT_BGRA8_UNORM | GPU_IMAGE_FORMAT_DEPTH32_FLOAT
+        ) {
+            return Err("qcom-adreno-a618: image format is not supported");
+        }
+        if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
+            let tiled = depth32_tile6_3_layout(create.width, create.height)
+                .ok_or("qcom-adreno-a618: tiled depth layout overflows")?;
+            let array_pitch = u32::try_from(tiled.layer_size)
+                .map_err(|_| "qcom-adreno-a618: depth layer pitch exceeds the backend ABI")?;
+            let mut planes = [GpuBackendImagePlaneLayout::EMPTY; 4];
+            planes[0] = GpuBackendImagePlaneLayout {
+                offset: 0,
+                size: tiled.layer_size,
+                row_pitch: tiled.row_pitch,
+                array_pitch,
+                block_width: 1,
+                block_height: 1,
+                bytes_per_block: 4,
+            };
+            return Ok(GpuBackendImageLayout {
+                modifier: IMAGE_MODIFIER_TILE6_3_DEPTH,
+                total_size: tiled.layer_size,
+                alignment: DEPTH32_LAYER_ALIGNMENT,
+                plane_count: 1,
+                planes,
+            });
         }
         let row_bytes = create
             .width
@@ -1725,23 +1753,43 @@ impl GpuBackend for A618Backend {
                 } else {
                     0
                 }) | (if create.usage
-                    & (GPU_IMAGE_USAGE_RENDER_TARGET | GPU_IMAGE_USAGE_TRANSFER_DST)
+                    & (GPU_IMAGE_USAGE_RENDER_TARGET
+                        | GPU_IMAGE_USAGE_TRANSFER_DST
+                        | GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT)
                     != 0
                 {
                     adreno_a6xx_submit_wire::ACCESS_WRITE
                 } else {
                     0
+                }) | (if create.usage & GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT != 0 {
+                    adreno_a6xx_submit_wire::ACCESS_READ
+                } else {
+                    0
                 }),
                 Some(LinearImage {
+                    format: if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
+                        LinearImageFormat::Depth32Float
+                    } else {
+                        LinearImageFormat::Bgra8Unorm
+                    },
+                    modifier: if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
+                        ImageModifier::Tile6_3Depth
+                    } else {
+                        ImageModifier::Linear
+                    },
                     width: create.width,
                     height: create.height,
                     row_pitch: layout.planes[0].row_pitch,
-                    // Exclude page-alignment tail padding: A2D authorizes the
-                    // complete visible plane, while the mapping retains the
-                    // separately tracked allocation_size.
-                    visible_size: u64::from(layout.planes[0].row_pitch)
-                        .checked_mul(u64::from(create.height))
-                        .ok_or("qcom-adreno-a618: image visible size overflows")?,
+                    // A relocation exposes exactly the immutable plane
+                    // footprint. Linear color excludes backing tail padding;
+                    // TILE6_3 depth includes its padded rows and layer tail.
+                    visible_size: if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
+                        layout.planes[0].size
+                    } else {
+                        u64::from(layout.planes[0].row_pitch)
+                            .checked_mul(u64::from(create.height))
+                            .ok_or("qcom-adreno-a618: image visible size overflows")?
+                    },
                 }),
             )?,
             create,
@@ -1963,7 +2011,6 @@ mod tests {
         assert_eq!(commands[7], 0x2345_6000);
         assert_eq!(commands[8], 1);
         assert_eq!(commands[9], 0x123);
-        assert_eq!(commands[10], type7(opcode::WAIT_MEM_WRITES, 0).unwrap());
-        assert_eq!(commands[11], type7(opcode::WAIT_FOR_ME, 0).unwrap());
+        assert_eq!(commands.len(), 10);
     }
 }

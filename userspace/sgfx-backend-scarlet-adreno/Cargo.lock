@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "adreno-a6xx-layout"
+version = "0.1.0"
+
+[[package]]
 name = "adreno-a6xx-pm4"
 version = "0.1.0"
 
@@ -121,6 +125,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "sgfx-backend-scarlet-adreno"
 version = "0.1.0"
 dependencies = [
+ "adreno-a6xx-layout",
  "adreno-a6xx-submit-wire",
  "gpu-raw",
  "scarlet-os",
@@ -133,6 +138,7 @@ dependencies = [
 name = "sgfx-codegen-adreno-a6xx"
 version = "0.1.0"
 dependencies = [
+ "adreno-a6xx-layout",
  "adreno-a6xx-pm4",
  "adreno-a6xx-shader-pack",
  "sgfx-core",

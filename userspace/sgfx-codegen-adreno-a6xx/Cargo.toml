@@ -8,6 +8,7 @@ license = "GPL-2.0-only"
 path = "src/lib.rs"
 
 [dependencies]
+adreno-a6xx-layout = { path = "../../shared/adreno-a6xx-layout" }
 adreno-a6xx-pm4 = { path = "../../shared/adreno-a6xx-pm4" }
 adreno-a6xx-shader-pack = { path = "../../shared/adreno-a6xx-shader-pack" }
 sgfx-core = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "sgfx-core", default-features = false }

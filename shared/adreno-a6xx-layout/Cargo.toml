@@ -1,0 +1,8 @@
+[package]
+name = "adreno-a6xx-layout"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[lib]
+path = "src/lib.rs"

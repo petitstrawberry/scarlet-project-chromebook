@@ -10,6 +10,7 @@ std = ["dep:scarlet-os", "gpu-raw/std"]
 scarlet-std = ["dep:scarlet-std", "gpu-raw/scarlet-std"]
 
 [dependencies]
+adreno-a6xx-layout = { path = "../../shared/adreno-a6xx-layout" }
 adreno-a6xx-submit-wire = { path = "../../shared/adreno-a6xx-submit-wire" }
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "gpu-raw", default-features = false }
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-os", default-features = false, features = ["std"], optional = true }

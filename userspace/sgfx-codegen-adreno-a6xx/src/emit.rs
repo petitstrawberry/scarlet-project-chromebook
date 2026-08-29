@@ -7,7 +7,7 @@ use adreno_a6xx_shader_pack::{
     FragmentMeta, LinkMeta, PipelineVariant, SAMPLER_CLAMP_LINEAR, SAMPLER_CLAMP_NEAREST,
     SHADER_SIZE, ShaderMeta, VertexMeta, link_meta, shader_meta,
 };
-use sgfx_core::ir::{Color, IndexFormat, PixelRect};
+use sgfx_core::ir::{Color, CompareFunction, IndexFormat, PixelRect};
 
 use crate::model::{
     Access, AddressEncoding, CompileError, GeneratedObject, GeneratedObjectId, GeneratedObjectKind,
@@ -34,8 +34,12 @@ const EVENT_CCU_FLUSH_COLOR_TS: u32 = 0x1d;
 const EVENT_CCU_FLUSH_DEPTH_TS: u32 = 0x1c;
 const EVENT_CCU_INVALIDATE_COLOR: u32 = 0x19;
 const EVENT_CACHE_INVALIDATE: u32 = 0x31;
+const EVENT_WRITE_TIMESTAMP: u32 = 1 << 30;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
+const FORMAT_32_FLOAT: u32 = 0x4a;
+const DEPTH_FORMAT_32: u32 = 4;
+const A2D_IFMT_FLOAT32: u32 = 4;
 // Mesa fd6_format_table maps PIPE_FORMAT_B8G8R8A8_UNORM to WXYZ (1).
 const A2D_BGRA_COLOR_SWAP: u32 = 1 << 10;
 const MRT_BGRA_COLOR_SWAP: u32 = 1 << 13;
@@ -43,8 +47,6 @@ const BLIT_CHANNEL_MASK: u32 = 0xf << 20;
 const BLIT_SOLID_COLOR: u32 = 1 << 7;
 const BLIT_SCISSOR: u32 = 1 << 16;
 const SOURCE_TEXTURE_REQUIRED: u32 = (1 << 20) | (1 << 22);
-const SP_OUTPUT_INFO: u32 = (FORMAT_8_8_8_8_UNORM << 3) | (0xf << 12);
-
 const RB_A2D_BLT_CNTL: u32 = 0x8c00;
 const RB_A2D_PIXEL_CNTL: u32 = 0x8c01;
 const RB_A2D_DEST_BUFFER_INFO: u32 = 0x8c17;
@@ -122,6 +124,7 @@ const RB_BIN_CONTROL2: u32 = 0x88d3;
 const RB_WINDOW_OFFSET2: u32 = 0x88d4;
 const RB_RESOLVE_GMEM_BUFFER_INFO: u32 = 0x88d5;
 const RB_COLOR_FLAG_BUFFER_ADDR: u32 = 0x8903;
+const RB_DEPTH_FLAG_BUFFER_BASE: u32 = 0x8900;
 const VPC_RAST_CNTL: u32 = 0x9108;
 const VPC_VARYING_INTERP_MODE: u32 = 0x9200;
 const VPC_VARYING_REPLACE_MODE: u32 = 0x9208;
@@ -206,7 +209,15 @@ pub(crate) struct DrawState {
     pub(crate) linear_sampler: bool,
     pub(crate) source_over: bool,
     pub(crate) cull: u32,
+    pub(crate) depth: Option<DepthDrawState>,
     pub(crate) draw: DrawCall,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DepthDrawState {
+    pub(crate) target: Surface,
+    pub(crate) compare: CompareFunction,
+    pub(crate) write_enabled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +250,7 @@ pub(crate) struct Surface {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) stride: u32,
+    pub(crate) tile_mode: u32,
     pub(crate) alpha_mask: bool,
 }
 
@@ -649,7 +661,7 @@ impl Emitter {
         self.packet4(SP_PS_MRT_CNTL, &[1])?;
         self.packet4(RB_PS_MRT_CNTL, &[1])?;
         self.packet4(SP_PS_MRT_REG, &[FORMAT_8_8_8_8_UNORM])?;
-        self.emit_no_depth_state()?;
+        self.emit_depth_state(draw.depth)?;
         self.emit_single_sample_state()?;
 
         let target_area = PixelRect::new(0, 0, draw.target.width, draw.target.height)
@@ -798,6 +810,7 @@ impl Emitter {
             && previous.attributes == next.attributes
             && previous.source_over == next.source_over
             && previous.cull == next.cull
+            && previous.depth == next.depth
     }
 
     fn draw_with_retained_fixed_state(&mut self, draw: DrawState) -> Result<(), CompileError> {
@@ -977,22 +990,66 @@ impl Emitter {
         self.packet4(SP_GFX_USIZE, &[0])
     }
 
-    fn emit_no_depth_state(&mut self) -> Result<(), CompileError> {
+    fn emit_depth_state(&mut self, depth: Option<DepthDrawState>) -> Result<(), CompileError> {
         self.packet4(RB_ALPHA_TEST_CNTL, &[0])?;
         self.packet4(RB_STENCIL_CNTL, &[0])?;
         self.packet4(GRAS_SU_STENCIL_CNTL, &[0])?;
         self.packet4(RB_STENCIL_REF_CNTL, &[0])?;
         self.packet4(RB_STENCIL_MASK, &[0, 0])?;
-        self.packet4(RB_DEPTH_CNTL, &[0])?;
-        self.packet4(GRAS_SU_DEPTH_CNTL, &[0])?;
         self.packet4(RB_DEPTH_PLANE_CNTL, &[0])?;
         self.packet4(GRAS_SU_DEPTH_PLANE_CNTL, &[0])?;
         self.packet4(RB_DEPTH_BOUND_MIN, &[0, f32_bits(1.0)])?;
+        self.packet4(RB_STENCIL_BUFFER_INFO, &[0])?;
+        let Some(depth) = depth else {
+            self.packet4(RB_DEPTH_CNTL, &[0])?;
+            self.packet4(GRAS_SU_DEPTH_CNTL, &[0])?;
+            // DEPTH_BUFFER_INFO, PITCH, ARRAY_PITCH, BASE_LO/HI and GMEM_BASE.
+            self.packet4(RB_DEPTH_BUFFER_INFO, &[0; 6])?;
+            self.packet4(GRAS_SU_DEPTH_BUFFER_INFO, &[0])?;
+            return Ok(());
+        };
 
-        // DEPTH_BUFFER_INFO, PITCH, ARRAY_PITCH, BASE_LO/HI and GMEM_BASE.
-        self.packet4(RB_DEPTH_BUFFER_INFO, &[0; 6])?;
-        self.packet4(GRAS_SU_DEPTH_BUFFER_INFO, &[0])?;
-        self.packet4(RB_STENCIL_BUFFER_INFO, &[0])
+        let compare = match depth.compare {
+            CompareFunction::Never => 0,
+            CompareFunction::Less => 1,
+            CompareFunction::Equal => 2,
+            CompareFunction::LessEqual => 3,
+            CompareFunction::Greater => 4,
+            CompareFunction::NotEqual => 5,
+            CompareFunction::GreaterEqual => 6,
+            CompareFunction::Always => 7,
+        };
+        let reads_depth = !matches!(
+            depth.compare,
+            CompareFunction::Never | CompareFunction::Always
+        );
+        let depth_control = 1
+            | (u32::from(depth.write_enabled) << 1)
+            | (compare << 2)
+            | (u32::from(reads_depth) << 6);
+        self.packet4(RB_DEPTH_CNTL, &[depth_control])?;
+        self.packet4(GRAS_SU_DEPTH_CNTL, &[1])?;
+        // TILE6_3 depth is uncompressed and has no UBWC flag plane. Clear the
+        // complete flag-buffer state rather than inheriting firmware or an
+        // earlier depth draw's compression state.
+        self.packet4(RB_DEPTH_FLAG_BUFFER_BASE, &[0; 3])?;
+
+        // Keep the six-register A6xx depth layout atomic, matching Freedreno:
+        // INFO, PITCH, ARRAY_PITCH, BASE_LO/HI, and the zero sysmem GMEM base.
+        self.push_word(type4(RB_DEPTH_BUFFER_INFO, 6).map_err(|_| CompileError::InvalidPm4)?)?;
+        self.extend_words(&[
+            DEPTH_FORMAT_32,
+            depth.target.stride >> 6,
+            u32::try_from(depth.target.plane_size >> 6).map_err(|_| CompileError::Overflow)?,
+        ])?;
+        self.address_words(
+            ObjectRef::External(depth.target.object),
+            depth.target.plane_offset,
+            depth.target.plane_size,
+            Access::READ | Access::WRITE,
+        )?;
+        self.push_word(0)?;
+        self.packet4(GRAS_SU_DEPTH_BUFFER_INFO, &[DEPTH_FORMAT_32])
     }
 
     fn emit_single_sample_state(&mut self) -> Result<(), CompileError> {
@@ -1062,11 +1119,12 @@ impl Emitter {
         };
         self.event_sequence = self.event_sequence.wrapping_add(1).max(1);
         self.push_word(type7(opcode::EVENT_WRITE, 4).map_err(|_| CompileError::InvalidPm4)?)?;
-        // A6xx writes the packet's last dword to memory after this event
-        // completes. Bit 30 instead selects a hardware timestamp and is only
-        // appropriate for trace timestamps; Freedreno leaves it clear for
-        // addressed CCU clean/flush sequencing.
-        self.push_word(event)?;
+        // A6xx CCU clean events are timestamp events.  Freedreno marks every
+        // addressed PC_CCU_FLUSH_{COLOR,DEPTH}_TS packet with TIMESTAMP; the
+        // CP then retires the event by writing its hardware timestamp to the
+        // supplied address.  Omitting this bit leaves a depth flush pending
+        // and the following kernel CACHE_FLUSH_TS faults on A618.
+        self.push_word(event | EVENT_WRITE_TIMESTAMP)?;
         self.address_words(ObjectRef::Generated(sequence), 0, 4, Access::WRITE)?;
         self.push_word(self.event_sequence)
     }
@@ -1184,21 +1242,33 @@ impl Emitter {
         Ok(())
     }
 
-    fn emit_a2d_common(&mut self, solid: bool, scissor: bool) -> Result<(), CompileError> {
-        let control = (FORMAT_8_8_8_8_UNORM << 8)
+    fn emit_a2d_common(
+        &mut self,
+        format: u32,
+        ifmt: u32,
+        solid: bool,
+        scissor: bool,
+    ) -> Result<(), CompileError> {
+        let control = (format << 8)
             | BLIT_CHANNEL_MASK
             | if solid { BLIT_SOLID_COLOR } else { 0 }
-            | if scissor { BLIT_SCISSOR } else { 0 };
+            | if scissor { BLIT_SCISSOR } else { 0 }
+            | (ifmt << 24);
         self.packet4(RB_A2D_BLT_CNTL, &[control])?;
         self.packet4(GRAS_A2D_BLT_CNTL, &[control])?;
-        self.packet4(SP_A2D_OUTPUT_INFO, &[SP_OUTPUT_INFO])?;
+        self.packet4(SP_A2D_OUTPUT_INFO, &[(format << 3) | (0xf << 12)])?;
         self.packet4(RB_A2D_PIXEL_CNTL, &[0])
     }
 
-    fn emit_destination(&mut self, target: Surface) -> Result<(), CompileError> {
+    fn emit_destination(
+        &mut self,
+        target: Surface,
+        format: u32,
+        color_swap: u32,
+    ) -> Result<(), CompileError> {
         self.packet4(
             RB_A2D_DEST_BUFFER_INFO,
-            &[FORMAT_8_8_8_8_UNORM | A2D_BGRA_COLOR_SWAP],
+            &[format | (target.tile_mode << 8) | color_swap],
         )?;
         self.address_register(
             RB_A2D_DEST_BUFFER_BASE,
@@ -1230,8 +1300,27 @@ impl Emitter {
             RB_A2D_CLEAR_COLOR_DW0,
             &[unorm8(red), unorm8(green), unorm8(blue), unorm8(alpha)],
         )?;
-        self.emit_a2d_common(true, true)?;
-        self.emit_destination(target)?;
+        self.emit_a2d_common(FORMAT_8_8_8_8_UNORM, 0, true, true)?;
+        self.emit_destination(target, FORMAT_8_8_8_8_UNORM, A2D_BGRA_COLOR_SWAP)?;
+        self.emit_blit()?;
+        self.submission_end()
+    }
+
+    pub(crate) fn clear_depth(
+        &mut self,
+        target: Surface,
+        area: PixelRect,
+        depth: f32,
+    ) -> Result<(), CompileError> {
+        if !depth.is_finite() || !(0.0..=1.0).contains(&depth) {
+            return Err(CompileError::InvalidResource);
+        }
+        self.submission_begin_2d()?;
+        self.wait_for_idle()?;
+        self.emit_coordinates(area, None)?;
+        self.packet4(RB_A2D_CLEAR_COLOR_DW0, &[depth.to_bits(), 0, 0, 0])?;
+        self.emit_a2d_common(FORMAT_32_FLOAT, A2D_IFMT_FLOAT32, true, true)?;
+        self.emit_destination(target, FORMAT_32_FLOAT, 0)?;
         self.emit_blit()?;
         self.submission_end()
     }
@@ -1255,7 +1344,7 @@ impl Emitter {
             ],
         )?;
         self.emit_coordinates(destination_rect, None)?;
-        self.emit_a2d_common(false, true)?;
+        self.emit_a2d_common(FORMAT_8_8_8_8_UNORM, 0, false, true)?;
         self.packet4(
             TPL1_A2D_SRC_TEXTURE_INFO,
             &[FORMAT_8_8_8_8_UNORM | A2D_BGRA_COLOR_SWAP | SOURCE_TEXTURE_REQUIRED],
@@ -1272,7 +1361,7 @@ impl Emitter {
             Access::READ,
         )?;
         self.packet4(TPL1_A2D_SRC_TEXTURE_PITCH, &[(source.stride >> 6) << 9])?;
-        self.emit_destination(destination)?;
+        self.emit_destination(destination, FORMAT_8_8_8_8_UNORM, A2D_BGRA_COLOR_SWAP)?;
         self.emit_blit()?;
         self.submission_end()
     }
