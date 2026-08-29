@@ -33,6 +33,18 @@ cp "$main_lock" "$lock_file"
 
 echo "cargo-scarlet: rebuilding CoachZ SGFX userspace from $chromebook_root" >&2
 cd "$project_dir"
+# The copied workspace lock normally pins these crates to the last pushed git
+# revision.  Merely supplying a `[patch]` table does not replace an already
+# locked git package, so explicitly select the local Adreno backend once.  Its
+# path dependencies pull the other four local A6xx crates into the same lock.
+# Without this step a successful image build can silently omit working-tree
+# driver fixes while still claiming to rebuild CoachZ userspace locally.
+CARGO_TARGET_DIR="$target_dir" cargo update \
+    -Z unstable-options \
+    --lockfile-path "$lock_file" \
+    --config "$config" \
+    --manifest-path "$scarlet_root/.cargo/Cargo.toml" \
+    -p sgfx-backend-scarlet-adreno
 CARGO_TARGET_DIR="$target_dir" cargo build \
     -Z unstable-options \
     -Z build-std=core,compiler_builtins,alloc \
