@@ -900,7 +900,12 @@ impl Emitter {
             )?;
         }
 
-        self.wait_for_idle()?;
+        // Compatible draws are one pipelined render pass.  A WAIT_FOR_IDLE
+        // here drains every earlier primitive before every following draw,
+        // turning a retained UI frame into hundreds of serialized jobs.  The
+        // pass begin/end paths retain the required cache and CCU barriers;
+        // dynamic scissor, vertex, constant, and texture state is ordered by
+        // the command stream itself.
         match draw.draw {
             DrawCall::NonIndexed { vertex_count, .. } => {
                 self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, vertex_count])?;

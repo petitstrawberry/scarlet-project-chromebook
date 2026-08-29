@@ -1268,7 +1268,9 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
             depth: None,
         }),
     ];
-    for (index, pipeline) in [0_u32, 1, 0, 2].into_iter().enumerate() {
+    // Keep two adjacent solid draws so the golden also exercises retained
+    // fixed state and pipelined draw submission before switching programs.
+    for (index, pipeline) in [0_u32, 0, 1, 2].into_iter().enumerate() {
         operations.push(Operation::SetVertexBuffer {
             buffer: VERTICES,
             offset: index as u64 * QUAD_BYTES,
@@ -1304,10 +1306,28 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
     .unwrap();
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.words.len(), 1_607);
+    assert_eq!(artifact.words.len(), 1_378);
     let packets = Packets::new(&artifact.words)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
+    let draws = packets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, packet)| {
+            matches!(packet.header, Header::Type7 { opcode: 0x38, .. }).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(draws.len(), 4);
+    assert!(
+        !matches!(
+            packets[draws[1] - 1].header,
+            Header::Type7 {
+                opcode: opcode::WAIT_FOR_IDLE,
+                ..
+            }
+        ),
+        "compatible draws must remain pipelined",
+    );
     assert_eq!(
         packets
             .iter()
