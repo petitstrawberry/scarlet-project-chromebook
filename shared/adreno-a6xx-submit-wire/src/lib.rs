@@ -24,11 +24,16 @@ pub const RESOURCE_SIZE: usize = 32;
 /// Fixed v1 relocation record size.
 pub const RELOCATION_SIZE: usize = 32;
 /// Maximum A618 payload accepted by Scarlet's opaque queue transport.
-pub const MAX_SUBMIT_SIZE: usize = 256 * 1024;
+///
+/// A full 512-item ScarletUI frame is slightly larger than 1 MiB once its
+/// canonical PM4 and relocation authority are encoded.  Keeping the complete
+/// render pass in one bounded payload avoids several synchronous sysmem
+/// load/store retirements without weakening the per-packet validator.
+pub const MAX_SUBMIT_SIZE: usize = 2 * 1024 * 1024;
 /// Maximum resources referenced by one v1 submission.
 pub const MAX_RESOURCES: usize = 1_024;
 /// Maximum relocations referenced by one v1 submission.
-pub const MAX_RELOCATIONS: usize = 4_096;
+pub const MAX_RELOCATIONS: usize = 8_192;
 
 /// Resource is read by the GPU.
 pub const ACCESS_READ: u32 = 1 << 0;

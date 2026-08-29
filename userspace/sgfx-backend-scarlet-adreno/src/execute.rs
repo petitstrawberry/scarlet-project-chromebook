@@ -1,6 +1,6 @@
 //! Full SGFX command normalization and A6xx queue submission.
 
-use alloc::{borrow::Cow, vec, vec::Vec};
+use alloc::{borrow::Cow, vec::Vec};
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use gpu_raw::GpuImageBgraRect;
@@ -13,14 +13,14 @@ use crate::{ContextInner, IrSubmitError, UnsupportedIrFeature, ir, wire};
 const IMAGE_OBJECT_BASE: u32 = 1;
 const BUFFER_OBJECT_BASE: u32 = 1 << 16;
 const PIPELINE_OBJECT_BASE: u32 = 1 << 24;
-// A canonical A618 draw expands to several hundred PM4 words. Production
-// ScarletUI batches of 112 draws stay below the A618-specific 256 KiB queue
-// budget while nearly halving synchronous submit/validation round trips versus
-// the previous 64-draw cap. This is only the optimistic limit: the submission
-// path bisects any unusually resource-heavy chunk whose exact wire encoding
-// exceeds the negotiated ABI limit.
-const MAX_DRAWS_PER_SUBMIT: usize = 112;
-const MAX_TEXTURED_DRAWS_PER_SUBMIT: usize = 112;
+// A canonical A618 draw expands to several hundred PM4 words.  The A618 queue
+// advertises a 2 MiB transport so the production 512-item ScarletUI workload
+// remains one render pass instead of forcing repeated full-surface load/store
+// retirements. This is only the optimistic limit: the submission path bisects
+// any unusually resource-heavy chunk whose exact wire encoding exceeds the
+// negotiated ABI limit.
+const MAX_DRAWS_PER_SUBMIT: usize = 512;
+const MAX_TEXTURED_DRAWS_PER_SUBMIT: usize = 512;
 
 fn submit_trace_enabled() -> bool {
     static TRACE_CACHE: AtomicU8 = AtomicU8::new(u8::MAX);
@@ -511,20 +511,23 @@ impl ContextResources {
             placements.push((generated.id, total, size));
             total = total.checked_add(size).ok_or(IrSubmitError::OutOfMemory)?;
         }
-        let total_usize = usize::try_from(total).map_err(|_| IrSubmitError::OutOfMemory)?;
-        let mut upload = vec![0; total_usize];
-        for (generated, (_, offset, size)) in compiled
-            .generated_objects
-            .iter()
-            .zip(placements.iter().copied())
-        {
-            let start = usize::try_from(offset).map_err(|_| IrSubmitError::OutOfMemory)?;
-            let size = usize::try_from(size).map_err(|_| IrSubmitError::OutOfMemory)?;
-            upload[start..start + size].copy_from_slice(&generated.bytes);
-        }
         let (scratch_token, scratch_size) = {
             let scratch = self.scratch(total)?;
-            scratch.write(0, &upload)?;
+            // The generated-object offsets already describe disjoint ranges
+            // in the retained coherent scratch buffer.  Write each object
+            // directly instead of assembling and then copying a second full
+            // staging Vec on every submit. Alignment gaps are never addressed
+            // by PM4 and therefore do not require initialization.
+            for (generated, (_, offset, size)) in compiled
+                .generated_objects
+                .iter()
+                .zip(placements.iter().copied())
+            {
+                if usize::try_from(size).ok() != Some(generated.bytes.len()) {
+                    return Err(IrSubmitError::OutOfMemory);
+                }
+                scratch.write(offset, &generated.bytes)?;
+            }
             (scratch.attachment_token, scratch.logical_size)
         };
         let progress = compiled
@@ -621,27 +624,26 @@ fn split_submission_operations<'data>(
     let mut current = Vec::new();
     let mut pass = None;
     let mut replay = RenderReplayState::default();
-    let mut draws = 0usize;
+    let mut chunk_draws = 0usize;
 
     for operation in source {
         match operation {
             codegen::Operation::BeginRenderPass(descriptor) => {
-                pass = Some(*descriptor);
-                replay = RenderReplayState::default();
-                draws = 0;
-                current.push(operation.clone());
-            }
-            codegen::Operation::EndRenderPass => {
-                current.push(codegen::Operation::EndRenderPass);
-                if !current.is_empty() {
+                if chunk_draws >= max_draws && !current.is_empty() {
                     chunks
                         .try_reserve(1)
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
                     chunks.push(core::mem::take(&mut current));
+                    chunk_draws = 0;
                 }
+                pass = Some(*descriptor);
+                replay = RenderReplayState::default();
+                current.push(operation.clone());
+            }
+            codegen::Operation::EndRenderPass => {
+                current.push(codegen::Operation::EndRenderPass);
                 pass = None;
                 replay = RenderReplayState::default();
-                draws = 0;
             }
             codegen::Operation::SetPipeline(pipeline) => {
                 replay.pipeline = Some(*pipeline);
@@ -681,7 +683,7 @@ fn split_submission_operations<'data>(
                 } else {
                     max_draws
                 };
-                if draws >= draw_limit {
+                if chunk_draws >= draw_limit {
                     let mut continuation = pass.ok_or(IrSubmitError::Unsupported(
                         UnsupportedIrFeature::ResourceState,
                     ))?;
@@ -697,10 +699,12 @@ fn split_submission_operations<'data>(
                     }
                     current.push(codegen::Operation::BeginRenderPass(continuation));
                     replay.append(&mut current);
-                    draws = 0;
+                    chunk_draws = 0;
                 }
                 current.push(operation.clone());
-                draws = draws.checked_add(1).ok_or(IrSubmitError::OutOfMemory)?;
+                chunk_draws = chunk_draws
+                    .checked_add(1)
+                    .ok_or(IrSubmitError::OutOfMemory)?;
             }
             _ => current.push(operation.clone()),
         }
@@ -926,7 +930,7 @@ fn require_texture_upload_format(format: ir::TextureFormat) -> Result<(), IrSubm
 
 #[cfg(test)]
 mod tests {
-    use alloc::borrow::Cow;
+    use alloc::{borrow::Cow, vec};
 
     use super::{
         MAX_DRAWS_PER_SUBMIT, MAX_TEXTURED_DRAWS_PER_SUBMIT, prepare_bgra_upload,
@@ -1050,6 +1054,46 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn small_clear_copy_and_cursor_pass_remain_one_submission() {
+        let target = super::codegen::ObjectId::new(7);
+        let source = super::codegen::ObjectId::new(8);
+        let pipeline = super::codegen::PipelineId::new(9);
+        let area = ir::PixelRect::new(0, 0, 64, 64).unwrap();
+        let operations = vec![
+            super::codegen::Operation::BeginRenderPass(super::codegen::RenderPass {
+                target,
+                area,
+                load: ir::LoadOp::Clear(ir::Color::rgba(0.1, 0.2, 0.3, 1.0).unwrap()),
+                store: ir::StoreOp::Store,
+                depth: None,
+            }),
+            super::codegen::Operation::EndRenderPass,
+            super::codegen::Operation::CopyTextureToTexture {
+                source,
+                source_rect: area,
+                destination: target,
+                destination_rect: area,
+            },
+            super::codegen::Operation::BeginRenderPass(super::codegen::RenderPass {
+                target,
+                area,
+                load: ir::LoadOp::Load,
+                store: ir::StoreOp::Store,
+                depth: None,
+            }),
+            super::codegen::Operation::SetPipeline(pipeline),
+            super::codegen::Operation::Draw {
+                vertex_count: 6,
+                first_vertex: 0,
+            },
+            super::codegen::Operation::EndRenderPass,
+        ];
+
+        let chunks = split_submission_operations(&operations, MAX_DRAWS_PER_SUBMIT).unwrap();
+        assert_eq!(chunks, vec![operations]);
     }
 
     #[test]
