@@ -9,7 +9,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{mem, ptr};
 
 use crate::{
@@ -50,9 +50,13 @@ const INITIAL_HEIGHT: u32 = 96;
 const MAX_DYNAMIC_BUFFERS: u32 = 32;
 const MAX_INTERNAL_BUFFERS_PER_TYPE: u32 = 8;
 // Venus HFI supports independent firmware sessions over one shared command
-// transport. Match the upstream Venus fallback limit; command submission stays
-// serialized below because this backend currently owns one HFI worker/ring.
+// transport. Match the upstream Venus fallback limit.
 const MAX_CONCURRENT_SESSIONS: usize = 16;
+// Keep one access unit in flight per session, while allowing the firmware to
+// schedule several sessions concurrently.  Four matches the practical
+// full-HD limit of the current CoachZ memory/display pipeline without
+// advertising the old, globally serialized one-frame path.
+const MAX_INFLIGHT_DECODES: usize = 4;
 const HFI_RESPONSE_TIMEOUT_US: u64 = 1_000_000;
 const HFI_DECODE_TIMEOUT_US: u64 = 2_000_000;
 // Match Linux's internal-DPB tag range: application-visible capture tags live
@@ -329,28 +333,20 @@ impl HfiCore {
         }
     }
 
-    fn next_packet(
+    /// Return the next already-available HFI packet without waiting.
+    ///
+    /// Command/response helpers retain unrelated session packets in
+    /// `deferred`.  The asynchronous decode worker must drain that queue
+    /// before the hardware message ring so completions remain ordered while
+    /// still being demultiplexed by firmware session id.
+    fn try_next_packet(
         &mut self,
         registers: &VenusRegisters,
-        start: u64,
-        timeout_us: u64,
-    ) -> Result<Vec<u32>, &'static str> {
-        loop {
-            if let Some(packet) = self.deferred.pop_front() {
-                return Ok(packet);
-            }
-            if let Some(packet) = self.transport.read_message(registers)? {
-                return Ok(packet);
-            }
-            if registers.interrupt_status() != 0 {
-                let _ = registers.acknowledge_interrupt();
-            }
-            self.transport.drain_debug(registers);
-            if time::current_time().saturating_sub(start) >= timeout_us {
-                return Err("qcom-venus-sc7180: synchronous decode timed out");
-            }
-            wait_without_burning_cpu(start);
+    ) -> Result<Option<Vec<u32>>, &'static str> {
+        if let Some(packet) = self.deferred.pop_front() {
+            return Ok(Some(packet));
         }
+        self.transport.read_message(registers)
     }
 }
 
@@ -549,6 +545,14 @@ struct VenusSession {
     layout: Option<Nv12Layout>,
     mappings: Option<FrontendMappings>,
     next_input_tag: u32,
+    pending: Option<PendingDecode>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingDecode {
+    request: VideoBackendDecodeRequest,
+    output_tag: u32,
+    submitted_at: u64,
 }
 
 impl VenusSession {
@@ -599,6 +603,7 @@ impl VenusSession {
             layout: None,
             mappings: None,
             next_input_tag: 1,
+            pending: None,
         })
     }
 
@@ -613,6 +618,9 @@ impl VenusSession {
             hfi_abi::HFI_MSG_SESSION_STOP,
             self.id,
         )?;
+        // STOP is the firmware ownership barrier for any input/output buffer
+        // that was still in flight when userspace closed the session.
+        self.pending = None;
         core.command_response_polling(
             registers,
             &hfi_abi::session_command(hfi_abi::HFI_CMD_SESSION_RELEASE_RESOURCES, self.id),
@@ -645,15 +653,18 @@ impl VenusSession {
         Ok(())
     }
 
-    fn submit(
+    fn begin_submit(
         &mut self,
         registers: &VenusRegisters,
         core: &mut HfiCore,
         dma: &DmaContext,
         request: &VideoBackendDecodeRequest,
-    ) -> Result<VideoBackendDecodedFrame, &'static str> {
+    ) -> Result<(), &'static str> {
         if request.stream_id != self.id || request.coded_format != SCARLET_VIDEO_FORMAT_H264 {
             return Err("qcom-venus-sc7180: invalid decode session or format");
+        }
+        if self.pending.is_some() {
+            return Err("qcom-venus-sc7180: session decode is already in flight");
         }
         let input_capacity = usize::try_from(request.output_offset)
             .map_err(|_| "qcom-venus-sc7180: invalid frontend input-buffer size")?;
@@ -677,6 +688,8 @@ impl VenusSession {
             .mappings
             .as_ref()
             .ok_or("qcom-venus-sc7180: frontend mappings are unavailable")?;
+        let input_dma = mappings.input_dma();
+        let input_capacity = mappings.input_capacity();
         arch::clean_dcache_to_poc_range(request.input_vaddr, request.input_len as usize);
 
         let input_tag = self.next_input_tag;
@@ -685,51 +698,30 @@ impl VenusSession {
         if let Some(layout) = self.layout {
             self.queue_output(registers, core, mappings, layout, output_tag, request)?;
         }
-        core.send(
+        // Publish the request before the input command makes it executable.
+        // A queued output buffer cannot complete without an input access unit,
+        // while the input doorbell may produce an IRQ immediately.
+        self.pending = Some(PendingDecode {
+            request: *request,
+            output_tag,
+            submitted_at: time::current_time(),
+        });
+        if let Err(error) = core.send(
             registers,
             &hfi_abi::empty_buffer(
                 self.id,
                 request.timestamp,
                 input_tag,
-                mappings.input_dma(),
-                mappings.input_capacity(),
+                input_dma,
+                input_capacity,
                 request.input_len,
             ),
             false,
-        )?;
-
-        if self.layout.is_none() {
-            let sequence_packet =
-                core.wait_matching(registers, HFI_DECODE_TIMEOUT_US, |packet| {
-                    hfi_abi::packet_type(packet) == Some(hfi_abi::HFI_MSG_EVENT_NOTIFY)
-                        && hfi_abi::session_id(packet) == Some(self.id)
-                        && packet.get(3) == Some(&hfi_abi::HFI_EVENT_SESSION_SEQUENCE_CHANGED)
-                })?;
-            let sequence = match hfi_abi::parse_sequence_changed(&sequence_packet) {
-                Ok(sequence) => sequence,
-                Err(error) => {
-                    log_sequence_packet(&sequence_packet);
-                    return Err(error);
-                }
-            };
-            self.reconfigure(registers, core, dma, sequence)?;
-            let mappings = self
-                .mappings
-                .as_ref()
-                .ok_or("qcom-venus-sc7180: frontend mappings disappeared")?;
-            self.queue_output(
-                registers,
-                core,
-                mappings,
-                self.layout
-                    .ok_or("qcom-venus-sc7180: sequence configuration was not retained")?,
-                output_tag,
-                request,
-            )?;
+        ) {
+            self.pending = None;
+            return Err(error);
         }
-
-        let done = self.wait_for_output(registers, core, output_tag)?;
-        self.finish_output(request, done)
+        Ok(())
     }
 
     fn reconfigure(
@@ -892,65 +884,107 @@ impl VenusSession {
         )
     }
 
-    fn wait_for_output(
+    fn pending_expired(&self, now: u64) -> bool {
+        self.pending.is_some_and(|pending| {
+            now.saturating_sub(pending.submitted_at) >= HFI_DECODE_TIMEOUT_US
+        })
+    }
+
+    fn fail_pending(
+        &mut self,
+        error: &'static str,
+    ) -> Option<Result<VideoBackendDecodedFrame, &'static str>> {
+        self.pending.take().map(|_| Err(error))
+    }
+
+    /// Consume one HFI packet already demultiplexed to this firmware session.
+    fn handle_packet(
         &mut self,
         registers: &VenusRegisters,
         core: &mut HfiCore,
-        output_tag: u32,
-    ) -> Result<FillDone, &'static str> {
-        let start = time::current_time();
-        loop {
-            let packet = match core.next_packet(registers, start, HFI_DECODE_TIMEOUT_US) {
-                Ok(packet) => packet,
-                Err(error) => {
-                    core.transport.log_diagnostics(registers);
-                    return Err(error);
-                }
-            };
-            if hfi_abi::is_fatal_event(&packet, self.id) {
-                return Err("qcom-venus-sc7180: fatal firmware event during decode");
+        dma: &DmaContext,
+        packet: &[u32],
+    ) -> Result<Option<VideoBackendDecodedFrame>, &'static str> {
+        if hfi_abi::is_fatal_event(packet, self.id) {
+            return Err("qcom-venus-sc7180: fatal firmware event during decode");
+        }
+        match hfi_abi::packet_type(packet) {
+            Some(hfi_abi::HFI_MSG_SESSION_EMPTY_BUFFER) => {
+                ensure_response_success(packet)?;
+                Ok(None)
             }
-            match hfi_abi::packet_type(&packet) {
-                Some(hfi_abi::HFI_MSG_SESSION_EMPTY_BUFFER) => {
-                    ensure_response_success(&packet)?;
+            Some(hfi_abi::HFI_MSG_SESSION_FILL_BUFFER) => {
+                let done = hfi_abi::parse_fill_done(packet)?;
+                if done.session != self.id {
+                    return Err("qcom-venus-sc7180: fill completion has the wrong session");
                 }
-                Some(hfi_abi::HFI_MSG_SESSION_FILL_BUFFER) => {
-                    let done = hfi_abi::parse_fill_done(&packet)?;
-                    if done.session != self.id {
-                        continue;
-                    }
-                    if done.error != hfi_abi::HFI_ERR_NONE {
-                        return Err("qcom-venus-sc7180: firmware failed an output buffer");
-                    }
-                    if done.stream_id == 1 && done.output_tag == output_tag {
-                        return Ok(done);
-                    }
-                    if done.stream_id == 0 && done.output_tag >= DPB_TAG_BASE {
-                        let index = (done.output_tag - DPB_TAG_BASE) as usize;
-                        if index < self.dpb_queued.len() {
-                            self.dpb_queued[index] = false;
-                            if done.flags & HFI_BUFFERFLAG_READONLY == 0 {
-                                self.queue_dpb(registers, core, index)?;
-                            }
-                        }
-                    }
+                if done.error != hfi_abi::HFI_ERR_NONE {
+                    return Err("qcom-venus-sc7180: firmware failed an output buffer");
                 }
-                Some(hfi_abi::HFI_MSG_EVENT_NOTIFY)
-                    if packet.get(3) == Some(&hfi_abi::HFI_EVENT_SESSION_SEQUENCE_CHANGED) =>
-                {
-                    return Err("qcom-venus-sc7180: unsupported mid-stream sequence change");
+                if done.stream_id == 1 {
+                    let pending = self
+                        .pending
+                        .ok_or("qcom-venus-sc7180: output completed without an in-flight frame")?;
+                    if done.output_tag != pending.output_tag {
+                        return Err("qcom-venus-sc7180: output completed with an unknown tag");
+                    }
+                    self.pending = None;
+                    return self.finish_output(&pending.request, done).map(Some);
                 }
-                Some(hfi_abi::HFI_MSG_EVENT_NOTIFY) if packet.get(3) == Some(&0x0100_0006) => {
-                    let tag = packet.get(8).copied().unwrap_or(0);
-                    if tag >= DPB_TAG_BASE {
-                        let index = (tag - DPB_TAG_BASE) as usize;
-                        if index < self.dpb_queued.len() && !self.dpb_queued[index] {
+                if done.stream_id == 0 && done.output_tag >= DPB_TAG_BASE {
+                    let index = (done.output_tag - DPB_TAG_BASE) as usize;
+                    if index < self.dpb_queued.len() {
+                        self.dpb_queued[index] = false;
+                        if done.flags & HFI_BUFFERFLAG_READONLY == 0 {
                             self.queue_dpb(registers, core, index)?;
                         }
                     }
                 }
-                _ => {}
+                Ok(None)
             }
+            Some(hfi_abi::HFI_MSG_EVENT_NOTIFY)
+                if packet.get(3) == Some(&hfi_abi::HFI_EVENT_SESSION_SEQUENCE_CHANGED) =>
+            {
+                if self.layout.is_some() {
+                    return Err("qcom-venus-sc7180: unsupported mid-stream sequence change");
+                }
+                let sequence = match hfi_abi::parse_sequence_changed(packet) {
+                    Ok(sequence) => sequence,
+                    Err(error) => {
+                        log_sequence_packet(packet);
+                        return Err(error);
+                    }
+                };
+                self.reconfigure(registers, core, dma, sequence)?;
+                let pending = self
+                    .pending
+                    .ok_or("qcom-venus-sc7180: sequence event has no in-flight frame")?;
+                let mappings = self
+                    .mappings
+                    .as_ref()
+                    .ok_or("qcom-venus-sc7180: frontend mappings disappeared")?;
+                self.queue_output(
+                    registers,
+                    core,
+                    mappings,
+                    self.layout
+                        .ok_or("qcom-venus-sc7180: sequence configuration was not retained")?,
+                    pending.output_tag,
+                    &pending.request,
+                )?;
+                Ok(None)
+            }
+            Some(hfi_abi::HFI_MSG_EVENT_NOTIFY) if packet.get(3) == Some(&0x0100_0006) => {
+                let tag = packet.get(8).copied().unwrap_or(0);
+                if tag >= DPB_TAG_BASE {
+                    let index = (tag - DPB_TAG_BASE) as usize;
+                    if index < self.dpb_queued.len() && !self.dpb_queued[index] {
+                        self.queue_dpb(registers, core, index)?;
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1295,9 +1329,9 @@ pub(crate) struct VenusBackend {
     irq_count: AtomicUsize,
     notifier: IrqSpinLock<Option<Weak<dyn VideoCompletionNotifier>>>,
     active_session_ids: IrqSpinLock<Vec<u32>>,
-    decode_active_session_id: AtomicU32,
-    pending_decode: IrqSpinLock<Option<VideoBackendDecodeRequest>>,
-    completion: IrqSpinLock<Option<BackendCompletion>>,
+    inflight_decodes: AtomicUsize,
+    queued_decodes: IrqSpinLock<VecDeque<VideoBackendDecodeRequest>>,
+    completions: IrqSpinLock<VecDeque<BackendCompletion>>,
     process: Mutex<BackendState>,
 }
 
@@ -1320,9 +1354,9 @@ impl VenusBackend {
             irq_count: AtomicUsize::new(0),
             notifier: IrqSpinLock::new(None),
             active_session_ids: IrqSpinLock::new(Vec::with_capacity(MAX_CONCURRENT_SESSIONS)),
-            decode_active_session_id: AtomicU32::new(0),
-            pending_decode: IrqSpinLock::new(None),
-            completion: IrqSpinLock::new(None),
+            inflight_decodes: AtomicUsize::new(0),
+            queued_decodes: IrqSpinLock::new(VecDeque::with_capacity(MAX_CONCURRENT_SESSIONS)),
+            completions: IrqSpinLock::new(VecDeque::with_capacity(MAX_CONCURRENT_SESSIONS)),
             process: Mutex::new(BackendState {
                 core: None,
                 sessions: Vec::with_capacity(MAX_CONCURRENT_SESSIONS),
@@ -1364,25 +1398,208 @@ impl VenusBackend {
         }
     }
 
-    fn process_pending_decode(&self) -> bool {
-        let request = {
+    fn process_pending_work(&self) -> bool {
+        let mut requests = Vec::with_capacity(MAX_INFLIGHT_DECODES);
+        {
             let _irq_guard = IrqGuard::new();
-            self.pending_decode.lock().take()
-        };
-        let Some(request) = request else {
-            return false;
-        };
-
-        let result = self.execute_decode(&request);
-        if self.session_is_active(request.stream_id) {
-            let _irq_guard = IrqGuard::new();
-            *self.completion.lock() = Some(BackendCompletion {
-                stream_id: request.stream_id,
-                result,
-            });
+            let mut queued = self.queued_decodes.lock();
+            while let Some(request) = queued.pop_front() {
+                requests.push(request);
+            }
         }
-        self.notify_completion();
-        true
+
+        let mut completions = Vec::with_capacity(MAX_CONCURRENT_SESSIONS);
+        let mut made_progress = !requests.is_empty();
+        let mut state = self.process.lock();
+
+        let mut request_iter = requests.into_iter();
+        while let Some(request) = request_iter.next() {
+            if !self.session_is_active(request.stream_id) {
+                continue;
+            }
+            if state.failed {
+                completions.push(BackendCompletion {
+                    stream_id: request.stream_id,
+                    result: Err("qcom-venus-sc7180: firmware is quarantined; recreate the session"),
+                });
+                continue;
+            }
+            let Some(session_index) = state
+                .sessions
+                .iter()
+                .position(|session| session.id == request.stream_id)
+            else {
+                completions.push(BackendCompletion {
+                    stream_id: request.stream_id,
+                    result: Err("qcom-venus-sc7180: video session is not active"),
+                });
+                continue;
+            };
+            let begin_result = {
+                let BackendState { core, sessions, .. } = &mut *state;
+                let core = core
+                    .as_mut()
+                    .ok_or("qcom-venus-sc7180: HFI core is not initialized");
+                match core {
+                    Ok(core) => sessions[session_index].begin_submit(
+                        &self.registers,
+                        core,
+                        &self.dma,
+                        &request,
+                    ),
+                    Err(error) => Err(error),
+                }
+            };
+            if let Err(error) = begin_result {
+                completions.push(BackendCompletion {
+                    stream_id: request.stream_id,
+                    result: Err(error),
+                });
+                if is_session_resource_error(error) {
+                    state.last_error = Some(error);
+                } else {
+                    Self::quarantine(&mut state, &self.registers, error);
+                    Self::fail_all_pending(&mut state, error, &mut completions);
+                    for queued in request_iter {
+                        completions.push(BackendCompletion {
+                            stream_id: queued.stream_id,
+                            result: Err(error),
+                        });
+                    }
+                    break;
+                }
+            } else {
+                state.last_error = None;
+            }
+        }
+
+        while !state.failed {
+            let packet = match state.core.as_mut() {
+                Some(core) => match core.try_next_packet(&self.registers) {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        Self::quarantine(&mut state, &self.registers, error);
+                        Self::fail_all_pending(&mut state, error, &mut completions);
+                        break;
+                    }
+                },
+                None => None,
+            };
+            let Some(packet) = packet else {
+                break;
+            };
+            made_progress = true;
+
+            // A system event is the only decode-packet failure that poisons
+            // the shared HFI core. Session events are completed only against
+            // their owning stream, matching Linux Venus' instance dispatch.
+            if hfi_abi::is_fatal_event(&packet, 0) {
+                let error = "qcom-venus-sc7180: firmware reported a fatal HFI event";
+                Self::quarantine(&mut state, &self.registers, error);
+                Self::fail_all_pending(&mut state, error, &mut completions);
+                break;
+            }
+
+            let Some(stream_id) = hfi_abi::session_id(&packet) else {
+                continue;
+            };
+            let Some(session_index) = state
+                .sessions
+                .iter()
+                .position(|session| session.id == stream_id)
+            else {
+                // A STOP/END command can race a final buffer notification.
+                // The destroyed frontend mapping is no longer schedulable, so
+                // safely discard that stale session packet.
+                continue;
+            };
+            let packet_result = {
+                let BackendState { core, sessions, .. } = &mut *state;
+                let core = core
+                    .as_mut()
+                    .ok_or("qcom-venus-sc7180: HFI core is not initialized");
+                match core {
+                    Ok(core) => sessions[session_index].handle_packet(
+                        &self.registers,
+                        core,
+                        &self.dma,
+                        &packet,
+                    ),
+                    Err(error) => Err(error),
+                }
+            };
+            match packet_result {
+                Ok(Some(frame)) => {
+                    state.last_error = None;
+                    completions.push(BackendCompletion {
+                        stream_id,
+                        result: Ok(frame),
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    state.last_error = Some(error);
+                    state.sessions[session_index].pending = None;
+                    completions.push(BackendCompletion {
+                        stream_id,
+                        result: Err(error),
+                    });
+                }
+            }
+        }
+
+        if !state.failed {
+            let now = time::current_time();
+            if state
+                .sessions
+                .iter()
+                .any(|session| session.pending_expired(now))
+            {
+                let error = "qcom-venus-sc7180: asynchronous decode timed out";
+                if let Some(core) = state.core.as_mut() {
+                    core.transport.log_diagnostics(&self.registers);
+                }
+                Self::quarantine(&mut state, &self.registers, error);
+                Self::fail_all_pending(&mut state, error, &mut completions);
+            }
+        }
+
+        let inflight = state
+            .sessions
+            .iter()
+            .filter(|session| session.pending.is_some())
+            .count();
+        self.inflight_decodes.store(inflight, Ordering::Release);
+        drop(state);
+
+        let mut published = false;
+        for completion in completions {
+            if !self.session_is_active(completion.stream_id) {
+                continue;
+            }
+            let _irq_guard = IrqGuard::new();
+            self.completions.lock().push_back(completion);
+            published = true;
+        }
+        if published {
+            self.notify_completion();
+        }
+        made_progress || published
+    }
+
+    fn fail_all_pending(
+        state: &mut BackendState,
+        error: &'static str,
+        completions: &mut Vec<BackendCompletion>,
+    ) {
+        for session in &mut state.sessions {
+            if session.fail_pending(error).is_some() {
+                completions.push(BackendCompletion {
+                    stream_id: session.id,
+                    result: Err(error),
+                });
+            }
+        }
     }
 
     fn session_is_active(&self, stream_id: u32) -> bool {
@@ -1403,57 +1620,6 @@ impl VenusBackend {
         };
         active.swap_remove(index);
         true
-    }
-
-    fn execute_decode(
-        &self,
-        request: &VideoBackendDecodeRequest,
-    ) -> Result<VideoBackendDecodedFrame, &'static str> {
-        if !self.session_is_active(request.stream_id) {
-            return Err("qcom-venus-sc7180: video session was destroyed before decode");
-        }
-
-        self.decode_active_session_id
-            .store(request.stream_id, Ordering::Release);
-        let result = (|| {
-            let mut state = self.process.lock();
-            if state.failed {
-                return Err("qcom-venus-sc7180: firmware is quarantined; recreate the session");
-            }
-            let session_index = state
-                .sessions
-                .iter()
-                .position(|session| session.id == request.stream_id)
-                .ok_or("qcom-venus-sc7180: video session is not active")?;
-            let BackendState { core, sessions, .. } = &mut *state;
-            let core = core
-                .as_mut()
-                .ok_or("qcom-venus-sc7180: HFI core is not initialized")?;
-            let session = sessions
-                .get_mut(session_index)
-                .ok_or("qcom-venus-sc7180: video session is not active")?;
-            match session.submit(&self.registers, core, &self.dma, request) {
-                Ok(frame) => {
-                    state.last_error = None;
-                    Ok(frame)
-                }
-                Err(error) => {
-                    if is_session_resource_error(error) {
-                        // This stream could not provision its own scratch/DPB
-                        // memory. HFI and the other firmware sessions remain
-                        // valid; userspace will receive the error and destroy
-                        // only this session. Quarantining the whole core here
-                        // unnecessarily tears down every concurrent player.
-                        state.last_error = Some(error);
-                    } else {
-                        Self::quarantine(&mut state, &self.registers, error);
-                    }
-                    Err(error)
-                }
-            }
-        })();
-        self.decode_active_session_id.store(0, Ordering::Release);
-        result
     }
 
     fn ensure_core<'a>(
@@ -1495,9 +1661,7 @@ impl VenusBackend {
 }
 
 fn process_pending_venus_work() -> bool {
-    if !VENUS_WORKER_PENDING.swap(false, Ordering::AcqRel) {
-        return false;
-    }
+    let was_woken = VENUS_WORKER_PENDING.swap(false, Ordering::AcqRel);
 
     let backends = {
         let mut registered = VENUS_WORKER_BACKENDS.lock();
@@ -1512,10 +1676,11 @@ fn process_pending_venus_work() -> bool {
         });
         live
     };
+    let mut made_progress = false;
     for backend in backends {
-        while backend.process_pending_decode() {}
+        made_progress |= backend.process_pending_work();
     }
-    true
+    was_woken || made_progress
 }
 
 fn venus_worker_entry() {
@@ -1525,7 +1690,13 @@ fn venus_worker_entry() {
         let Some(task) = scarlet::task::mytask() else {
             scarlet::arch::instruction::idle();
         };
-        VENUS_WORKER_WAKER.wait(task.get_id(), task.get_trapframe());
+        // The timeout is a lost-IRQ safety net and drives the bounded
+        // per-session decode deadline. Normal progress remains IRQ-driven.
+        let _ = VENUS_WORKER_WAKER.wait_with_timeout(
+            task.get_id(),
+            task.get_trapframe(),
+            Some(100_000),
+        );
     }
 }
 
@@ -1536,15 +1707,17 @@ impl VideoDecodeBackend for VenusBackend {
 
     fn debug_status(&self) -> Option<String> {
         let active = self.active_session_ids.lock().len();
-        let pending = self.pending_decode.lock().is_some();
-        let completed = self.completion.lock().is_some();
+        let queued = self.queued_decodes.lock().len();
+        let inflight = self.inflight_decodes.load(Ordering::Acquire);
+        let completed = self.completions.lock().len();
         match self.process.try_lock() {
             Some(state) => Some(format!(
-                " core={} sessions={} active={} pending={} completed={} failed={} irq={} control={:#x} last_error={}",
+                " core={} sessions={} active={} queued={} inflight={} completed={} failed={} irq={} control={:#x} last_error={}",
                 state.core.is_some(),
                 state.sessions.len(),
                 active,
-                pending,
+                queued,
+                inflight,
                 completed,
                 state.failed,
                 self.irq_count.load(Ordering::Relaxed),
@@ -1552,9 +1725,10 @@ impl VideoDecodeBackend for VenusBackend {
                 state.last_error.unwrap_or("none")
             )),
             None => Some(format!(
-                " core=busy active={} pending={} completed={} irq={} control={:#x}",
+                " core=busy active={} queued={} inflight={} completed={} irq={} control={:#x}",
                 active,
-                pending,
+                queued,
+                inflight,
                 completed,
                 self.irq_count.load(Ordering::Relaxed),
                 self.registers.control_status(),
@@ -1565,7 +1739,7 @@ impl VideoDecodeBackend for VenusBackend {
     fn capabilities(&self) -> VideoBackendCapabilities {
         VideoBackendCapabilities {
             max_sessions: MAX_CONCURRENT_SESSIONS as u32,
-            max_inflight_decodes: 1,
+            max_inflight_decodes: MAX_INFLIGHT_DECODES as u32,
             mapped_input_len: MAPPED_INPUT_BYTES as u32,
             mapped_output_len: MAPPED_OUTPUT_BYTES as u32,
             output_pixel_format: SCARLET_VIDEO_PIXEL_FORMAT_NV12,
@@ -1615,6 +1789,9 @@ impl VideoDecodeBackend for VenusBackend {
                 state.sessions.push(session);
                 state.last_error = None;
                 self.activate_session(session_id);
+                // Synchronous session setup may have deferred completion
+                // packets belonging to existing streams.
+                self.queue_worker();
                 Ok(session_id)
             }
             Err(error) => {
@@ -1630,23 +1807,14 @@ impl VideoDecodeBackend for VenusBackend {
         }
         {
             let _irq_guard = IrqGuard::new();
-            let mut pending = self.pending_decode.lock();
-            if pending
-                .as_ref()
-                .is_some_and(|request| request.stream_id == stream_id)
-            {
-                *pending = None;
-            }
-            let mut completion = self.completion.lock();
-            if completion
-                .as_ref()
-                .is_some_and(|completion| completion.stream_id == stream_id)
-            {
-                *completion = None;
-            }
+            self.queued_decodes
+                .lock()
+                .retain(|request| request.stream_id != stream_id);
+            self.completions
+                .lock()
+                .retain(|completion| completion.stream_id != stream_id);
         }
 
-        let decode_active = self.decode_active_session_id.load(Ordering::Acquire);
         let mut reported_wait = false;
         let mut state = loop {
             if let Some(state) = self.process.try_lock() {
@@ -1654,8 +1822,9 @@ impl VideoDecodeBackend for VenusBackend {
             }
             if !reported_wait {
                 println!(
-                    "[qcom-venus-sc7180] stream={} teardown waiting for decode worker active={}",
-                    stream_id, decode_active
+                    "[qcom-venus-sc7180] stream={} teardown waiting for decode worker inflight={}",
+                    stream_id,
+                    self.inflight_decodes.load(Ordering::Acquire)
                 );
                 reported_wait = true;
             }
@@ -1678,6 +1847,14 @@ impl VideoDecodeBackend for VenusBackend {
             return Err("qcom-venus-sc7180: video session is not active");
         };
         let mut session = state.sessions.swap_remove(session_index);
+        self.inflight_decodes.store(
+            state
+                .sessions
+                .iter()
+                .filter(|session| session.pending.is_some())
+                .count(),
+            Ordering::Release,
+        );
         if state.failed {
             self.registers.assert_arm9_reset();
             if state.sessions.is_empty() {
@@ -1685,6 +1862,7 @@ impl VideoDecodeBackend for VenusBackend {
                 state.failed = false;
                 state.last_error = None;
             }
+            self.queue_worker();
             return Ok(());
         }
         let result = match state.core.as_mut() {
@@ -1698,9 +1876,11 @@ impl VideoDecodeBackend for VenusBackend {
                 state.failed = false;
                 state.last_error = None;
             }
+            self.queue_worker();
             return Err(error);
         }
         state.last_error = None;
+        self.queue_worker();
         Ok(())
     }
 
@@ -1708,16 +1888,27 @@ impl VideoDecodeBackend for VenusBackend {
         if !self.session_is_active(request.stream_id) {
             return Err("qcom-venus-sc7180: unknown video session");
         }
-        if self.completion.lock().is_some() {
+        if self
+            .completions
+            .lock()
+            .iter()
+            .any(|completion| completion.stream_id == request.stream_id)
+        {
             return Err("qcom-venus-sc7180: previous decoded frame was not dequeued");
         }
         {
             let _irq_guard = IrqGuard::new();
-            let mut pending = self.pending_decode.lock();
-            if pending.is_some() {
-                return Err("qcom-venus-sc7180: decode is already pending");
+            let mut queued = self.queued_decodes.lock();
+            if queued
+                .iter()
+                .any(|queued| queued.stream_id == request.stream_id)
+            {
+                return Err("qcom-venus-sc7180: session decode is already queued");
             }
-            *pending = Some(*request);
+            if queued.len() >= MAX_CONCURRENT_SESSIONS {
+                return Err("qcom-venus-sc7180: decode queue is full");
+            }
+            queued.push_back(*request);
         }
         self.queue_worker();
         Ok(())
@@ -1731,14 +1922,16 @@ impl VideoDecodeBackend for VenusBackend {
             return Err("qcom-venus-sc7180: unknown video session");
         }
         let _irq_guard = IrqGuard::new();
-        let mut slot = self.completion.lock();
-        let Some(completion) = slot.take() else {
+        let mut completions = self.completions.lock();
+        let Some(index) = completions
+            .iter()
+            .position(|completion| completion.stream_id == stream_id)
+        else {
             return Ok(None);
         };
-        if completion.stream_id != stream_id {
-            *slot = Some(completion);
-            return Err("qcom-venus-sc7180: completion belongs to another session");
-        }
+        let completion = completions
+            .remove(index)
+            .ok_or("qcom-venus-sc7180: completion queue changed unexpectedly")?;
         completion.result.map(Some)
     }
 }
@@ -1756,7 +1949,7 @@ impl InterruptSource for VenusBackend {
         let _ = self.registers.acknowledge_interrupt();
         self.irq_count.fetch_add(1, Ordering::Relaxed);
         VENUS_HFI_WAKER.wake_one();
-        self.notify_completion();
+        self.queue_worker();
         Ok(InterruptClaim::Handled)
     }
 }
