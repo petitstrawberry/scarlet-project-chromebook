@@ -60,7 +60,7 @@ fi
 for binary in \
   sgfx_probe taskbar terminal ui-demo ui-benchmark settings \
   sws clock files launcher notepad task_manager ui-sgfx-showcase \
-  sgfx_cube sgfx_texture sgfx_showcase
+  sgfx_cube sgfx_texture sgfx_showcase boxcraft
 do
   staged_binary="$staging_dir/rootfs/system/scarlet/bin/$binary"
   staged_hash=$(shasum -a 256 "$staged_binary" | awk '{print $1}')
