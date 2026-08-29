@@ -1611,6 +1611,12 @@ fn set_image_expectation(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ValidatedTargetState {
+    screen: [u32; 2],
+    viewport: [u32; 2],
+}
+
 fn validate_3d_sequences(
     packets: &[Packet<'_>],
     addresses: &mut [AddressField],
@@ -1621,6 +1627,7 @@ fn validate_3d_sequences(
     let mut segment_registers = Vec::new();
     let mut retained_pipeline = None;
     let mut shader_state_initialized = false;
+    let mut target_state = None;
     for (packet_index, packet) in packets.iter().copied().enumerate() {
         if !matches!(
             packet.header,
@@ -1676,81 +1683,104 @@ fn validate_3d_sequences(
             return Err("qcom-adreno-a618: incomplete shader state transition");
         }
 
-        let (pitch_packet, pitch) = segment
-            .reg(RB_MRT_PITCH)
-            .ok_or("qcom-adreno-a618: MRT layout is missing")?;
-        let (base_packet, _) = segment
-            .reg(RB_MRT_BASE)
-            .ok_or("qcom-adreno-a618: MRT base is missing")?;
-        let (_, clip_transform) = segment
-            .reg(GRAS_CL_VIEWPORT_XOFFSET)
-            .ok_or("qcom-adreno-a618: viewport transform is missing")?;
-        let (_, screen) = segment
-            .reg(GRAS_SC_SCREEN_SCISSOR_TL)
-            .ok_or("qcom-adreno-a618: render bounds are missing")?;
-        let (_, viewport) = segment
-            .reg(GRAS_SC_VIEWPORT_SCISSOR_TL)
-            .ok_or("qcom-adreno-a618: viewport scissor is missing")?;
+        let x = |word: u32| word & 0xffff;
+        let y = |word: u32| word >> 16;
+        let pitch = segment.reg(RB_MRT_PITCH);
+        let base = segment.reg(RB_MRT_BASE);
+        let clip_transform = segment.reg(GRAS_CL_VIEWPORT_XOFFSET);
+        let screen = segment.reg(GRAS_SC_SCREEN_SCISSOR_TL);
+        let viewport = segment.reg(GRAS_SC_VIEWPORT_SCISSOR_TL);
+        let target_fields = [
+            pitch.is_some(),
+            base.is_some(),
+            clip_transform.is_some(),
+            screen.is_some(),
+            viewport.is_some(),
+        ];
+        let target = if target_fields.iter().all(|present| *present) {
+            let (_, pitch) = pitch.ok_or("qcom-adreno-a618: MRT layout is missing")?;
+            let (base_packet, _) = base.ok_or("qcom-adreno-a618: MRT base is missing")?;
+            let (_, clip_transform) =
+                clip_transform.ok_or("qcom-adreno-a618: viewport transform is missing")?;
+            let (_, screen) = screen.ok_or("qcom-adreno-a618: render bounds are missing")?;
+            let (_, viewport) = viewport.ok_or("qcom-adreno-a618: viewport scissor is missing")?;
+            let screen: [u32; 2] = screen
+                .try_into()
+                .map_err(|_| "qcom-adreno-a618: invalid render bounds")?;
+            let viewport: [u32; 2] = viewport
+                .try_into()
+                .map_err(|_| "qcom-adreno-a618: invalid viewport scissor")?;
+            if viewport[0] != 0
+                || x(viewport[0]) > x(viewport[1])
+                || y(viewport[0]) > y(viewport[1])
+                || x(screen[0]) > x(screen[1])
+                || y(screen[0]) > y(screen[1])
+                || x(screen[0]) < x(viewport[0])
+                || y(screen[0]) < y(viewport[0])
+                || x(screen[1]) > x(viewport[1])
+                || y(screen[1]) > y(viewport[1])
+            {
+                return Err("qcom-adreno-a618: unsafe 3D scissor state");
+            }
+            // SGFX clip-space coordinates are defined against the complete
+            // attachment. The render area is damage and may only narrow the
+            // screen/window scissors; it must never remap the viewport.
+            let width = (x(viewport[1]) - x(viewport[0]) + 1) as f32;
+            let height = (y(viewport[1]) - y(viewport[0]) + 1) as f32;
+            let x_scale = width * 0.5;
+            let y_scale = height * 0.5;
+            let expected_clip_transform = [
+                (x(viewport[0]) as f32 + x_scale).to_bits(),
+                x_scale.to_bits(),
+                (y(viewport[0]) as f32 + y_scale).to_bits(),
+                (-y_scale).to_bits(),
+                0.5_f32.to_bits(),
+                0.5_f32.to_bits(),
+            ];
+            if clip_transform != expected_clip_transform {
+                return Err("qcom-adreno-a618: unsafe 3D viewport transform");
+            }
+            let row_pitch = pitch[0]
+                .checked_mul(64)
+                .ok_or("qcom-adreno-a618: MRT pitch overflows")?;
+            set_image_expectation(
+                addresses,
+                base_packet + 1,
+                ImageExpectation {
+                    row_pitch,
+                    width: (viewport[1] & 0xffff).saturating_add(1),
+                    height: (viewport[1] >> 16).saturating_add(1),
+                    exact_extent: true,
+                    pitch_align: None,
+                    array_pitch: Some(ArrayPitchExpectation {
+                        bytes: u64::from(pitch[1]) << 6,
+                        alignment: 64,
+                    }),
+                },
+            )?;
+            let target = ValidatedTargetState { screen, viewport };
+            target_state = Some(target);
+            target
+        } else if target_fields.iter().all(|present| !*present) && retained_delta {
+            target_state.ok_or("qcom-adreno-a618: target state is not initialized")?
+        } else {
+            return Err("qcom-adreno-a618: incomplete target state transition");
+        };
+
         let (_, window) = segment
             .reg(GRAS_SC_WINDOW_SCISSOR_TL)
             .ok_or("qcom-adreno-a618: window scissor is missing")?;
-        let x = |word: u32| word & 0xffff;
-        let y = |word: u32| word >> 16;
-        if viewport[0] != 0
-            || x(viewport[0]) > x(viewport[1])
-            || y(viewport[0]) > y(viewport[1])
-            || x(screen[0]) > x(screen[1])
-            || y(screen[0]) > y(screen[1])
-            || x(screen[0]) < x(viewport[0])
-            || y(screen[0]) < y(viewport[0])
-            || x(screen[1]) > x(viewport[1])
-            || y(screen[1]) > y(viewport[1])
-            || x(window[0]) > x(window[1])
+        if x(window[0]) > x(window[1])
             || y(window[0]) > y(window[1])
-            || x(window[0]) < x(screen[0])
-            || y(window[0]) < y(screen[0])
-            || x(window[1]) > x(screen[1])
-            || y(window[1]) > y(screen[1])
+            || x(window[0]) < x(target.screen[0])
+            || y(window[0]) < y(target.screen[0])
+            || x(window[1]) > x(target.screen[1])
+            || y(window[1]) > y(target.screen[1])
+            || x(window[1]) > x(target.viewport[1])
+            || y(window[1]) > y(target.viewport[1])
         {
             return Err("qcom-adreno-a618: unsafe 3D scissor state");
         }
-        // SGFX clip-space coordinates are defined against the complete
-        // attachment.  The render area is damage and may only narrow the
-        // screen/window scissors; it must never remap the viewport.
-        let width = (x(viewport[1]) - x(viewport[0]) + 1) as f32;
-        let height = (y(viewport[1]) - y(viewport[0]) + 1) as f32;
-        let x_scale = width * 0.5;
-        let y_scale = height * 0.5;
-        let expected_clip_transform = [
-            (x(viewport[0]) as f32 + x_scale).to_bits(),
-            x_scale.to_bits(),
-            (y(viewport[0]) as f32 + y_scale).to_bits(),
-            (-y_scale).to_bits(),
-            0.5_f32.to_bits(),
-            0.5_f32.to_bits(),
-        ];
-        if clip_transform != expected_clip_transform {
-            return Err("qcom-adreno-a618: unsafe 3D viewport transform");
-        }
-        let _ = pitch_packet;
-        let row_pitch = pitch[0]
-            .checked_mul(64)
-            .ok_or("qcom-adreno-a618: MRT pitch overflows")?;
-        set_image_expectation(
-            addresses,
-            base_packet + 1,
-            ImageExpectation {
-                row_pitch,
-                width: (viewport[1] & 0xffff).saturating_add(1),
-                height: (viewport[1] >> 16).saturating_add(1),
-                exact_extent: true,
-                pitch_align: None,
-                array_pitch: Some(ArrayPitchExpectation {
-                    bytes: u64::from(pitch[1]) << 6,
-                    alignment: 64,
-                }),
-            },
-        )?;
         let (_, vertex_layout) = segment
             .reg(VFD_VERTEX_BUFFER_SIZE)
             .ok_or("qcom-adreno-a618: VFD buffer layout is missing")?;
@@ -3078,6 +3108,57 @@ mod tests {
         })
         .unwrap();
         assert!(accept_codegen(&two_draw_artifact).is_ok());
+        let two_draw_packets = Packets::new(&two_draw_artifact.words)
+            .collect::<Result<std::vec::Vec<_>, _>>()
+            .unwrap();
+        let draws = two_draw_packets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, packet)| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: super::CP_DRAW_INDX_OFFSET,
+                        ..
+                    }
+                )
+                .then_some(index)
+            })
+            .collect::<std::vec::Vec<_>>();
+        assert_eq!(draws.len(), 2);
+        assert!(
+            two_draw_packets[draws[0] + 1..draws[1]]
+                .iter()
+                .all(|packet| {
+                    !matches!(
+                        packet.header,
+                        Header::Type4 {
+                            register: super::RB_MRT_PITCH
+                                | super::RB_MRT_BASE
+                                | super::GRAS_CL_VIEWPORT_XOFFSET
+                                | super::GRAS_SC_SCREEN_SCISSOR_TL
+                                | super::GRAS_SC_VIEWPORT_SCISSOR_TL,
+                            ..
+                        }
+                    )
+                })
+        );
+
+        // Retained target state is all-or-nothing. Injecting only a new pitch
+        // must not let a compact segment combine attacker-controlled target
+        // state with the previously authorized base and viewport.
+        let second_draw_word = two_draw_packets[draws[1]].word_offset as usize;
+        let mut partial_target = two_draw_artifact.clone();
+        partial_target.words.splice(
+            second_draw_word..second_draw_word,
+            [type4(super::RB_MRT_PITCH, 2).unwrap(), 1, 16],
+        );
+        for fixup in &mut partial_target.fixups {
+            if fixup.word_offset as usize >= second_draw_word {
+                fixup.word_offset += 3;
+            }
+        }
+        assert!(accept_codegen(&partial_target).is_err());
 
         let mut wrong_final_marker = clear_artifact.clone();
         let draw_word = Packets::new(&wrong_final_marker.words)

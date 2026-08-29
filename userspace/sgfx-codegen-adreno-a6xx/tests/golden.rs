@@ -1306,7 +1306,7 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
     .unwrap();
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.words.len(), 1_350);
+    assert_eq!(artifact.words.len(), 1_331);
     let packets = Packets::new(&artifact.words)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -1318,6 +1318,18 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
         })
         .collect::<Vec<_>>();
     assert_eq!(draws.len(), 4);
+    assert!(
+        packets[draws[0] + 1..draws[1]].iter().all(|packet| {
+            !matches!(
+                packet.header,
+                Header::Type4 {
+                    register: 0x8823 | 0x8825 | 0x8000 | 0x8080 | 0x8082,
+                    ..
+                }
+            )
+        }),
+        "a compatible draw must inherit immutable target and viewport state",
+    );
     assert!(
         !matches!(
             packets[draws[1] - 1].header,

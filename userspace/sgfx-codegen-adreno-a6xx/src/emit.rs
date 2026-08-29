@@ -793,42 +793,16 @@ impl Emitter {
     }
 
     fn draw_with_retained_fixed_state(&mut self, draw: DrawState) -> Result<(), CompileError> {
-        // Keep each draw independently bounded for the production validator.
-        // Fixed blend, raster, linkage, and sample state is inherited from the
-        // preceding compatible draw, while addresses and dimensions remain
-        // explicit in this segment.
-        self.packet4(
-            RB_MRT_PITCH,
-            &[
-                draw.target.stride >> 6,
-                u32::try_from(draw.target.plane_size >> 6).map_err(|_| CompileError::Overflow)?,
-            ],
-        )?;
-        self.address_register(
-            RB_MRT_BASE,
-            ObjectRef::External(draw.target.object),
-            draw.target.plane_offset,
-            draw.target.plane_size,
-            Access::WRITE,
-        )?;
-
-        let target_area = PixelRect::new(0, 0, draw.target.width, draw.target.height)
-            .map_err(|_| CompileError::InvalidResource)?;
-        let target_br = pack_xy(draw.target.width - 1, draw.target.height - 1);
-        let area_br = pack_xy(
-            draw.area.x() + draw.area.width() - 1,
-            draw.area.y() + draw.area.height() - 1,
-        );
+        // The complete first draw authorizes and establishes the target,
+        // viewport, render-area, pipeline, and shader state. Compatibility
+        // includes the exact target and pass area, so replaying those immutable
+        // registers and their target relocation for every UI primitive only
+        // bloats the command stream. The kernel permits this inheritance only
+        // inside the same decoded submit after validating that complete draw.
         let scissor_br = pack_xy(
             draw.scissor.x() + draw.scissor.width() - 1,
             draw.scissor.y() + draw.scissor.height() - 1,
         );
-        self.packet4(GRAS_CL_VIEWPORT_XOFFSET, &viewport_transform(target_area))?;
-        self.packet4(
-            GRAS_SC_SCREEN_SCISSOR_TL,
-            &[pack_xy(draw.area.x(), draw.area.y()), area_br],
-        )?;
-        self.packet4(GRAS_SC_VIEWPORT_SCISSOR_TL, &[pack_xy(0, 0), target_br])?;
         self.packet4(
             GRAS_SC_WINDOW_SCISSOR_TL,
             &[pack_xy(draw.scissor.x(), draw.scissor.y()), scissor_br],
