@@ -49,6 +49,10 @@ const INITIAL_WIDTH: u32 = 96;
 const INITIAL_HEIGHT: u32 = 96;
 const MAX_DYNAMIC_BUFFERS: u32 = 32;
 const MAX_INTERNAL_BUFFERS_PER_TYPE: u32 = 8;
+// Venus HFI supports independent firmware sessions over one shared command
+// transport. Match the upstream Venus fallback limit; command submission stays
+// serialized below because this backend currently owns one HFI worker/ring.
+const MAX_CONCURRENT_SESSIONS: usize = 16;
 const HFI_RESPONSE_TIMEOUT_US: u64 = 1_000_000;
 const HFI_DECODE_TIMEOUT_US: u64 = 2_000_000;
 // Match Linux's internal-DPB tag range: application-visible capture tags live
@@ -1189,9 +1193,25 @@ fn align_up_u32(value: u32, alignment: u32) -> Result<u32, &'static str> {
         .ok_or("qcom-venus-sc7180: alignment overflows")
 }
 
+fn allocate_session_id<F>(next_session_id: &mut u32, mut in_use: F) -> Result<u32, &'static str>
+where
+    F: FnMut(u32) -> bool,
+{
+    // At most MAX_CONCURRENT_SESSIONS identifiers can be live. Therefore one
+    // more consecutive non-zero candidate is sufficient even across wrap.
+    for _ in 0..=MAX_CONCURRENT_SESSIONS {
+        let candidate = (*next_session_id).max(1);
+        *next_session_id = candidate.wrapping_add(1).max(1);
+        if !in_use(candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err("qcom-venus-sc7180: no free video session identifier")
+}
+
 struct BackendState {
     core: Option<HfiCore>,
-    session: Option<VenusSession>,
+    sessions: Vec<VenusSession>,
     next_session_id: u32,
     failed: bool,
     last_error: Option<&'static str>,
@@ -1212,7 +1232,7 @@ pub(crate) struct VenusBackend {
     interrupt_id: InterruptId,
     irq_count: AtomicUsize,
     notifier: IrqSpinLock<Option<Weak<dyn VideoCompletionNotifier>>>,
-    active_session_id: AtomicU32,
+    active_session_ids: IrqSpinLock<Vec<u32>>,
     decode_active_session_id: AtomicU32,
     pending_decode: IrqSpinLock<Option<VideoBackendDecodeRequest>>,
     completion: IrqSpinLock<Option<BackendCompletion>>,
@@ -1237,13 +1257,13 @@ impl VenusBackend {
             interrupt_id,
             irq_count: AtomicUsize::new(0),
             notifier: IrqSpinLock::new(None),
-            active_session_id: AtomicU32::new(0),
+            active_session_ids: IrqSpinLock::new(Vec::with_capacity(MAX_CONCURRENT_SESSIONS)),
             decode_active_session_id: AtomicU32::new(0),
             pending_decode: IrqSpinLock::new(None),
             completion: IrqSpinLock::new(None),
             process: Mutex::new(BackendState {
                 core: None,
-                session: None,
+                sessions: Vec::with_capacity(MAX_CONCURRENT_SESSIONS),
                 next_session_id: 1,
                 failed: false,
                 last_error: None,
@@ -1292,7 +1312,7 @@ impl VenusBackend {
         };
 
         let result = self.execute_decode(&request);
-        if self.active_session_id.load(Ordering::Acquire) == request.stream_id {
+        if self.session_is_active(request.stream_id) {
             let _irq_guard = IrqGuard::new();
             *self.completion.lock() = Some(BackendCompletion {
                 stream_id: request.stream_id,
@@ -1303,11 +1323,31 @@ impl VenusBackend {
         true
     }
 
+    fn session_is_active(&self, stream_id: u32) -> bool {
+        self.active_session_ids.lock().contains(&stream_id)
+    }
+
+    fn activate_session(&self, stream_id: u32) {
+        let mut active = self.active_session_ids.lock();
+        debug_assert!(!active.contains(&stream_id));
+        debug_assert!(active.len() < MAX_CONCURRENT_SESSIONS);
+        active.push(stream_id);
+    }
+
+    fn deactivate_session(&self, stream_id: u32) -> bool {
+        let mut active = self.active_session_ids.lock();
+        let Some(index) = active.iter().position(|active| *active == stream_id) else {
+            return false;
+        };
+        active.swap_remove(index);
+        true
+    }
+
     fn execute_decode(
         &self,
         request: &VideoBackendDecodeRequest,
     ) -> Result<VideoBackendDecodedFrame, &'static str> {
-        if self.active_session_id.load(Ordering::Acquire) != request.stream_id {
+        if !self.session_is_active(request.stream_id) {
             return Err("qcom-venus-sc7180: video session was destroyed before decode");
         }
 
@@ -1318,12 +1358,17 @@ impl VenusBackend {
             if state.failed {
                 return Err("qcom-venus-sc7180: firmware is quarantined; recreate the session");
             }
-            let BackendState { core, session, .. } = &mut *state;
+            let session_index = state
+                .sessions
+                .iter()
+                .position(|session| session.id == request.stream_id)
+                .ok_or("qcom-venus-sc7180: video session is not active")?;
+            let BackendState { core, sessions, .. } = &mut *state;
             let core = core
                 .as_mut()
                 .ok_or("qcom-venus-sc7180: HFI core is not initialized")?;
-            let session = session
-                .as_mut()
+            let session = sessions
+                .get_mut(session_index)
                 .ok_or("qcom-venus-sc7180: video session is not active")?;
             match session.submit(&self.registers, core, &self.dma, request) {
                 Ok(frame) => {
@@ -1419,18 +1464,15 @@ impl VideoDecodeBackend for VenusBackend {
     }
 
     fn debug_status(&self) -> Option<String> {
-        let active = self.active_session_id.load(Ordering::Acquire);
+        let active = self.active_session_ids.lock().len();
         let pending = self.pending_decode.lock().is_some();
         let completed = self.completion.lock().is_some();
         match self.process.try_lock() {
             Some(state) => Some(format!(
-                " core={} session={} pending={} completed={} failed={} irq={} control={:#x} last_error={}",
+                " core={} sessions={} active={} pending={} completed={} failed={} irq={} control={:#x} last_error={}",
                 state.core.is_some(),
-                state
-                    .session
-                    .as_ref()
-                    .map(|session| session.id)
-                    .unwrap_or(active),
+                state.sessions.len(),
+                active,
                 pending,
                 completed,
                 state.failed,
@@ -1439,7 +1481,7 @@ impl VideoDecodeBackend for VenusBackend {
                 state.last_error.unwrap_or("none")
             )),
             None => Some(format!(
-                " core=busy session={} pending={} completed={} irq={} control={:#x}",
+                " core=busy active={} pending={} completed={} irq={} control={:#x}",
                 active,
                 pending,
                 completed,
@@ -1451,7 +1493,7 @@ impl VideoDecodeBackend for VenusBackend {
 
     fn capabilities(&self) -> VideoBackendCapabilities {
         VideoBackendCapabilities {
-            max_sessions: 1,
+            max_sessions: MAX_CONCURRENT_SESSIONS as u32,
             max_inflight_decodes: 1,
             mapped_input_len: MAPPED_INPUT_BYTES as u32,
             mapped_output_len: MAPPED_OUTPUT_BYTES as u32,
@@ -1472,31 +1514,32 @@ impl VideoDecodeBackend for VenusBackend {
         if coded_format != SCARLET_VIDEO_FORMAT_H264 {
             return Err("qcom-venus-sc7180: only stateful H.264 is supported");
         }
-        if self.active_session_id.load(Ordering::Acquire) != 0 {
-            return Err("qcom-venus-sc7180: the hardware session is already in use");
-        }
         let mut state = self.process.lock();
-        if state.session.is_some() {
-            return Err("qcom-venus-sc7180: the hardware session is already in use");
+        if state.sessions.len() >= MAX_CONCURRENT_SESSIONS {
+            return Err("qcom-venus-sc7180: maximum video session count reached");
         }
         if state.failed {
+            if !state.sessions.is_empty() {
+                return Err(
+                    "qcom-venus-sc7180: firmware is quarantined; close existing sessions first",
+                );
+            }
             state.core = None;
             state.failed = false;
+            state.last_error = None;
         }
-        let session_id = state.next_session_id;
-        state.next_session_id = state.next_session_id.wrapping_add(1).max(1);
+        let mut next_session_id = state.next_session_id;
+        let session_id = allocate_session_id(&mut next_session_id, |candidate| {
+            state.sessions.iter().any(|session| session.id == candidate)
+        })?;
+        state.next_session_id = next_session_id;
         let dma = self.dma.clone();
         let core = self.ensure_core(&mut state)?;
         match VenusSession::create(session_id, &self.registers, core, &dma) {
             Ok(session) => {
-                state.session = Some(session);
+                state.sessions.push(session);
                 state.last_error = None;
-                {
-                    let _irq_guard = IrqGuard::new();
-                    *self.pending_decode.lock() = None;
-                    *self.completion.lock() = None;
-                }
-                self.active_session_id.store(session_id, Ordering::Release);
+                self.activate_session(session_id);
                 Ok(session_id)
             }
             Err(error) => {
@@ -1507,9 +1550,9 @@ impl VideoDecodeBackend for VenusBackend {
     }
 
     fn destroy_session(&self, stream_id: u32) -> Result<(), &'static str> {
-        self.active_session_id
-            .compare_exchange(stream_id, 0, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| "qcom-venus-sc7180: unknown video session")?;
+        if !self.deactivate_session(stream_id) {
+            return Err("qcom-venus-sc7180: unknown video session");
+        }
         {
             let _irq_guard = IrqGuard::new();
             let mut pending = self.pending_decode.lock();
@@ -1519,7 +1562,13 @@ impl VideoDecodeBackend for VenusBackend {
             {
                 *pending = None;
             }
-            *self.completion.lock() = None;
+            let mut completion = self.completion.lock();
+            if completion
+                .as_ref()
+                .is_some_and(|completion| completion.stream_id == stream_id)
+            {
+                *completion = None;
+            }
         }
 
         let decode_active = self.decode_active_session_id.load(Ordering::Acquire);
@@ -1533,26 +1582,21 @@ impl VideoDecodeBackend for VenusBackend {
                 self.process.lock()
             }
         };
-        let Some(mut session) = state.session.take() else {
-            if state.failed {
-                state.core = None;
-                state.failed = false;
-                return Ok(());
-            }
+        let Some(session_index) = state
+            .sessions
+            .iter()
+            .position(|session| session.id == stream_id)
+        else {
             return Err("qcom-venus-sc7180: video session is not active");
         };
-        if session.id != stream_id {
-            let active_session_id = session.id;
-            state.session = Some(session);
-            self.active_session_id
-                .store(active_session_id, Ordering::Release);
-            return Err("qcom-venus-sc7180: unknown video session");
-        }
+        let mut session = state.sessions.swap_remove(session_index);
         if state.failed {
             self.registers.assert_arm9_reset();
-            state.core = None;
-            state.failed = false;
-            state.last_error = None;
+            if state.sessions.is_empty() {
+                state.core = None;
+                state.failed = false;
+                state.last_error = None;
+            }
             return Ok(());
         }
         let result = match state.core.as_mut() {
@@ -1561,8 +1605,11 @@ impl VideoDecodeBackend for VenusBackend {
         };
         if let Err(error) = result {
             Self::quarantine(&mut state, &self.registers, error);
-            state.core = None;
-            state.failed = false;
+            if state.sessions.is_empty() {
+                state.core = None;
+                state.failed = false;
+                state.last_error = None;
+            }
             return Err(error);
         }
         state.last_error = None;
@@ -1570,7 +1617,7 @@ impl VideoDecodeBackend for VenusBackend {
     }
 
     fn submit_decode(&self, request: &VideoBackendDecodeRequest) -> Result<(), &'static str> {
-        if self.active_session_id.load(Ordering::Acquire) != request.stream_id {
+        if !self.session_is_active(request.stream_id) {
             return Err("qcom-venus-sc7180: unknown video session");
         }
         if self.completion.lock().is_some() {
@@ -1592,7 +1639,7 @@ impl VideoDecodeBackend for VenusBackend {
         &self,
         stream_id: u32,
     ) -> Result<Option<VideoBackendDecodedFrame>, &'static str> {
-        if self.active_session_id.load(Ordering::Acquire) != stream_id {
+        if !self.session_is_active(stream_id) {
             return Err("qcom-venus-sc7180: unknown video session");
         }
         let _irq_guard = IrqGuard::new();
