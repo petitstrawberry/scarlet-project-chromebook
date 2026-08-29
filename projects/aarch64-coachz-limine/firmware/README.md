@@ -1,8 +1,9 @@
-# CoachZ Adreno firmware
+# CoachZ Qualcomm firmware
 
-This directory vendors the two binary firmware files required by the Adreno
-A618 driver. They are imported byte-for-byte from the official linux-firmware
-repository at the pinned revision below; image creation performs no download.
+This directory vendors the binary firmware files required by the Adreno A618
+GPU and Venus 5.4 video decoder. They are imported byte-for-byte from the
+official linux-firmware repository at the pinned revision below; image creation
+performs no download.
 
 Upstream repository: <https://gitlab.com/kernel-firmware/linux-firmware>
 
@@ -12,6 +13,7 @@ Pinned revision: `8c7fac62c0d1c3b8915f596effc1ef6e95fd6b5f`
 | --- | --- | --- | --- |
 | `qcom/a630_gmu.bin` | `da8d9b1b1f5c1a0b311f32567093b4828f3c80031dd8435f91ac13c664e173a6` | `/system/scarlet/lib/firmware/qcom/a630_gmu.bin` | `/lib/firmware/qcom/a630_gmu.bin` |
 | `qcom/a630_sqe.fw` | `1c21b527d9183487cc550dabbb3f43e555df5a977a461934fc61f0635a9aa90c` | `/system/scarlet/lib/firmware/qcom/a630_sqe.fw` | `/lib/firmware/qcom/a630_sqe.fw` |
+| `qcom/venus-5.4/venus.mbn` | `db2a2efefa7149519b36f01be8a7c37bdf21efd2f06eff5028f80d4295aef7d9` | `/system/scarlet/lib/firmware/qcom/venus-5.4/venus.mbn` | `/lib/firmware/qcom/venus-5.4/venus.mbn` |
 
 These files are not distributed under the repository's GPL license. The
 linux-firmware `WHENCE` entry identifies them as redistributable under QTI's

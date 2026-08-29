@@ -65,6 +65,24 @@ CARGO_TARGET_DIR="$target_dir" cargo build \
     --bin ui-benchmark \
     --bin settings
 
+# video_player is its own no_std workspace package rather than a userprogram
+# binary.  Rebuild it in the same patched dependency graph; otherwise the
+# generic desktop bundle can leave a Git-pinned Adreno code generator in the
+# final image even though every other CoachZ SGFX client was replaced here.
+CARGO_TARGET_DIR="$target_dir" cargo build \
+    -Z unstable-options \
+    -Z build-std=core,compiler_builtins,alloc \
+    -Z build-std-features=compiler-builtins-mem \
+    --lockfile-path "$lock_file" \
+    --config "$config" \
+    --manifest-path "$scarlet_root/.cargo/Cargo.toml" \
+    --target aarch64-unknown-scarlet \
+    --release \
+    -p video_player \
+    --bin video_player \
+    --no-default-features \
+    --features av1-stateful-hw,h264-stateful-hw,h264-stateless-hw,mp4-aac
+
 # `userprogram` uses Scarlet's no_std compatibility layer, while std-bin uses
 # the target's Rust std.  Keep them in separate Cargo feature-resolution units
 # so the two runtime personalities are never unified into one backend build.
@@ -113,7 +131,7 @@ else
 fi
 
 for binary in \
-    sgfx_probe taskbar terminal ui-demo ui-benchmark settings \
+    sgfx_probe taskbar terminal ui-demo ui-benchmark settings video_player \
     sws clock files launcher notepad task_manager ui-sgfx-showcase \
     sgfx_cube sgfx_texture sgfx_showcase
 do
