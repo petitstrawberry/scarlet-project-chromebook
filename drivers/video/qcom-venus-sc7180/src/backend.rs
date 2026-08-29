@@ -1572,15 +1572,28 @@ impl VideoDecodeBackend for VenusBackend {
         }
 
         let decode_active = self.decode_active_session_id.load(Ordering::Acquire);
-        let mut state = match self.process.try_lock() {
-            Some(state) => state,
-            None => {
+        let mut reported_wait = false;
+        let mut state = loop {
+            if let Some(state) = self.process.try_lock() {
+                break state;
+            }
+            if !reported_wait {
                 println!(
                     "[qcom-venus-sc7180] stream={} teardown waiting for decode worker active={}",
                     stream_id, decode_active
                 );
-                self.process.lock()
+                reported_wait = true;
             }
+
+            // File teardown can run after the calling userspace task has
+            // already entered Terminated state. Such a task cannot join a
+            // sleepable Mutex wait queue: it will never be scheduled again,
+            // and Mutex correctly rejects it. The process mutex owner is the
+            // dedicated Venus kernel worker, whose HFI waits are bounded, so
+            // poll without enqueueing the dying task until the worker drops
+            // the guard. This also preserves destroy_session's contract that
+            // submitted buffers are no longer touched when teardown returns.
+            core::hint::spin_loop();
         };
         let Some(session_index) = state
             .sessions
