@@ -16,7 +16,7 @@ use crate::{
     EnabledVideoClocks, firmware,
     hfi::{HfiTransport, SHARED_REGION_SIZE},
     hfi_abi::{self, BufferRequirement, FillDone, SequenceInfo},
-    memory::{DmaAllocation, rw_flags},
+    memory::{DmaPagedAllocation, rw_flags},
     registers::VenusRegisters,
 };
 use qcom_sc7180_interconnect::VenusInterconnectPaths;
@@ -65,6 +65,26 @@ static VENUS_WORKER_PENDING: AtomicBool = AtomicBool::new(false);
 static VENUS_WORKER_WAKER: Waker = Waker::new_uninterruptible("venus-decode-worker");
 static VENUS_HFI_WAKER: Waker = Waker::new_uninterruptible("venus-hfi-response");
 static VENUS_WORKER_BACKENDS: IrqSpinLock<Vec<Weak<VenusBackend>>> = IrqSpinLock::new(Vec::new());
+
+fn is_session_resource_error(error: &'static str) -> bool {
+    matches!(
+        error,
+        "qcom-venus-sc7180: paged DMA allocation failed"
+            | "qcom-venus-sc7180: paged DMA length overflows"
+            | "qcom-venus-sc7180: paged DMA mapping failed"
+            | "qcom-venus-sc7180: firmware requires a 32-bit DMA address"
+            | "qcom-venus-sc7180: invalid frontend input-buffer size"
+            | "qcom-venus-sc7180: invalid frontend output-buffer size"
+            | "qcom-venus-sc7180: frontend buffer range overflows"
+            | "qcom-venus-sc7180: frontend buffers are not contiguous"
+            | "qcom-venus-sc7180: failed to map frontend input"
+            | "qcom-venus-sc7180: failed to map frontend output"
+            | "qcom-venus-sc7180: frontend DMA address exceeds HFI 32-bit range"
+            | "qcom-venus-sc7180: frontend DMA buffers are not page aligned"
+            | "qcom-venus-sc7180: invalid H.264 access-unit size"
+            | "qcom-venus-sc7180: decoded frame exceeds frontend output buffer"
+    )
+}
 
 fn log_sequence_packet(words: &[u32]) {
     println!(
@@ -366,23 +386,41 @@ fn wait_without_burning_cpu(start: u64) {
 
 struct InternalBuffer {
     buffer_type: u32,
-    allocation: DmaAllocation,
+    allocation: DmaPagedAllocation,
 }
 
 struct FrontendMappings {
     input_paddr: usize,
     output_paddr: usize,
+    input_len: usize,
+    output_len: usize,
     input: DmaMapping,
     output: DmaMapping,
 }
 
 impl FrontendMappings {
     fn new(dma: &DmaContext, request: &VideoBackendDecodeRequest) -> Result<Self, &'static str> {
+        let input_len = usize::try_from(request.output_offset)
+            .map_err(|_| "qcom-venus-sc7180: invalid frontend input-buffer size")?;
+        let output_len = request.output_len as usize;
+        if input_len == 0 || input_len > MAPPED_INPUT_BYTES {
+            return Err("qcom-venus-sc7180: invalid frontend input-buffer size");
+        }
+        if output_len == 0 || output_len > MAPPED_OUTPUT_BYTES {
+            return Err("qcom-venus-sc7180: invalid frontend output-buffer size");
+        }
+        let expected_output_paddr = request
+            .input_paddr
+            .checked_add(input_len)
+            .ok_or("qcom-venus-sc7180: frontend buffer range overflows")?;
+        if request.output_paddr != expected_output_paddr {
+            return Err("qcom-venus-sc7180: frontend buffers are not contiguous");
+        }
         let input = dma
-            .map_phys_owned(request.input_paddr, MAPPED_INPUT_BYTES, rw_flags())
+            .map_phys_owned(request.input_paddr, input_len, rw_flags())
             .map_err(|_| "qcom-venus-sc7180: failed to map frontend input")?;
         let output = dma
-            .map_phys_owned(request.output_paddr, MAPPED_OUTPUT_BYTES, rw_flags())
+            .map_phys_owned(request.output_paddr, output_len, rw_flags())
             .map_err(|_| "qcom-venus-sc7180: failed to map frontend output")?;
         if input.dma_addr() > u32::MAX as u64 || output.dma_addr() > u32::MAX as u64 {
             return Err("qcom-venus-sc7180: frontend DMA address exceeds HFI 32-bit range");
@@ -393,13 +431,22 @@ impl FrontendMappings {
         Ok(Self {
             input_paddr: request.input_paddr,
             output_paddr: request.output_paddr,
+            input_len,
+            output_len,
             input,
             output,
         })
     }
 
     fn matches(&self, request: &VideoBackendDecodeRequest) -> bool {
-        self.input_paddr == request.input_paddr && self.output_paddr == request.output_paddr
+        self.input_paddr == request.input_paddr
+            && self.output_paddr == request.output_paddr
+            && usize::try_from(request.output_offset).ok() == Some(self.input_len)
+            && self.output_len == request.output_len as usize
+    }
+
+    fn input_capacity(&self) -> u32 {
+        self.input_len as u32
     }
 
     fn input_dma(&self) -> u32 {
@@ -497,7 +544,7 @@ impl Nv12Layout {
 struct VenusSession {
     id: u32,
     internal: Vec<InternalBuffer>,
-    dpbs: Vec<DmaAllocation>,
+    dpbs: Vec<DmaPagedAllocation>,
     dpb_queued: Vec<bool>,
     layout: Option<Nv12Layout>,
     mappings: Option<FrontendMappings>,
@@ -608,11 +655,16 @@ impl VenusSession {
         if request.stream_id != self.id || request.coded_format != SCARLET_VIDEO_FORMAT_H264 {
             return Err("qcom-venus-sc7180: invalid decode session or format");
         }
-        if request.input_len == 0 || request.input_len as usize > MAPPED_INPUT_BYTES {
+        let input_capacity = usize::try_from(request.output_offset)
+            .map_err(|_| "qcom-venus-sc7180: invalid frontend input-buffer size")?;
+        if request.input_len == 0
+            || request.input_len as usize > input_capacity
+            || input_capacity > MAPPED_INPUT_BYTES
+        {
             return Err("qcom-venus-sc7180: invalid H.264 access-unit size");
         }
-        if request.output_len as usize != MAPPED_OUTPUT_BYTES {
-            return Err("qcom-venus-sc7180: unexpected frontend output-buffer size");
+        if request.output_len == 0 || request.output_len as usize > MAPPED_OUTPUT_BYTES {
+            return Err("qcom-venus-sc7180: invalid frontend output-buffer size");
         }
         if self
             .mappings
@@ -640,7 +692,7 @@ impl VenusSession {
                 request.timestamp,
                 input_tag,
                 mappings.input_dma(),
-                MAPPED_INPUT_BYTES as u32,
+                mappings.input_capacity(),
                 request.input_len,
             ),
             false,
@@ -718,10 +770,15 @@ impl VenusSession {
                 retained.push(buffer);
             }
         }
+        // Keep every still-registered persistent buffer owned by the session
+        // before attempting the optional scratch replacement. If physical
+        // memory is tight, allocation may fail here; dropping `retained`
+        // would otherwise leave firmware pointing at freed IOVAs and force a
+        // global core quarantine that also kills unrelated streams.
+        self.internal = retained;
         let mut scratch =
             allocate_internal_buffers(registers, core, dma, self.id, &requirements, true)?;
-        retained.append(&mut scratch);
-        self.internal = retained;
+        self.internal.append(&mut scratch);
 
         let output_requirement = requirements
             .iter()
@@ -743,7 +800,7 @@ impl VenusSession {
         self.dpb_queued = Vec::with_capacity(dpb_count as usize);
         for _ in 0..dpb_count {
             self.dpbs
-                .push(DmaAllocation::new(dma, dpb_size as usize, rw_flags())?);
+                .push(DmaPagedAllocation::new(dma, dpb_size as usize, rw_flags())?);
             self.dpb_queued.push(false);
         }
 
@@ -1055,22 +1112,27 @@ fn allocate_internal_buffers(
         }
         let count = requirement.count_actual;
         for _ in 0..count {
-            let allocation = DmaAllocation::new(dma, requirement.size as usize, rw_flags())?;
-            core.send(
-                registers,
-                &hfi_abi::set_internal_buffer(
-                    session,
-                    requirement.buffer_type,
-                    requirement.size,
-                    allocation.dma_addr(),
-                ),
-                false,
-            )?;
+            let allocation = DmaPagedAllocation::new(dma, requirement.size as usize, rw_flags())?;
             buffers.push(InternalBuffer {
                 buffer_type: requirement.buffer_type,
                 allocation,
             });
         }
+    }
+    // Allocate the complete set before publishing any address to firmware.
+    // Resource exhaustion is then a session-local failure with no stale HFI
+    // buffer registrations, while transport failures below remain fatal.
+    for buffer in &buffers {
+        core.send(
+            registers,
+            &hfi_abi::set_internal_buffer(
+                session,
+                buffer.buffer_type,
+                buffer.allocation.requested_size() as u32,
+                buffer.allocation.dma_addr(),
+            ),
+            false,
+        )?;
     }
     Ok(buffers)
 }
@@ -1376,7 +1438,16 @@ impl VenusBackend {
                     Ok(frame)
                 }
                 Err(error) => {
-                    Self::quarantine(&mut state, &self.registers, error);
+                    if is_session_resource_error(error) {
+                        // This stream could not provision its own scratch/DPB
+                        // memory. HFI and the other firmware sessions remain
+                        // valid; userspace will receive the error and destroy
+                        // only this session. Quarantining the whole core here
+                        // unnecessarily tears down every concurrent player.
+                        state.last_error = Some(error);
+                    } else {
+                        Self::quarantine(&mut state, &self.registers, error);
+                    }
                     Err(error)
                 }
             }
@@ -1503,6 +1574,10 @@ impl VideoDecodeBackend for VenusBackend {
             supports_hevc: false,
             supports_stateless_h264: false,
         }
+    }
+
+    fn supports_variable_mapped_buffers(&self) -> bool {
+        true
     }
 
     fn set_completion_notifier(&self, notifier: Option<Weak<dyn VideoCompletionNotifier>>) {
