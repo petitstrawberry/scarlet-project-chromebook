@@ -915,11 +915,12 @@ impl A618Core {
         let sequence = hardware.fence_sequence;
         hardware.fence.as_words_mut()[0] = 0;
         hardware.fence.clean_for_device();
-        // Match Linux's A6xx completion source. The addressed timestamp remains
-        // useful diagnostic state, but this serialized single-ring backend
-        // retires from a fresh RBBM completion bit plus the sequence-specific
-        // scratch register. Some SC7180 firmware paths acknowledge the event
-        // without making a repeated timestamp write CPU-visible.
+        // Match Linux's A6xx completion sources. A completed submission may be
+        // observed either through the cache-flush interrupt or through its
+        // addressed sequence fence. Keep the sequence-specific scratch value,
+        // retired ring pointer, and idle status as mandatory corroboration so
+        // a stale interrupt or fence can never retire a newer submission.
+        // Some SC7180 paths expose only one of the two completion signals.
         let completion = completion_commands(hardware.fence.dma_addr(), sequence)?;
         let mut ring = Vec::new();
         ring.try_reserve_exact(words.len() + completion.len())
@@ -972,7 +973,8 @@ impl A618Core {
             }
             // Drain any status raised alongside the memory fence before
             // returning so the next ring kick starts from a clean status word.
-            if observed_interrupts.rbbm & RBBM_INT_CP_CACHE_FLUSH_TS != 0
+            if (observed_interrupts.rbbm & RBBM_INT_CP_CACHE_FLUSH_TS != 0
+                || fence_value == sequence)
                 && self.registers.read(CP_SCRATCH_2) == sequence
                 && self.registers.read(CP_RB_RPTR) == target_wptr
                 && self.registers.read(RBBM_STATUS) & !RBBM_STATUS_CP_AHB_BUSY_CX_MASTER == 0
