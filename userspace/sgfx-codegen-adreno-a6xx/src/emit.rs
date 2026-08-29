@@ -239,6 +239,7 @@ pub(crate) struct Surface {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) stride: u32,
+    pub(crate) alpha_mask: bool,
 }
 
 pub(crate) struct Emitter {
@@ -444,12 +445,19 @@ impl Emitter {
     }
 
     fn texture_descriptor_prefix(texture: Surface) -> Result<[u32; 4], CompileError> {
-        // A6XX_TEX_MEMOBJ, single-level explicit-layout linear 2D BGRA8,
-        // identity view swizzle.  Freedreno assigns explicit linear BGRA8 a
+        // A6XX_TEX_MEMOBJ, single-level explicit-layout linear 2D BGRA8.
+        // Alpha masks force RGB to one and retain physical W as alpha so the
+        // canonical RGBA vertex-color shader has exact alpha-mask semantics,
+        // including at linearly filtered atlas edges. Other images use the
+        // identity view swizzle. Freedreno assigns explicit linear BGRA8 a
         // 64-byte minimum pitch alignment (PITCHALIGN encoding zero); a wider
         // incidental stride alignment must not change the descriptor.
         Ok([
-            0x4c00_6880,
+            if texture.alpha_mask {
+                0x4c00_76d0
+            } else {
+                0x4c00_6880
+            },
             texture.width | (texture.height << 15),
             (texture.stride << 7) | (1 << 29),
             u32::try_from(

@@ -408,6 +408,7 @@ fn require_image_surface(
         width: image.extent.width(),
         height: image.extent.height(),
         stride: plane.stride,
+        alpha_mask: image.format == TextureFormat::R8Unorm,
     })
 }
 
@@ -682,7 +683,12 @@ fn pipeline_variant(
             (16, Texture(AlphaMask)) => PipelineVariant::Stride16TextureAlphaMask,
             (40, Solid) => PipelineVariant::Stride40Solid,
             (40, VertexColor) => PipelineVariant::Stride40VertexColor,
-            (40, TextureVertexColor(Rgba)) => PipelineVariant::Stride40TextureVertexColorRgba,
+            (40, TextureVertexColor(Rgba | AlphaMask)) => {
+                // R8 mask descriptors force sampled RGB to one and retain the
+                // logical mask in alpha. The canonical RGBA shader therefore
+                // implements vertex-colored alpha-mask sampling exactly.
+                PipelineVariant::Stride40TextureVertexColorRgba
+            }
             (24, Solid) => PipelineVariant::Stride24Solid,
             (24, Texture(Rgba)) => PipelineVariant::Stride24TextureRgba,
             (24, Texture(RgbIgnoreAlpha)) => PipelineVariant::Stride24TextureRgbIgnoreAlpha,
@@ -889,7 +895,12 @@ fn validate_pipeline_descriptor(pipeline: &PipelineMeta) -> Result<(), CompileEr
             find(0) == Some((VertexFormat::Float32x4, 0))
                 && find(1) == Some((VertexFormat::Float32x4, 16))
         }
-        (40, FragmentProgram::TextureVertexColor(TextureSampleMode::Rgba)) => {
+        (
+            40,
+            FragmentProgram::TextureVertexColor(
+                TextureSampleMode::Rgba | TextureSampleMode::AlphaMask,
+            ),
+        ) => {
             find(0) == Some((VertexFormat::Float32x4, 0))
                 && find(1) == Some((VertexFormat::Float32x4, 16))
                 && find(2) == Some((VertexFormat::Float32x2, 32))
@@ -925,7 +936,10 @@ fn validate_pipeline_descriptor(pipeline: &PipelineMeta) -> Result<(), CompileEr
         }
         40 => {
             descriptor.blend() == BlendState::SOURCE_OVER_STRAIGHT_ALPHA
-                && descriptor.raster().cull_mode() == CullMode::Back
+                && matches!(
+                    descriptor.raster().cull_mode(),
+                    CullMode::None | CullMode::Back
+                )
                 && descriptor.raster().front_face() == FrontFace::CounterClockwise
         }
         28 => descriptor.blend() == BlendState::REPLACE,

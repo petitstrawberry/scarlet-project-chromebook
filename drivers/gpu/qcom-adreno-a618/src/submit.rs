@@ -53,6 +53,8 @@ const TPL1_A2D_SRC_TEXTURE_PITCH: u32 = 0xb4c4;
 const CP_DRAW_INDX_OFFSET: u8 = 0x38;
 const CP_LOAD_STATE6_GEOM: u8 = 0x32;
 const CP_LOAD_STATE6_FRAG: u8 = 0x34;
+const TEX_DESCRIPTOR_BGRA_IDENTITY: u32 = 0x4c00_6880;
+const TEX_DESCRIPTOR_ALPHA_MASK: u32 = 0x4c00_76d0;
 const GRAS_CL_CNTL: u32 = 0x8000;
 const GRAS_CL_VS_CLIP_CULL_DISTANCE: u32 = 0x8001;
 const GRAS_CL_ARRAY_SIZE: u32 = 0x8004;
@@ -179,6 +181,13 @@ const TPL1_MODE_CNTL: u32 = 0xb309;
 const SP_WINDOW_OFFSET: u32 = 0xb4d1;
 const SP_UPDATE_CNTL: u32 = 0xbb08;
 const SP_PS_CONST_CONFIG: u32 = 0xbb10;
+
+fn supported_texture_descriptor(word: u32) -> bool {
+    matches!(
+        word,
+        TEX_DESCRIPTOR_BGRA_IDENTITY | TEX_DESCRIPTOR_ALPHA_MASK
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AddressField {
@@ -637,7 +646,7 @@ fn validate_type7(
         }
         (CP_MEM_WRITE, 22)
             if payload[0..2] == [0, 0]
-                && payload[2] == 0x4c00_6880
+                && supported_texture_descriptor(payload[2])
                 && payload[3] & 0xc000_0000 == 0
                 && payload[3] & 0x7fff != 0
                 && (payload[3] >> 15) & 0x7fff != 0
@@ -1514,8 +1523,10 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
             p.len() == 1
                 && if fixed.stride == 28 {
                     p[0] & !0x2017 == 0 && p[0] & 0x2010 == 0x2010
+                } else if fixed.stride == 40 {
+                    matches!(p[0], 0x2010 | 0x2012)
                 } else {
-                    p[0] == if fixed.stride == 40 { 0x2012 } else { 0x2010 }
+                    p[0] == 0x2010
                 }
         })
         && reg(GRAS_SU_POINT_MINMAX) == Some(&[0x0010_0010])
@@ -1551,7 +1562,7 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
                         ..
                     }
                 ) && p.payload.len() == 22
-                    && p.payload[2] == 0x4c00_6880
+                    && supported_texture_descriptor(p.payload[2])
             })
         }
 }
@@ -1857,7 +1868,9 @@ fn validate_3d_sequences(
                     }
                 )
                 .then_some(packet)
-                .filter(|packet| packet.payload.len() == 22 && packet.payload[2] == 0x4c00_6880)
+                .filter(|packet| {
+                    packet.payload.len() == 22 && supported_texture_descriptor(packet.payload[2])
+                })
                 .map(|packet| (packet.word_offset, packet.payload))
             })
         {
@@ -3660,13 +3673,19 @@ mod tests {
                 color4,
                 FragmentProgram::VertexColor,
                 BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
-                CullMode::Back
+                CullMode::None
+            ),
+            (
+                color4_uv.clone(),
+                FragmentProgram::TextureVertexColor(TextureSampleMode::Rgba),
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                CullMode::None
             ),
             (
                 color4_uv,
-                FragmentProgram::TextureVertexColor(TextureSampleMode::Rgba),
+                FragmentProgram::TextureVertexColor(TextureSampleMode::AlphaMask),
                 BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
-                CullMode::Back
+                CullMode::None
             ),
             (
                 pos4(24),
@@ -3738,6 +3757,7 @@ mod tests {
                     if matches!(
                         fragment,
                         FragmentProgram::Texture(TextureSampleMode::AlphaMask)
+                            | FragmentProgram::TextureVertexColor(TextureSampleMode::AlphaMask)
                     ) {
                         ALPHA
                     } else {
@@ -3747,11 +3767,7 @@ mod tests {
                 // Sampler filtering is dynamic SGFX state rather than part of
                 // the shader/vertex pipeline identity. Exercise linear mode
                 // for every sampled layout, including the stride-16 UI path.
-                let filter = if matches!(index, 1 | 2 | 5 | 8) {
-                    FilterMode::Linear
-                } else {
-                    FilterMode::Nearest
-                };
+                let filter = FilterMode::Linear;
                 operations.push(Operation::SetSampler(SamplerDesc::new(
                     filter,
                     filter,

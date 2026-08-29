@@ -980,12 +980,17 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
         (
             FragmentProgram::VertexColor,
             canvas_layout.clone(),
-            CullMode::Back,
+            CullMode::None,
         ),
         (
             FragmentProgram::TextureVertexColor(TextureSampleMode::Rgba),
+            canvas_layout.clone(),
+            CullMode::None,
+        ),
+        (
+            FragmentProgram::TextureVertexColor(TextureSampleMode::AlphaMask),
             canvas_layout,
-            CullMode::Back,
+            CullMode::None,
         ),
     ];
     let mut pipelines = variants
@@ -1060,6 +1065,7 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
         let alpha = matches!(
             pipeline.descriptor.fragment(),
             FragmentProgram::Texture(TextureSampleMode::AlphaMask)
+                | FragmentProgram::TextureVertexColor(TextureSampleMode::AlphaMask)
         );
         let stride = pipeline.descriptor.vertex_buffer().stride();
         let mut operations = vec![
@@ -1121,12 +1127,13 @@ fn ui_pipeline_matrix_is_accepted_without_external_shader_objects() {
             assert_eq!(state_object.bytes, [0; 80]);
             assert_eq!(state_object.access, Access::READ | Access::WRITE);
 
+            let expected_descriptor = if alpha { 0x4c00_76d0 } else { 0x4c00_6880 };
             let state_write = packets
                 .iter()
                 .find(|packet| {
                     matches!(packet.header, Header::Type7 { opcode: 0x3d, .. })
                         && packet.payload.len() == 22
-                        && packet.payload[2] == 0x4c00_6880
+                        && packet.payload[2] == expected_descriptor
                 })
                 .expect("one CP_MEM_WRITE texture-state materialization");
             let expected_sampler = if matches!(stride, 16 | 24) {
