@@ -419,8 +419,25 @@ impl GpuDirectScanoutState {
         let length = usize::try_from(backing.allocation_size())
             .map_err(|_| "qcom-sc7180-mdss: GPU scanout allocation exceeds usize")?;
         let granule = dma_context.mapping_granule();
-        if length == 0 || backing.physical_addr() % granule != 0 || length % granule != 0 {
+        if length == 0 || length % granule != 0 {
             return Err("qcom-sc7180-mdss: GPU scanout is not DMA aligned");
+        }
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(backing.physical_segments().len())
+            .map_err(|_| "qcom-sc7180-mdss: GPU scanout segment allocation failed")?;
+        let mut segment_bytes = 0usize;
+        for segment in backing.physical_segments().iter().copied() {
+            if segment.physical_addr() % granule != 0 || segment.length() % granule != 0 {
+                return Err("qcom-sc7180-mdss: GPU scanout segment is not DMA aligned");
+            }
+            segment_bytes = segment_bytes
+                .checked_add(segment.length())
+                .ok_or("qcom-sc7180-mdss: GPU scanout segment size overflows")?;
+            segments.push((segment.physical_addr(), segment.length()));
+        }
+        if segment_bytes < length {
+            return Err("qcom-sc7180-mdss: GPU scanout segments are undersized");
         }
         while self.mappings.len() >= GPU_SCANOUT_CACHE_CAPACITY {
             let Some(index) = self.mappings.iter().position(|entry| {
@@ -433,11 +450,7 @@ impl GpuDirectScanoutState {
             self.mappings.remove(index);
         }
         let mapping = dma_context
-            .map_phys_owned(
-                backing.physical_addr(),
-                length,
-                IommuMapFlags::READ | IommuMapFlags::COHERENT,
-            )
+            .map_phys_segments_owned(&segments, IommuMapFlags::READ | IommuMapFlags::COHERENT)
             .map_err(|_| "qcom-sc7180-mdss: failed to map direct GPU scanout")?;
         let address = dpu_dma_address(&mapping)?;
         self.mappings.push(DirectGpuScanout {
@@ -613,10 +626,6 @@ impl Sc7180GraphicsDevice {
         let row_bytes = (region.width as usize)
             .checked_mul(bytes_per_pixel)
             .ok_or("qcom-sc7180-mdss: GPU damage row size overflows")?;
-        let first_source_offset = (region.y as usize)
-            .checked_mul(source_stride)
-            .and_then(|offset| offset.checked_add(x_bytes))
-            .ok_or("qcom-sc7180-mdss: GPU source offset overflows")?;
         let last_source_end = (region.y as usize + region.height as usize - 1)
             .checked_mul(source_stride)
             .and_then(|offset| offset.checked_add(x_bytes))
@@ -628,11 +637,6 @@ impl Sc7180GraphicsDevice {
             return Err("qcom-sc7180-mdss: GPU source damage exceeds backing");
         }
 
-        let source_base = vm::phys_to_virt(backing.physical_addr());
-        arch::invalidate_dcache_to_poc_range(
-            source_base + first_source_offset,
-            last_source_end - first_source_offset,
-        );
         for row in 0..region.height as usize {
             let source_offset = (region.y as usize + row)
                 .checked_mul(source_stride)
@@ -645,15 +649,50 @@ impl Sc7180GraphicsDevice {
             if destination_offset.saturating_add(row_bytes) > self.config.size() {
                 return Err("qcom-sc7180-mdss: GPU destination damage exceeds scanout");
             }
-            // SAFETY: the source is a retained, validated linear GPU backing;
-            // the destination is the non-visible owned scanout; both row
-            // ranges were checked against their complete allocations.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    (source_base + source_offset) as *const u8,
-                    (destination.as_vaddr() + destination_offset) as *mut u8,
-                    row_bytes,
-                );
+            let mut copied = 0usize;
+            let mut logical_base = 0usize;
+            let source_end = source_offset
+                .checked_add(row_bytes)
+                .ok_or("qcom-sc7180-mdss: GPU source row range overflows")?;
+            for segment in backing.physical_segments().iter().copied() {
+                if copied == row_bytes {
+                    break;
+                }
+                let segment_end = logical_base
+                    .checked_add(segment.length())
+                    .ok_or("qcom-sc7180-mdss: GPU segment range overflows")?;
+                if source_offset < segment_end && source_end > logical_base {
+                    let range_start = source_offset.max(logical_base);
+                    let range_end = source_end.min(segment_end);
+                    let segment_offset = range_start - logical_base;
+                    let part_length = range_end - range_start;
+                    let source_address = vm::phys_to_virt(
+                        segment
+                            .physical_addr()
+                            .checked_add(segment_offset)
+                            .ok_or("qcom-sc7180-mdss: GPU source address overflows")?,
+                    );
+                    let destination_address = destination
+                        .as_vaddr()
+                        .checked_add(destination_offset)
+                        .and_then(|address| address.checked_add(copied))
+                        .ok_or("qcom-sc7180-mdss: GPU destination address overflows")?;
+                    arch::invalidate_dcache_to_poc_range(source_address, part_length);
+                    // SAFETY: the source segment is retained by `backing`; the
+                    // destination scanout row was bounds-checked above.
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            source_address as *const u8,
+                            destination_address as *mut u8,
+                            part_length,
+                        );
+                    }
+                    copied += part_length;
+                }
+                logical_base = segment_end;
+            }
+            if copied != row_bytes {
+                return Err("qcom-sc7180-mdss: GPU source segments are incomplete");
             }
         }
         self.clean_regions(destination, &[region])

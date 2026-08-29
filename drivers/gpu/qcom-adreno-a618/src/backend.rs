@@ -270,13 +270,34 @@ struct HardwareState {
     last_ring_failure: Option<RingFailureSnapshot>,
 }
 
+struct ResourceMapping {
+    gate: Arc<Mutex<()>>,
+    mapping: Option<DmaMapping>,
+}
+
+impl ResourceMapping {
+    fn new(gate: Arc<Mutex<()>>, mapping: DmaMapping) -> Self {
+        Self {
+            gate,
+            mapping: Some(mapping),
+        }
+    }
+}
+
+impl Drop for ResourceMapping {
+    fn drop(&mut self) {
+        let _gate = self.gate.lock();
+        drop(self.mapping.take());
+    }
+}
+
 struct ResourceEntry {
     token: u64,
     gpu_va: u64,
     allocation_size: u64,
     allowed_access: u32,
     linear_image: Option<LinearImage>,
-    _mapping: DmaMapping,
+    _mapping: ResourceMapping,
 }
 
 struct A618Core {
@@ -291,6 +312,7 @@ struct A618Core {
     peak_kbps: u32,
     gmu: Arc<Mutex<A618Gmu>>,
     hardware: Mutex<HardwareState>,
+    resource_mapping_gate: Arc<Mutex<()>>,
     resources: IrqSpinLock<Vec<Arc<ResourceEntry>>>,
     next_resource_token: AtomicU64,
     backend_cookie: u64,
@@ -434,9 +456,12 @@ impl A618Core {
 
     fn unregister_resource(&self, token: u64) {
         let mut resources = self.resources.lock();
-        if let Some(index) = resources.iter().position(|entry| entry.token == token) {
-            resources.swap_remove(index);
-        }
+        let removed = resources
+            .iter()
+            .position(|entry| entry.token == token)
+            .map(|index| resources.swap_remove(index));
+        drop(resources);
+        drop(removed);
     }
 
     fn resource(&self, token: u64) -> Option<Arc<ResourceEntry>> {
@@ -457,6 +482,7 @@ impl A618Core {
         if paddr == 0 || allocation_size == 0 || paddr & (PAGE_SIZE - 1) != 0 {
             return Err("qcom-adreno-a618: resource backing is invalid");
         }
+        let _mapping_gate = self.resource_mapping_gate.lock();
         let mapping = self
             .dma_context
             // A618 advertises cached-coherent system memory. External CPU-mapped
@@ -468,6 +494,47 @@ impl A618Core {
                 IommuMapFlags::READ | IommuMapFlags::WRITE | IommuMapFlags::COHERENT,
             )
             .map_err(|_| "qcom-adreno-a618: resource IOMMU mapping failed")?;
+        Ok((mapping.dma_addr(), mapping))
+    }
+
+    fn map_image_backing(
+        &self,
+        backing: &GpuImageBackingInfo,
+    ) -> Result<(u64, DmaMapping), &'static str> {
+        if backing.is_physically_contiguous() {
+            return self.map_backing(backing.paddr, backing.allocation_size);
+        }
+        let allocation_size = usize::try_from(backing.allocation_size)
+            .map_err(|_| "qcom-adreno-a618: image allocation exceeds kernel address size")?;
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(backing.physical_segments().len())
+            .map_err(|_| "qcom-adreno-a618: image segment metadata allocation failed")?;
+        let mut total_size = 0usize;
+        for segment in backing.physical_segments().iter().copied() {
+            if segment.physical_addr() == 0
+                || segment.physical_addr() & (PAGE_SIZE - 1) != 0
+                || segment.length() == 0
+                || segment.length() & (PAGE_SIZE - 1) != 0
+            {
+                return Err("qcom-adreno-a618: image backing segment is invalid");
+            }
+            total_size = total_size
+                .checked_add(segment.length())
+                .ok_or("qcom-adreno-a618: image backing size overflows")?;
+            segments.push((segment.physical_addr(), segment.length()));
+        }
+        if total_size < allocation_size {
+            return Err("qcom-adreno-a618: image backing segments are undersized");
+        }
+        let _mapping_gate = self.resource_mapping_gate.lock();
+        let mapping = self
+            .dma_context
+            .map_phys_segments_owned(
+                &segments,
+                IommuMapFlags::READ | IommuMapFlags::WRITE | IommuMapFlags::COHERENT,
+            )
+            .map_err(|_| "qcom-adreno-a618: segmented image IOMMU mapping failed")?;
         Ok((mapping.dma_addr(), mapping))
     }
 
@@ -1205,6 +1272,10 @@ impl A618Core {
         let byte_size = words.len().checked_mul(core::mem::size_of::<u32>()).ok_or(
             GpuBackendSubmitError::Rejected("qcom-adreno-a618: command byte size overflows"),
         )?;
+        // Mapping changes invalidate the complete A618 SMMU context. Keep
+        // resource map/unmap outside the interval in which the GPU can fetch
+        // commands, shaders, or image data from that context.
+        let _mapping_gate = self.resource_mapping_gate.lock();
         let mut hardware = self.hardware.lock();
         if byte_size > hardware.command.requested_size() {
             return Err(GpuBackendSubmitError::Rejected(
@@ -1378,7 +1449,9 @@ impl A618ContextInner {
             .iter()
             .position(|entry| entry.resource.token == resource_token)
             .ok_or("qcom-adreno-a618: resource is not attached")?;
-        attachments.swap_remove(index);
+        let removed = attachments.swap_remove(index);
+        drop(attachments);
+        drop(removed);
         Ok(())
     }
 
@@ -1591,7 +1664,30 @@ impl A618Backend {
             allocation_size,
             allowed_access,
             linear_image,
-            _mapping: mapping,
+            _mapping: ResourceMapping::new(Arc::clone(&self.core.resource_mapping_gate), mapping),
+        });
+        self.core.register_resource(Arc::clone(&entry))?;
+        Ok(A618Resource {
+            core: Arc::clone(&self.core),
+            entry,
+        })
+    }
+
+    fn create_image_resource(
+        &self,
+        backing: &GpuImageBackingInfo,
+        allowed_access: u32,
+        linear_image: LinearImage,
+    ) -> Result<A618Resource, &'static str> {
+        let (gpu_va, mapping) = self.core.map_image_backing(backing)?;
+        let token = self.core.allocate_resource_token()?;
+        let entry = Arc::new(ResourceEntry {
+            token,
+            gpu_va,
+            allocation_size: backing.allocation_size,
+            allowed_access,
+            linear_image: Some(linear_image),
+            _mapping: ResourceMapping::new(Arc::clone(&self.core.resource_mapping_gate), mapping),
         });
         self.core.register_resource(Arc::clone(&entry))?;
         Ok(A618Resource {
@@ -1602,6 +1698,10 @@ impl A618Backend {
 }
 
 impl GpuBackend for A618Backend {
+    fn supports_segmented_image_backing(&self) -> bool {
+        true
+    }
+
     fn query_info(&self) -> scarlet::device::gpu::GpuBackendInfo {
         let ready = match self.core.ensure_hardware_ready() {
             Ok(()) => true,
@@ -1747,9 +1847,8 @@ impl GpuBackend for A618Backend {
             return Err("qcom-adreno-a618: image backing does not match its layout plan");
         }
         Ok(Arc::new(A618Image {
-            resource: self.create_resource(
-                backing.paddr,
-                backing.allocation_size,
+            resource: self.create_image_resource(
+                &backing,
                 (if create.usage & (GPU_IMAGE_USAGE_PRESENTABLE | GPU_IMAGE_USAGE_SAMPLED) != 0 {
                     adreno_a6xx_submit_wire::ACCESS_READ
                 } else {
@@ -1768,7 +1867,7 @@ impl GpuBackend for A618Backend {
                 } else {
                     0
                 }),
-                Some(LinearImage {
+                LinearImage {
                     format: if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
                         LinearImageFormat::Depth32Float
                     } else {
@@ -1792,7 +1891,7 @@ impl GpuBackend for A618Backend {
                             .checked_mul(u64::from(create.height))
                             .ok_or("qcom-adreno-a618: image visible size overflows")?
                     },
-                }),
+                },
             )?,
             create,
             layout,
@@ -1895,6 +1994,7 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             &NEXT_BACKEND_COOKIE,
             "qcom-adreno-a618: backend cookie space exhausted",
         )?;
+        let resource_mapping_gate = Arc::new(Mutex::new(()));
         let core = Arc::new(A618Core {
             registers: DwordRegisters::new(register_base),
             register_base,
@@ -1920,6 +2020,7 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
                 lost_reason: None,
                 last_ring_failure: None,
             }),
+            resource_mapping_gate,
             resources: IrqSpinLock::new(Vec::new()),
             next_resource_token: AtomicU64::new(1),
             backend_cookie,
