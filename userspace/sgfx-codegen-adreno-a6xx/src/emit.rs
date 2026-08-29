@@ -793,14 +793,6 @@ impl Emitter {
     }
 
     fn draw_with_retained_fixed_state(&mut self, draw: DrawState) -> Result<(), CompileError> {
-        let link = link_meta(draw.variant);
-        let ShaderMeta::Vertex(vs) = shader_meta(link.vs) else {
-            return Err(CompileError::InvalidPm4);
-        };
-        let ShaderMeta::Fragment(fs) = shader_meta(link.fs) else {
-            return Err(CompileError::InvalidPm4);
-        };
-
         // Keep each draw independently bounded for the production validator.
         // Fixed blend, raster, linkage, and sample state is inherited from the
         // preceding compatible draw, while addresses and dimensions remain
@@ -862,11 +854,11 @@ impl Emitter {
             ],
         )?;
 
-        // The safety validator currently requires immutable shader authority
-        // to be explicit at every draw boundary. These compact address bursts
-        // are retained until the validator grows submission-local state.
-        self.emit_vs_program(vs, link.vs)?;
-        self.emit_fs_program(fs, link.fs)?;
+        // Shader program layout and instruction preloads remain active within
+        // one IB.  Re-emitting four immutable shader relocations for every UI
+        // primitive bloats both the wire authority table and CP work.  The
+        // kernel accepts this omission only for a bounded retained-state delta
+        // following a complete shader segment in this same submission.
         self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms)?;
         self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
 

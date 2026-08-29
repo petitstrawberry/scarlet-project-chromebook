@@ -1252,14 +1252,7 @@ fn relocation_is_shader(
     })
 }
 
-/// Validate the compact delta emitted after one complete canonical draw.
-///
-/// Strict command validation still pins the inherited shader pair exactly,
-/// while allowing only address, bounds, uniforms, texture bindings, and the
-/// synchronization packets that may legitimately vary between compatible
-/// draws. Every packet continues through the production allowlist and range
-/// validator before this check.
-fn segment_matches_retained_pipeline(
+fn segment_shader_relocations_match(
     segment: &SegmentIndex<'_, '_, '_>,
     relocations: &[Relocation],
     variant: PipelineVariant,
@@ -1281,14 +1274,20 @@ fn segment_matches_retained_pipeline(
     let Some(fs_preload) = segment_shader_preload_word(segment, CP_LOAD_STATE6_FRAG, 12) else {
         return false;
     };
-    if !relocation_is_shader(relocations, vs_program, link.vs)
-        || !relocation_is_shader(relocations, vs_preload, link.vs)
-        || !relocation_is_shader(relocations, fs_program, link.fs)
-        || !relocation_is_shader(relocations, fs_preload, link.fs)
-    {
-        return false;
-    }
+    relocation_is_shader(relocations, vs_program, link.vs)
+        && relocation_is_shader(relocations, vs_preload, link.vs)
+        && relocation_is_shader(relocations, fs_program, link.fs)
+        && relocation_is_shader(relocations, fs_preload, link.fs)
+}
 
+/// Validate the compact delta emitted after one complete canonical draw.
+///
+/// No shader-program register or preload is accepted here. Therefore the
+/// exact immutable shader pair validated for the preceding draw remains
+/// active, while only addresses, bounds, constants, texture bindings, and
+/// their required synchronization may vary. Every packet still passes the
+/// production allowlist and relocation-range validator before this check.
+fn segment_matches_retained_pipeline(segment: &SegmentIndex<'_, '_, '_>) -> bool {
     segment.packets.iter().all(|packet| match packet.header {
         Header::Type4 { register, .. } => matches!(
             register,
@@ -1301,15 +1300,29 @@ fn segment_matches_retained_pipeline(
                 | VFD_INDEX_OFFSET
                 | VFD_VERTEX_BUFFER_BASE
                 | VFD_VERTEX_BUFFER_SIZE
-                | SP_VS_PROGRAM_COUNTER_OFFSET
-                | SP_VS_PVT_MEM_STACK_OFFSET
-                | SP_PS_PROGRAM_COUNTER_OFFSET
-                | SP_PS_PVT_MEM_STACK_OFFSET
                 | SP_PS_SAMPLER_BASE
                 | SP_PS_TEXMEMOBJ_BASE
         ),
         Header::Type7 { opcode, .. } => match opcode {
-            CP_LOAD_STATE6_GEOM | CP_LOAD_STATE6_FRAG | CP_MEM_WRITE => true,
+            CP_LOAD_STATE6_GEOM => {
+                packet.payload.len() == 23
+                    && packet.payload[0] == ((1 << 14) | (8 << 18) | (5 << 22))
+                    && packet.payload[1..3] == [0, 0]
+            }
+            CP_LOAD_STATE6_FRAG => {
+                (packet.payload.len() == 23
+                    && packet.payload[0] == ((1 << 14) | (12 << 18) | (5 << 22))
+                    && packet.payload[1..3] == [0, 0])
+                    || (packet.payload.len() == 3
+                        && matches!(
+                            packet.payload[0],
+                            value if value == ((2 << 16) | (4 << 18) | (1 << 22))
+                                || value
+                                    == ((1 << 14) | (2 << 16) | (4 << 18) | (1 << 22))
+                        )
+                        && packet.payload[1..3] == [0, 0])
+            }
+            CP_MEM_WRITE => true,
             opcode::WAIT_FOR_IDLE | opcode::WAIT_MEM_WRITES => true,
             opcode::EVENT_WRITE => packet.payload == [EVENT_CACHE_INVALIDATE],
             _ => false,
@@ -1607,6 +1620,7 @@ fn validate_3d_sequences(
     let mut segment_start = 0usize;
     let mut segment_registers = Vec::new();
     let mut retained_pipeline = None;
+    let mut shader_state_initialized = false;
     for (packet_index, packet) in packets.iter().copied().enumerate() {
         if !matches!(
             packet.header,
@@ -1621,11 +1635,13 @@ fn validate_3d_sequences(
             &packets[segment_start..packet_index],
             &mut segment_registers,
         );
+        let retained_delta = segment_matches_retained_pipeline(&segment);
         if require_canonical_pipeline {
             let mut matched = None;
             for candidate in PipelineVariant::ALL {
                 if segment_may_match_pipeline(&segment, candidate)
                     && segment_matches_pipeline(&segment, candidate)
+                    && segment_shader_relocations_match(&segment, relocations, candidate)
                 {
                     if matched.is_some() {
                         return Err("qcom-adreno-a618: ambiguous canonical 3D pipeline state");
@@ -1635,29 +1651,30 @@ fn validate_3d_sequences(
             }
             match matched {
                 Some(variant) => retained_pipeline = Some(variant),
-                None if retained_pipeline.is_some_and(|variant| {
-                    segment_matches_retained_pipeline(&segment, relocations, variant)
-                }) => {}
+                None if retained_pipeline.is_some() && retained_delta => {}
                 None => {
                     return Err("qcom-adreno-a618: incomplete canonical 3D pipeline state");
                 }
             }
         }
 
-        // The normal submit boundary does not attempt to recompile or bless a
-        // userspace graphics pipeline.  It still requires explicit VS/FS
-        // program state for every draw so a new context cannot inherit stale
-        // shader addresses.  The address-field scanner has already tagged
-        // these slots by stage and the relocation pass below resolves them to
-        // kernel-owned immutable shader objects.
-        segment_shader_program_layout(&segment, SP_VS_PROGRAM_COUNTER_OFFSET)
-            .ok_or("qcom-adreno-a618: vertex shader program layout is missing")?;
-        segment_shader_program_layout(&segment, SP_PS_PROGRAM_COUNTER_OFFSET)
-            .ok_or("qcom-adreno-a618: fragment shader program layout is missing")?;
-        segment_shader_preload_word(&segment, CP_LOAD_STATE6_GEOM, 8)
-            .ok_or("qcom-adreno-a618: vertex shader preload is missing")?;
-        segment_shader_preload_word(&segment, CP_LOAD_STATE6_FRAG, 12)
-            .ok_or("qcom-adreno-a618: fragment shader preload is missing")?;
+        // Shader state may be inherited only inside this one decoded submit,
+        // and only across the restricted retained-state language above. A
+        // partial program/preload update is never accepted.
+        let shader_fields = [
+            segment_shader_program_layout(&segment, SP_VS_PROGRAM_COUNTER_OFFSET).is_some(),
+            segment_shader_program_layout(&segment, SP_PS_PROGRAM_COUNTER_OFFSET).is_some(),
+            segment_shader_preload_word(&segment, CP_LOAD_STATE6_GEOM, 8).is_some(),
+            segment_shader_preload_word(&segment, CP_LOAD_STATE6_FRAG, 12).is_some(),
+        ];
+        if shader_fields.iter().all(|present| *present) {
+            shader_state_initialized = true;
+        } else if !(shader_fields.iter().all(|present| !*present)
+            && shader_state_initialized
+            && retained_delta)
+        {
+            return Err("qcom-adreno-a618: incomplete shader state transition");
+        }
 
         let (pitch_packet, pitch) = segment
             .reg(RB_MRT_PITCH)
@@ -2923,6 +2940,27 @@ mod tests {
         })
         .unwrap();
         assert!(accept_codegen(&artifact).is_ok());
+
+        // A same-stage canonical relocation is not enough in strict mode:
+        // the shader must be the exact program identified by the fixed
+        // pipeline state. This also pins the authority inherited by compact
+        // follow-up draws.
+        let mut wrong_vertex_program = artifact.clone();
+        let vertex_shader = wrong_vertex_program
+            .fixups
+            .iter_mut()
+            .find(|fixup| {
+                matches!(
+                    fixup.object,
+                    ObjectRef::CanonicalShader(
+                        adreno_a6xx_shader_pack::ShaderVariant::VsStride40Pos4Color4
+                    )
+                )
+            })
+            .unwrap();
+        vertex_shader.object =
+            ObjectRef::CanonicalShader(adreno_a6xx_shader_pack::ShaderVariant::VsStride16Pos2);
+        assert!(accept_codegen(&wrong_vertex_program).is_err());
 
         // Keep the crucial A618 sysmem retirement order pinned independently
         // from relocation validation.  The old stream was valid packetized
