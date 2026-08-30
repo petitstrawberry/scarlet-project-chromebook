@@ -1380,6 +1380,9 @@ impl VenusBackend {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
+            // A later backend can be registered while the singleton worker is
+            // blocked indefinitely because every existing backend is idle.
+            VENUS_WORKER_WAKER.wake_one();
             return;
         }
 
@@ -1683,6 +1686,14 @@ fn process_pending_venus_work() -> bool {
     was_woken || made_progress
 }
 
+fn venus_worker_has_inflight_decodes() -> bool {
+    VENUS_WORKER_BACKENDS
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|backend| backend.inflight_decodes.load(Ordering::Acquire) != 0)
+}
+
 fn venus_worker_entry() {
     loop {
         while process_pending_venus_work() {}
@@ -1690,13 +1701,15 @@ fn venus_worker_entry() {
         let Some(task) = scarlet::task::mytask() else {
             scarlet::arch::instruction::idle();
         };
-        // The timeout is a lost-IRQ safety net and drives the bounded
-        // per-session decode deadline. Normal progress remains IRQ-driven.
-        let _ = VENUS_WORKER_WAKER.wait_with_timeout(
-            task.get_id(),
-            task.get_trapframe(),
-            Some(100_000),
-        );
+        // Poll only while a decode is actually in flight: that bounded timeout
+        // is the lost-IRQ safety net and drives the per-session deadline.
+        // With no in-flight work, an unconditional 100 us timeout would wake
+        // this singleton roughly 10,000 times per second forever after the
+        // final session closed. Waker latches an early wake, so the indefinite
+        // idle wait cannot lose a queue or IRQ notification.
+        let timeout_ns = venus_worker_has_inflight_decodes().then_some(100_000);
+        let _ =
+            VENUS_WORKER_WAKER.wait_with_timeout(task.get_id(), task.get_trapframe(), timeout_ns);
     }
 }
 
