@@ -10,7 +10,8 @@ use gpu_raw::{
     GPU_BUFFER_FLAG_CPU_VISIBLE, GPU_IMAGE_FORMAT_BGRA8_UNORM, GPU_IMAGE_FORMAT_DEPTH32_FLOAT,
     GPU_IMAGE_MODIFIER_LINEAR, GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT,
     GPU_IMAGE_USAGE_PRESENTABLE, GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED,
-    GPU_IMAGE_USAGE_TRANSFER_DST, GpuBuffer, GpuImage, GpuImageLayout,
+    GPU_IMAGE_USAGE_TRANSFER_DST, GPU_IMAGE_USAGE_TRANSFER_SRC, GpuBuffer, GpuImage,
+    GpuImageLayout,
 };
 #[cfg(feature = "std")]
 use scarlet_os::handle::capability::memory_mapping::{MemoryMappingOps, flags, prot};
@@ -37,8 +38,10 @@ impl RawImage {
         if width == 0 || height == 0 {
             return Err(HandleError::InvalidParameter);
         }
-        let usage =
-            GPU_IMAGE_USAGE_RENDER_TARGET | GPU_IMAGE_USAGE_PRESENTABLE | GPU_IMAGE_USAGE_SAMPLED;
+        let usage = GPU_IMAGE_USAGE_RENDER_TARGET
+            | GPU_IMAGE_USAGE_PRESENTABLE
+            | GPU_IMAGE_USAGE_SAMPLED
+            | GPU_IMAGE_USAGE_TRANSFER_SRC;
         let raw = context.device.gpu.create_image_with_format_and_usage(
             GPU_IMAGE_FORMAT_BGRA8_UNORM,
             width,
@@ -111,6 +114,10 @@ impl RawImage {
 
     pub(crate) fn allocation_size(&self) -> u64 {
         self.layout.total_size
+    }
+
+    pub(crate) fn belongs_to(&self, context: &ContextInner) -> bool {
+        self.context_id == context.raw.as_handle().as_raw()
     }
 }
 
@@ -475,7 +482,7 @@ fn image_create_parameters(descriptor: ir::TextureDesc) -> HandleResult<(u32, u3
             usage |= GPU_IMAGE_USAGE_RENDER_TARGET;
         }
         if descriptor.usage().contains(ir::TextureUsage::PRESENT) {
-            usage |= GPU_IMAGE_USAGE_PRESENTABLE;
+            usage |= GPU_IMAGE_USAGE_PRESENTABLE | GPU_IMAGE_USAGE_TRANSFER_SRC;
         }
         if descriptor.usage().contains(ir::TextureUsage::SAMPLED)
             || descriptor.usage().contains(ir::TextureUsage::COPY_SRC)

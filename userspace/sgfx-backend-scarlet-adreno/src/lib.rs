@@ -14,9 +14,10 @@ extern crate scarlet_std as std;
 use alloc::{rc::Rc, vec::Vec};
 
 use gpu_raw::{
-    GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD, GPU_EXECUTION_SUPPORT_MEMORY,
-    GPU_EXECUTION_SUPPORT_PRESENTATION, GPU_EXECUTION_SUPPORT_QUEUE, GPU_RESULT_SUCCESS, Gpu,
-    GpuQueryInfo,
+    GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
+    GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD, GPU_EXECUTION_SUPPORT_MEMORY,
+    GPU_EXECUTION_SUPPORT_PRESENTATION, GPU_EXECUTION_SUPPORT_QUEUE, GPU_MAX_IMAGE_UPLOAD_SIZE,
+    GPU_RESULT_SUCCESS, Gpu, GpuImageBgraRect, GpuQueryInfo,
 };
 #[cfg(feature = "std")]
 pub use scarlet_os::handle::{Handle, HandleError, HandleResult};
@@ -69,10 +70,21 @@ pub struct Capabilities {
     rendering: bool,
     presentation: bool,
     image_upload: bool,
+    image_readback: bool,
     depth: bool,
 }
 
 impl Capabilities {
+    const fn from_execution_support(execution_support: u32) -> Self {
+        Self {
+            rendering: true,
+            presentation: execution_support & GPU_EXECUTION_SUPPORT_PRESENTATION != 0,
+            image_upload: execution_support & GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD != 0,
+            image_readback: execution_support & GPU_EXECUTION_SUPPORT_IMAGE_READBACK != 0,
+            depth: true,
+        }
+    }
+
     /// Return whether command execution is available.
     pub const fn supports_rendering(&self) -> bool {
         self.rendering
@@ -86,6 +98,11 @@ impl Capabilities {
     /// Return whether texture upload is available.
     pub const fn supports_image_upload(&self) -> bool {
         self.image_upload
+    }
+
+    /// Return whether rendered BGRA images can be read back synchronously.
+    pub const fn supports_image_readback(&self) -> bool {
+        self.image_readback
     }
 
     /// Return whether depth attachments are available.
@@ -150,12 +167,7 @@ impl Device {
             return Err(HandleError::Unsupported);
         }
 
-        let capabilities = Capabilities {
-            rendering: true,
-            presentation: info.execution_support & GPU_EXECUTION_SUPPORT_PRESENTATION != 0,
-            image_upload: info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD != 0,
-            depth: true,
-        };
+        let capabilities = Capabilities::from_execution_support(info.execution_support);
         let transport_bytes = usize::try_from(info.max_opaque_command_size)
             .unwrap_or(adreno_a6xx_submit_wire::MAX_SUBMIT_SIZE)
             .min(adreno_a6xx_submit_wire::MAX_SUBMIT_SIZE);
@@ -309,6 +321,101 @@ impl Context {
             height,
         })
     }
+
+    /// Read one render-target rectangle into a complete BGRA destination buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - Render-target image created by this context.
+    /// * `destination` - Complete writable BGRA destination buffer.
+    /// * `destination_stride` - Bytes between destination rows.
+    /// * `rect` - Source image rectangle written at identical destination coordinates.
+    ///
+    /// # Returns
+    ///
+    /// Success after synchronous GPU readback, or a handle error.
+    pub fn readback_image_bgra(
+        &self,
+        image: &Image,
+        destination: &mut [u8],
+        destination_stride: u32,
+        rect: ir::PixelRect,
+    ) -> HandleResult<()> {
+        if !image.raw.belongs_to(&self.inner)
+            || !self.inner.device.capabilities.supports_image_readback()
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+        validate_readback_destination(
+            image.width,
+            image.height,
+            destination.len(),
+            destination_stride,
+            rect,
+        )?;
+
+        let row_bytes = rect
+            .width()
+            .checked_mul(4)
+            .ok_or(HandleError::InvalidParameter)?;
+        let max_rows = max_readback_rows(row_bytes)?;
+        let mut y = rect.y();
+        let mut remaining = rect.height();
+        while remaining != 0 {
+            let height = remaining.min(max_rows);
+            self.inner.raw.readback_image_bgra(
+                &image.raw.raw,
+                destination,
+                destination_stride,
+                GpuImageBgraRect::new(rect.x(), y, rect.width(), height),
+            )?;
+            y = y.checked_add(height).ok_or(HandleError::InvalidParameter)?;
+            remaining -= height;
+        }
+        Ok(())
+    }
+}
+
+fn max_readback_rows(row_bytes: u32) -> HandleResult<u32> {
+    GPU_MAX_IMAGE_UPLOAD_SIZE
+        .checked_div(row_bytes)
+        .filter(|rows| *rows != 0)
+        .ok_or(HandleError::InvalidParameter)
+}
+
+fn validate_readback_destination(
+    image_width: u32,
+    image_height: u32,
+    destination_length: usize,
+    destination_stride: u32,
+    rect: ir::PixelRect,
+) -> HandleResult<()> {
+    let x_end = rect
+        .x()
+        .checked_add(rect.width())
+        .ok_or(HandleError::InvalidParameter)?;
+    let y_end = rect
+        .y()
+        .checked_add(rect.height())
+        .ok_or(HandleError::InvalidParameter)?;
+    if x_end > image_width || y_end > image_height {
+        return Err(HandleError::InvalidParameter);
+    }
+
+    let destination_row_end = x_end.checked_mul(4).ok_or(HandleError::InvalidParameter)?;
+    if destination_stride < destination_row_end {
+        return Err(HandleError::InvalidParameter);
+    }
+    let destination_end = u64::from(y_end - 1)
+        .checked_mul(u64::from(destination_stride))
+        .and_then(|offset| offset.checked_add(u64::from(destination_row_end)))
+        .ok_or(HandleError::InvalidParameter)?;
+    let destination_length =
+        u64::try_from(destination_length).map_err(|_| HandleError::InvalidParameter)?;
+    if destination_end > destination_length {
+        return Err(HandleError::InvalidParameter);
+    }
+    Ok(())
 }
 
 /// Failure while materializing or submitting a logical SGFX command buffer.
@@ -413,6 +520,31 @@ impl MappedTargetSession {
             .ok_or(IrSubmitError::ImageNotMapped)
     }
 
+    /// Read one mapped presentation-image rectangle into a BGRA buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `target` - Logical presentation texture identity.
+    /// * `destination` - Complete writable BGRA destination buffer.
+    /// * `destination_stride` - Bytes between destination rows.
+    /// * `rect` - Source target rectangle written at identical destination coordinates.
+    ///
+    /// # Returns
+    ///
+    /// Success after synchronous GPU readback, or an execution error.
+    pub fn readback_bgra(
+        &self,
+        target: ir::TextureId,
+        destination: &mut [u8],
+        destination_stride: u32,
+        rect: ir::PixelRect,
+    ) -> Result<(), IrSubmitError> {
+        let image = self.image(target)?;
+        self.context
+            .readback_image_bgra(image, destination, destination_stride, rect)?;
+        Ok(())
+    }
+
     /// Bind this session's queue and resource cache for command execution.
     pub fn executor(&mut self) -> Executor<'_> {
         Executor {
@@ -480,11 +612,14 @@ impl sgfx_core::backend::CommandExecutor for Executor<'_> {
 #[cfg(test)]
 mod tests {
     use gpu_raw::{
-        GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_MEMORY, GPU_EXECUTION_SUPPORT_QUEUE,
-        GPU_RESULT_SUCCESS, GpuQueryInfo,
+        GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_IMAGE_READBACK, GPU_EXECUTION_SUPPORT_MEMORY,
+        GPU_EXECUTION_SUPPORT_QUEUE, GPU_MAX_IMAGE_UPLOAD_SIZE, GPU_RESULT_SUCCESS, GpuQueryInfo,
     };
 
-    use super::{BACKEND_ID, DIALECT_ID, Device, matches_backend_id, matches_dialect};
+    use super::{
+        BACKEND_ID, Capabilities, DIALECT_ID, Device, HandleError, matches_backend_id,
+        matches_dialect, max_readback_rows, validate_readback_destination,
+    };
 
     #[test]
     fn backend_id_match_is_exact() {
@@ -520,5 +655,49 @@ mod tests {
         info.backend_id_len -= 1;
         info.execution_support &= !GPU_EXECUTION_SUPPORT_MEMORY;
         assert!(!Device::supports(&info));
+    }
+
+    #[test]
+    fn capabilities_report_only_advertised_image_readback() {
+        assert!(
+            !Capabilities::from_execution_support(0).supports_image_readback(),
+            "readback must not be inferred from rendering support"
+        );
+        assert!(
+            Capabilities::from_execution_support(GPU_EXECUTION_SUPPORT_IMAGE_READBACK)
+                .supports_image_readback()
+        );
+    }
+
+    #[test]
+    fn readback_chunk_rows_respect_the_abi_payload_limit() {
+        assert_eq!(max_readback_rows(4), Ok(GPU_MAX_IMAGE_UPLOAD_SIZE / 4));
+        assert_eq!(
+            max_readback_rows(GPU_MAX_IMAGE_UPLOAD_SIZE + 4),
+            Err(HandleError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn readback_destination_uses_identical_rectangle_coordinates() {
+        let rect = super::ir::PixelRect::new(2, 1, 3, 2).unwrap();
+        assert_eq!(validate_readback_destination(8, 4, 84, 32, rect), Ok(()));
+        assert_eq!(
+            validate_readback_destination(8, 4, 83, 32, rect),
+            Err(HandleError::InvalidParameter)
+        );
+        assert_eq!(
+            validate_readback_destination(8, 4, 80, 19, rect),
+            Err(HandleError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn readback_destination_rejects_rectangles_outside_the_image() {
+        let rect = super::ir::PixelRect::new(7, 0, 2, 1).unwrap();
+        assert_eq!(
+            validate_readback_destination(8, 4, 36, 36, rect),
+            Err(HandleError::InvalidParameter)
+        );
     }
 }

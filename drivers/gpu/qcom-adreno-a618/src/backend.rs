@@ -10,18 +10,19 @@ use scarlet::{
     device::{
         events::InterruptCapableDevice,
         gpu::{
-            GPU_EXECUTION_SUPPORT_ADDRESS_SPACE, GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD,
-            GPU_EXECUTION_SUPPORT_MEMORY, GPU_EXECUTION_SUPPORT_PRESENTATION,
-            GPU_EXECUTION_SUPPORT_QUEUE, GPU_EXECUTION_SUPPORT_TIMELINE,
-            GPU_IMAGE_FORMAT_BGRA8_UNORM, GPU_IMAGE_FORMAT_DEPTH32_FLOAT,
-            GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT, GPU_IMAGE_USAGE_PRESENTABLE,
-            GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED, GPU_IMAGE_USAGE_TRANSFER_DST,
-            GpuBackend, GpuBackendBuffer, GpuBackendBufferInfo, GpuBackendContext,
-            GpuBackendContextInfo, GpuBackendDialectDescriptor, GpuBackendDialectInfo,
-            GpuBackendImage, GpuBackendImageInfo, GpuBackendImageLayout,
-            GpuBackendImagePlaneLayout, GpuBackendLinearDisplayInfo, GpuBackendQueue,
-            GpuBackendQueueInfo, GpuBackendSubmitError, GpuBufferCreateInfo, GpuDeviceInfo,
-            GpuDeviceState, GpuImageBackingInfo, GpuImageCreateInfo, GpuImageUploadInfo,
+            GPU_EXECUTION_SUPPORT_ADDRESS_SPACE, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
+            GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD, GPU_EXECUTION_SUPPORT_MEMORY,
+            GPU_EXECUTION_SUPPORT_PRESENTATION, GPU_EXECUTION_SUPPORT_QUEUE,
+            GPU_EXECUTION_SUPPORT_TIMELINE, GPU_IMAGE_FORMAT_BGRA8_UNORM,
+            GPU_IMAGE_FORMAT_DEPTH32_FLOAT, GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT,
+            GPU_IMAGE_USAGE_PRESENTABLE, GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED,
+            GPU_IMAGE_USAGE_TRANSFER_DST, GPU_IMAGE_USAGE_TRANSFER_SRC, GpuBackend,
+            GpuBackendBuffer, GpuBackendBufferInfo, GpuBackendContext, GpuBackendContextInfo,
+            GpuBackendDialectDescriptor, GpuBackendDialectInfo, GpuBackendImage,
+            GpuBackendImageInfo, GpuBackendImageLayout, GpuBackendImagePlaneLayout,
+            GpuBackendLinearDisplayInfo, GpuBackendQueue, GpuBackendQueueInfo,
+            GpuBackendSubmitError, GpuBufferCreateInfo, GpuDeviceInfo, GpuDeviceState,
+            GpuImageBackingInfo, GpuImageCreateInfo, GpuImageUploadInfo,
             register_gpu_control_device,
         },
         graphics::{GpuDisplayResource, PixelFormat},
@@ -1539,6 +1540,30 @@ impl GpuBackendContext for A618Context {
         Ok(())
     }
 
+    fn readback_image_bgra(
+        &self,
+        image: &dyn GpuBackendImage,
+        _readback: GpuImageUploadInfo,
+    ) -> Result<(), &'static str> {
+        // Queue submission and readback share this gate. A successful submit
+        // has already completed its CACHE_FLUSH_TS fence, so a linear sysmem
+        // render target is the final backing and needs no extra GPU blit.
+        let _execution = self.inner.execution.lock();
+        if image.backend_cookie() != self.inner.core.backend_cookie {
+            return Err("qcom-adreno-a618: image belongs to another backend");
+        }
+        let info = image.query_info();
+        if info.format != GPU_IMAGE_FORMAT_BGRA8_UNORM
+            || info.usage & GPU_IMAGE_USAGE_TRANSFER_SRC == 0
+        {
+            return Err("qcom-adreno-a618: image does not support BGRA readback");
+        }
+        // Order the completed GPU fence before the generic GPU layer
+        // invalidates the requested backing rows and copies them to userspace.
+        arch::io_rmb();
+        Ok(())
+    }
+
     fn attach_buffer(&self, buffer: &dyn GpuBackendBuffer) -> Result<u64, &'static str> {
         let _execution = self.inner.execution.lock();
         self.validate_resource(
@@ -1732,6 +1757,7 @@ impl GpuBackend for A618Backend {
                         | GPU_EXECUTION_SUPPORT_TIMELINE
                         | GPU_EXECUTION_SUPPORT_PRESENTATION
                         | GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD
+                        | GPU_EXECUTION_SUPPORT_IMAGE_READBACK
                 } else {
                     0
                 },
