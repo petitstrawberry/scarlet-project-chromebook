@@ -27,11 +27,15 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-sc7180-rpmhcc" = { path = "../../drivers/clk/qcom-sc7180-rpmhcc", enabled = true }
 "scarlet-driver-qcom-sc7180-cpufreq-hw" = { path = "../../drivers/cpufreq/qcom-sc7180-hw", enabled = true }
 "scarlet-driver-qcom-sc7180-rpmhpd" = { path = "../../drivers/pmdomain/qcom-sc7180-rpmhpd", enabled = true }
+"scarlet-driver-qcom-sc7180-lpasscc" = { path = "../../drivers/clk/qcom-sc7180-lpasscc", enabled = true }
 "scarlet-driver-qcom-sc7180-interconnect" = { path = "../../drivers/interconnect/qcom-sc7180", enabled = true }
 "scarlet-driver-qcom-sc7180-gpucc" = { path = "../../drivers/clk/qcom-sc7180-gpucc", enabled = true }
 "scarlet-driver-qcom-adreno-a618" = { path = "../../drivers/gpu/qcom-adreno-a618", enabled = true }
 "scarlet-driver-qcom-sc7180-videocc" = { path = "../../drivers/clk/qcom-sc7180-videocc", enabled = true }
 "scarlet-driver-qcom-venus-sc7180" = { path = "../../drivers/video/qcom-venus-sc7180", enabled = true }
+"scarlet-driver-max98360a" = { path = "../../drivers/audio/codecs/max98360a", enabled = true }
+"scarlet-driver-qcom-sc7180-lpass" = { path = "../../drivers/audio/qcom-sc7180-lpass", enabled = true }
+"scarlet-driver-google-sc7180-trogdor-audio" = { path = "../../drivers/audio/google-sc7180-trogdor", enabled = true }
 "scarlet-driver-qcom-sc7180-dispcc" = { path = "../../drivers/clk/qcom-sc7180-dispcc", enabled = true }
 "scarlet-driver-qcom-sc7180-qfprom" = { path = "../../drivers/nvmem/qcom-sc7180-qfprom", enabled = true }
 "scarlet-driver-qcom-qusb2-v2" = { path = "../../drivers/phy/qcom-qusb2-v2", enabled = true }
