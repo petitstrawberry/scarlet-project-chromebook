@@ -58,7 +58,7 @@ CARGO_TARGET_DIR="$target_dir" cargo build \
     --target aarch64-unknown-scarlet \
     --release \
     -p userprogram \
-    --bin sgfx_probe \
+    --bin sgfx-probe \
     --bin taskbar \
     --bin terminal \
     --bin ui-demo \
@@ -79,7 +79,7 @@ CARGO_TARGET_DIR="$target_dir" cargo build \
     --target aarch64-unknown-scarlet \
     --release \
     -p video_player \
-    --bin video_player \
+    --bin video-player \
     --no-default-features \
     --features av1-stateful-hw,h264-stateful-hw,h264-stateless-hw,mp4-aac
 
@@ -99,11 +99,11 @@ CARGO_TARGET_DIR="$target_dir" cargo build \
     --bin files \
     --bin launcher \
     --bin notepad \
-    --bin task_manager \
+    --bin task-manager \
     --bin ui-sgfx-showcase \
-    --bin sgfx_cube \
-    --bin sgfx_texture \
-    --bin sgfx_showcase
+    --bin sgfx-cube \
+    --bin sgfx-texture \
+    --bin sgfx-showcase
 
 # The desktop bundle carries the portable Git build of Boxcraft.  When its
 # sibling checkout is available, replace that binary with one resolved against
@@ -131,9 +131,9 @@ else
 fi
 
 for binary in \
-    sgfx_probe taskbar terminal ui-demo ui-benchmark settings video_player \
-    sws clock files launcher notepad task_manager ui-sgfx-showcase \
-    sgfx_cube sgfx_texture sgfx_showcase
+    sgfx-probe taskbar terminal ui-demo ui-benchmark settings video-player \
+    sws clock files launcher notepad task-manager ui-sgfx-showcase \
+    sgfx-cube sgfx-texture sgfx-showcase
 do
     source_path="$target_bins/$binary"
     if [ ! -x "$source_path" ]; then
