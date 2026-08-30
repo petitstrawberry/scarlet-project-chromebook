@@ -2,7 +2,7 @@
 
 #![no_std]
 
-//! SC7180 GCC bootstrap and the clock/reset subset used by display, USB, and
+//! SC7180 GCC bootstrap and the clock/reset subset used by display, USB, LPASS,
 //! the CoachZ trackpad I2C serial engine, and CPU frequency hardware.
 //!
 //! The driver deliberately covers only the GCC resources consumed by Scarlet's
@@ -60,6 +60,20 @@ const GCC_USB3_PRIM_PHY_COM_AUX_CLK: u32 = 117;
 const GCC_USB3_PRIM_PHY_PIPE_CLK: u32 = 118;
 const GCC_USB_PHY_CFG_AHB2PHY_CLK: u32 = 119;
 const GCC_QUPV3_WRAP1_S1_CLK: u32 = 74;
+const GCC_LPASS_CFG_NOC_SWAY_CLK: u32 = 131;
+
+const LPASS_CFG_CLOCK: SimpleClockDescriptor = SimpleClockDescriptor {
+    id: GCC_LPASS_CFG_NOC_SWAY_CLK,
+    name: "gcc_lpass_cfg_noc_sway_clk",
+    register: 0x47018,
+    enable_mask: 1,
+    rate: 19_200_000,
+    // Linux uses BRANCH_HALT_DELAY for this branch. The enable bit is the
+    // authoritative state and the LPASS consumers perform their first MMIO
+    // access only after the clock handle has been prepared.
+    halt_check: false,
+    always_on: false,
+};
 
 const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
     SimpleClockDescriptor {
@@ -498,6 +512,7 @@ struct Sc7180GccProvider {
     gpll0_out_main: ClkHandle,
     clocks: [ClkHandle; USB_CLOCKS.len()],
     trackpad_i2c_clock: ClkHandle,
+    lpass_cfg_clock: ClkHandle,
     gpu_clocks: [ClkHandle; GPU_CLOCKS.len()],
 }
 
@@ -514,6 +529,10 @@ impl Sc7180GccProvider {
             }))
         });
         let trackpad_i2c_clock = ClkHandle::new(Arc::new(Sc7180QupSerialClock { registers }));
+        let lpass_cfg_clock = ClkHandle::new(Arc::new(Sc7180GccSimpleClock {
+            registers,
+            descriptor: LPASS_CFG_CLOCK,
+        }));
         let gpu_clocks = core::array::from_fn(|index| {
             ClkHandle::new(Arc::new(Sc7180GccSimpleClock {
                 registers,
@@ -524,6 +543,7 @@ impl Sc7180GccProvider {
             gpll0_out_main: ClkHandle::new(Arc::new(Sc7180Gpll0MainClock)),
             clocks,
             trackpad_i2c_clock,
+            lpass_cfg_clock,
             gpu_clocks,
         }
     }
@@ -689,6 +709,9 @@ impl ClkProvider for Sc7180GccProvider {
         }
         if *id == GCC_QUPV3_WRAP1_S1_CLK {
             return Ok(self.trackpad_i2c_clock.clone());
+        }
+        if *id == GCC_LPASS_CFG_NOC_SWAY_CLK {
+            return Ok(self.lpass_cfg_clock.clone());
         }
         if let Some(index) = GPU_CLOCKS.iter().position(|clock| clock.id == *id) {
             return Ok(self.gpu_clocks[index].clone());
@@ -925,6 +948,12 @@ mod tests {
         assert_eq!(GCC_QUPV3_WRAP1_S1_CMD_RCGR, 0x18148);
         assert_eq!(GCC_QUPV3_WRAP1_S1_HALT, 0x18144);
         assert_eq!(GCC_QUPV3_WRAP1_S1_VOTE, 1 << 23);
+    }
+
+    #[test]
+    fn lpass_cfg_clock_matches_sc7180_binding() {
+        assert_eq!(GCC_LPASS_CFG_NOC_SWAY_CLK, 131);
+        assert_eq!(LPASS_CFG_CLOCK.register, 0x47018);
     }
 
     #[test]
