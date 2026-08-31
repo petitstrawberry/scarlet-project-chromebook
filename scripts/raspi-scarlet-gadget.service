@@ -1,5 +1,5 @@
 [Unit]
-Description=Scarlet RAM-backed USB storage gadget
+Description=Scarlet RAM-backed USB composite gadget (storage + CDC-NCM)
 After=local-fs.target
 ConditionPathIsDirectory=/sys/kernel/config
 

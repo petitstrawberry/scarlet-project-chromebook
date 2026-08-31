@@ -7,6 +7,7 @@ if [[ -r "$config_env" ]]; then
 fi
 
 gadget_command="${SCARLET_GADGET_COMMAND:-/usr/local/sbin/scarlet-gadget}"
+network_command="${SCARLET_NCM_COMMAND:-/usr/local/sbin/scarlet-ncm}"
 runtime_dir="${SCARLET_RUNTIME_DIR:-/run/scarlet}"
 current_image="${SCARLET_CURRENT_IMAGE:-$runtime_dir/current.img}"
 
@@ -40,6 +41,10 @@ key_after() {
 
 status() {
   "$gadget_command" status
+  if [[ -x "$network_command" ]]; then
+    echo '--- ncm gateway ---'
+    "$network_command" status || true
+  fi
   if [[ -f "$current_image" ]]; then
     printf 'image_size=%s\n' "$(stat -c '%s' "$current_image")"
     printf 'image_sha256=%s\n' "$(sha256sum "$current_image" | awk '{print $1}')"

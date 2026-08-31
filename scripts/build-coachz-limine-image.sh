@@ -7,15 +7,45 @@ profile_flag="--release"
 profile_dir="release"
 staging_dir="$project_dir/.scarlet/staging"
 stamp_dir="$project_dir/.scarlet/image-stamps"
+local_scarlet_ui_root="${SCARLET_UI_ROOT:-}"
 
-if [[ "${1:-}" == "--debug" ]]; then
-  profile_flag=""
-  profile_dir="debug"
-  shift
-fi
-if [[ $# -ne 0 ]]; then
-  echo "usage: $0 [--debug]" >&2
-  exit 2
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debug)
+      profile_flag=""
+      profile_dir="debug"
+      shift
+      ;;
+    --local-scarlet-ui)
+      [[ $# -ge 2 && -n "$2" ]] || {
+        echo "--local-scarlet-ui requires a checkout path" >&2
+        exit 2
+      }
+      local_scarlet_ui_root="$2"
+      shift 2
+      ;;
+    --release-sources)
+      local_scarlet_ui_root=""
+      shift
+      ;;
+    *)
+      echo "usage: $0 [--debug] [--local-scarlet-ui PATH | --release-sources]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "$local_scarlet_ui_root" ]]; then
+  [[ -f "$local_scarlet_ui_root/Cargo.toml" ]] || {
+    echo "not a ScarletUI checkout: $local_scarlet_ui_root" >&2
+    exit 1
+  }
+  SCARLET_UI_ROOT="$(cd "$local_scarlet_ui_root" && pwd)"
+  export SCARLET_UI_ROOT
+  echo "CoachZ source mode: development ScarletUI at $SCARLET_UI_ROOT" >&2
+else
+  unset SCARLET_UI_ROOT
+  echo "CoachZ source mode: release (lock-pinned ScarletUI)" >&2
 fi
 
 # cargo-scarlet leaves this generated tree behind when an image build fails.
@@ -58,9 +88,9 @@ if [[ "$image_kernel_hash" != "$kernel_hash" ]]; then
 fi
 
 for binary in \
-  sgfx_probe taskbar terminal ui-demo ui-benchmark settings \
-  sws clock files launcher notepad task_manager ui-sgfx-showcase \
-  sgfx_cube sgfx_texture sgfx_showcase boxcraft
+  sgfx-probe taskbar terminal ui-demo ui-benchmark settings \
+  sws clock files launcher notepad task-manager ui-sgfx-showcase \
+  sgfx-cube sgfx-texture sgfx-showcase boxcraft
 do
   staged_binary="$staging_dir/rootfs/system/scarlet/bin/$binary"
   staged_hash=$(shasum -a 256 "$staged_binary" | awk '{print $1}')

@@ -12,6 +12,8 @@ files=(
   raspi-scarlet-gadget.sh
   raspi-scarlet-gadget.service
   raspi-scarlet-gadget.env
+  raspi-scarlet-ncm.sh
+  raspi-scarlet-ncm.service
   raspi-scarlet-controller.sh
 )
 
@@ -23,6 +25,14 @@ for file in "${files[@]}"; do
 done
 
 remote_tmp_dir=$(ssh "${ssh_opts[@]}" "$remote" 'mktemp -d /tmp/scarlet-install.XXXXXX')
+restart_gadget="${SCARLET_RPI_RESTART_GADGET:-1}"
+case "$restart_gadget" in
+  0|1) ;;
+  *)
+    echo "install-raspi-scarlet: SCARLET_RPI_RESTART_GADGET must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
 cleanup() {
   ssh "${ssh_opts[@]}" "$remote" "rm -rf -- '$remote_tmp_dir'" >/dev/null 2>&1 || true
 }
@@ -36,11 +46,24 @@ ssh "${ssh_opts[@]}" "$remote" "
   sudo install -d -m 0755 /usr/local/sbin /etc/default
   sudo install -m 0755 '$remote_tmp_dir/raspi-scarlet-gadget.sh' /usr/local/sbin/scarlet-gadget
   sudo install -m 0755 '$remote_tmp_dir/raspi-scarlet-controller.sh' /usr/local/sbin/scarlet-controller
+  sudo install -m 0755 '$remote_tmp_dir/raspi-scarlet-ncm.sh' /usr/local/sbin/scarlet-ncm
   sudo install -m 0644 '$remote_tmp_dir/raspi-scarlet-gadget.service' /etc/systemd/system/scarlet-gadget.service
+  sudo install -m 0644 '$remote_tmp_dir/raspi-scarlet-ncm.service' /etc/systemd/system/scarlet-ncm.service
   sudo install -m 0644 '$remote_tmp_dir/raspi-scarlet-gadget.env' /etc/default/scarlet-gadget
+  if [[ ! -x /usr/sbin/dnsmasq || ! -x /usr/sbin/nft ]]; then
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends dnsmasq-base nftables
+  fi
   sudo systemctl daemon-reload
-  sudo systemctl enable scarlet-gadget.service
-  sudo systemctl restart scarlet-gadget.service
+  sudo systemctl enable scarlet-gadget.service scarlet-ncm.service
+  if [[ '$restart_gadget' == 1 ]]; then
+    sudo systemctl restart scarlet-gadget.service
+  fi
+  sudo systemctl restart scarlet-ncm.service
 "
 
-echo "Raspberry Pi Scarlet gadget/controller installed and restarted."
+if [[ "$restart_gadget" == 1 ]]; then
+  echo "Raspberry Pi Scarlet gadget/controller/NCM gateway installed and restarted."
+else
+  echo "Raspberry Pi Scarlet controller/NCM gateway installed; existing gadget left attached."
+fi

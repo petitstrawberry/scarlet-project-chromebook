@@ -33,7 +33,7 @@ Working on CoachZ rev3:
 Still under development:
 
 - framebuffer and display output
-- Scarlet-side SC7180 USB host and USB mass-storage support
+- Scarlet-side SC7180 USB host, USB mass-storage, and CDC-NCM support
 - persistent USB root filesystem
 - SD/eMMC support
 - onboard networking and GPU support
@@ -179,6 +179,18 @@ From the Nix development shell:
 ./scripts/build-coachz-limine-image.sh
 ```
 
+By default this uses the lock-pinned ScarletUI source and does not look for a
+sibling checkout. To test an in-development ScarletUI tree, opt in with its
+actual location:
+
+```sh
+./scripts/build-coachz-limine-image.sh --local-scarlet-ui /path/to/scarlet-ui
+```
+
+`SCARLET_UI_ROOT=/path/to/scarlet-ui` provides the same development override.
+Use `--release-sources` to ignore that environment variable and force the
+lock-pinned source.
+
 The release images are written under:
 
 ```text
@@ -305,8 +317,12 @@ bootflow scan -a
 
 ## Raspberry Pi USB controller
 
-The optional Raspberry Pi 5 helper presents the Scarlet image as a mass-storage
-USB device. Keyboard input is injected through the Chromebook EC over CCD.
+The optional Raspberry Pi 5 helper presents the Scarlet image as a composite
+USB gadget. Its default function set is `mass_storage,ncm`: Scarlet's standard
+CDC-NCM host driver registers the network interface as `usbnet0`, while the
+image remains a normal `/dev/usbblk0` mass-storage device. Keyboard input is
+injected through the Chromebook EC over CCD, so the Pi-side HID function stays
+off by default.
 
 Install or refresh the Pi-side gadget and SSH controller:
 
@@ -315,6 +331,52 @@ Install or refresh the Pi-side gadget and SSH controller:
 ./scripts/deploy-scarlet-to-raspi.sh
 ./scripts/raspi-scarlet-control.sh status
 ```
+
+The Pi-side configuration lives in `scripts/raspi-scarlet-gadget.env`:
+
+```sh
+SCARLET_GADGET_FUNCTIONS=mass_storage,ncm
+SCARLET_NCM_PI_ADDRESS=192.168.88.1/30
+```
+
+The Pi configures `usb0` as `192.168.88.1/30` and the companion
+`scarlet-ncm.service` advertises `192.168.88.2` over DHCP. The CoachZ image
+contains an exact `netcfgd` entry for `usbnet0`, so it installs the Pi as the
+default gateway. IPv4 forwarding and an nftables masquerade route the USB
+subnet through the Pi's `eth0` (`192.168.77.2`); change
+`SCARLET_NCM_UPLINK_IFNAME` when the upstream link is different. DHCP does not
+advertise a DNS server by default because this development LAN currently has
+no default route; set `SCARLET_NCM_DHCP_DNS` to a comma-separated list when the
+upstream can reach one. Set `SCARLET_NCM_CONFIGURE_NETWORK=0` when another
+network manager should own `usb0`, or set `SCARLET_NCM_ENABLE_NAT=0` when the
+upstream router provides a route instead. Future functions can be enabled by
+appending their registry name (for example `mass_storage,ncm,hid`);
+unsupported or duplicate names fail before the gadget is rebound.
+
+The Pi's direct Ethernet profile uses `192.168.77.1` as its upstream gateway,
+so the route survives NetworkManager restarts. The Mac must also have IP
+forwarding/Internet Sharing enabled if traffic should continue past that
+direct link; Pi-side NAT alone cannot make a Mac forward packets while
+`net.inet.ip.forwarding` is disabled.
+
+For a temporary development session, the repository helper loads only a
+volatile PF anchor (it does not edit `/etc/pf.conf`):
+
+```sh
+sudo ./scripts/mac-scarlet-routing.sh enable
+sudo ./scripts/mac-scarlet-routing.sh disable
+```
+
+When updating the Pi while Scarlet is already booted, leave the active USB
+image attached with:
+
+```sh
+SCARLET_RPI_RESTART_GADGET=0 ./scripts/install-raspi-scarlet.sh
+```
+
+This refreshes the DHCP/routing service without interrupting the running
+mass-storage session. The normal installer restart is still useful after a
+Pi reboot or when switching the image composition.
 
 Run the reset and alternate-firmware shortcut as one sequence:
 
@@ -329,8 +391,9 @@ The default sequence sends `apreset` over the Mac's CCD EC console, waits
 
 The current reset path can remain on the Mac's CCD connection. A later
 controller backend can move EC/AP reset to a CCD connection on the Pi without
-changing the storage interface. The image is intentionally kept under
-`/run/scarlet` (tmpfs), so a Pi reboot requires another image deployment.
+changing the storage/network function registry. The image is intentionally
+kept under `/run/scarlet` (tmpfs), so a Pi reboot requires another image
+deployment.
 
 ## Repository layout
 

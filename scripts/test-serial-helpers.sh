@@ -17,10 +17,13 @@ expect_failure() {
 /bin/sh -n "$script_dir/fetch-chromiumos-ec.sh"
 /bin/sh -n "$script_dir/ec-usb-console.sh"
 bash -n "$script_dir/raspi-scarlet-gadget.sh"
+bash -n "$script_dir/raspi-scarlet-ncm.sh"
+bash -n "$script_dir/mac-scarlet-routing.sh"
 bash -n "$script_dir/raspi-scarlet-controller.sh"
 bash -n "$script_dir/raspi-scarlet-control.sh"
 bash -n "$script_dir/raspi-scarlet-boot.sh"
 bash -n "$script_dir/install-raspi-scarlet.sh"
+bash -n "$script_dir/deploy-scarlet-to-raspi.sh"
 python3 -m py_compile "$script_dir/check-pyusb-libusb.py"
 python3 -m py_compile "$script_dir/ec-usb-command.py"
 "$script_dir/fetch-chromiumos-ec.sh" --help >/dev/null

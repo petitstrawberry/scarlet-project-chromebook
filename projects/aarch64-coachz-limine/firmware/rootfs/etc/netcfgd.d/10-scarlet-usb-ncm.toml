@@ -1,0 +1,12 @@
+# The Pi-side CDC-NCM gadget runs DHCP on 192.168.88.1. The exact selector
+# wins over the generic wildcard, so usbnet0 receives the Pi gateway and is
+# preferred for default traffic. If no USB-NCM function is present this entry
+# is simply ignored.
+[[interface]]
+name = "usbnet0"
+method = "dhcp"
+metric = 50
+default = true
+required = false
+dhcp_timeout_ms = 1500
+dhcp_attempts = 5

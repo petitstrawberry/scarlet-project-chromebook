@@ -18,6 +18,7 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-sc7180-tlmm" = { path = "../../drivers/gpio/qcom-sc7180-tlmm", enabled = true }
 "scarlet-driver-qcom-geni-i2c" = { path = "../../drivers/i2c/qcom-geni", enabled = true }
 "scarlet-driver-qcom-geni-spi" = { path = "../../drivers/spi/qcom-geni", enabled = true }
+"scarlet-driver-google-cr50-tpm2-rng" = { path = "../../drivers/rng/google-cr50-tpm2", enabled = true }
 "scarlet-driver-cros-ec-spi" = { path = "../../drivers/platform/chromeos/cros-ec-spi", enabled = true }
 "scarlet-driver-qcom-spmi-pmic-arb" = { path = "../../drivers/spmi/qcom-spmi-pmic-arb", enabled = true }
 "scarlet-driver-qcom-pm8941-rtc" = { path = "../../drivers/rtc/qcom-pm8941-rtc", enabled = true }
@@ -42,9 +43,11 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-qmp-usb3-dp" = { path = "../../drivers/phy/qcom-qmp-usb3-dp", enabled = true }
 "scarlet-driver-qcom-dwc3" = { path = "../../drivers/usb/dwc3/qcom-dwc3", enabled = true }
 "scarlet-driver-chrome-ec-usb-touchpad" = { path = "../../drivers/input/trackpad/chrome-ec-usb-touchpad", enabled = true }
+"scarlet-driver-chrome-ec-mkbp-switch" = { path = "../../drivers/input/switch/chrome-ec-mkbp-switch", enabled = true }
 "scarlet-driver-goodix-gt7375p" = { path = "../../drivers/input/touchscreen/goodix-gt7375p", enabled = true }
 "scarlet-driver-ti-sn65dsi86" = { path = "../../drivers/display/bridge/ti-sn65dsi86", enabled = true }
 "scarlet-driver-qcom-sc7180-mdss" = { path = "../../drivers/display/qcom-sc7180-mdss", enabled = true }
+"scarlet-driver-qcom-sdhci-sc7180" = { path = "../../drivers/mmc/qcom-sdhci-sc7180", enabled = true }
 
 [images]
 

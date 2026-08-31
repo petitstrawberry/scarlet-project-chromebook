@@ -1,0 +1,17 @@
+[Unit]
+Description=Scarlet USB-NCM DHCP gateway and IPv4 forwarding
+Requires=scarlet-gadget.service
+After=scarlet-gadget.service network-online.target
+BindsTo=scarlet-gadget.service
+ConditionPathExists=/usr/local/sbin/scarlet-ncm
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/scarlet-gadget
+ExecStart=/usr/local/sbin/scarlet-ncm run
+ExecStop=/usr/local/sbin/scarlet-ncm stop
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

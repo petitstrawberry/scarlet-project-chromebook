@@ -2,11 +2,12 @@
 
 #![no_std]
 
-//! SC7180 GCC bootstrap and the clock/reset subset used by display, USB, LPASS,
-//! the CoachZ trackpad I2C serial engine, and CPU frequency hardware.
+//! SC7180 GCC bootstrap and the clock/reset subset used by display, USB, eMMC,
+//! LPASS, the CoachZ trackpad I2C serial engine, and CPU frequency hardware.
 //!
 //! The driver deliberately covers only the GCC resources consumed by Scarlet's
-//! SC7180 display, primary USB path, CoachZ trackpad, and CPU DVFS block.
+//! SC7180 display, primary USB path, CoachZ eMMC and trackpad, and CPU DVFS
+//! block.
 //! Firmware may leave these resources in an arbitrary enabled state, so all
 //! enabling operations preserve unrelated register bits and are safe to repeat
 //! during handoff.
@@ -48,6 +49,11 @@ const GCC_USB30_PRIM_GDSCR: usize = 0x0f004;
 const GCC_USB30_PRIM_MASTER_CMD_RCGR: usize = 0x0f01c;
 const GCC_USB30_PRIM_MOCK_UTMI_CMD_RCGR: usize = 0x0f034;
 const GCC_USB3_PRIM_PHY_AUX_CMD_RCGR: usize = 0x0f060;
+// SDCC1 is the CoachZ eMMC controller.  These are branch and RCG offsets
+// from Linux's gcc-sc7180.c.
+const GCC_SDCC1_AHB_BRANCH: usize = 0x12008;
+const GCC_SDCC1_APPS_BRANCH: usize = 0x1200c;
+const GCC_SDCC1_APPS_CMD_RCGR: usize = 0x12028;
 
 const GCC_AGGRE_USB3_PRIM_AXI_CLK: u32 = 8;
 const GCC_CFG_NOC_USB3_PRIM_AXI_CLK: u32 = 17;
@@ -59,7 +65,10 @@ const GCC_USB3_PRIM_PHY_AUX_CLK: u32 = 115;
 const GCC_USB3_PRIM_PHY_COM_AUX_CLK: u32 = 117;
 const GCC_USB3_PRIM_PHY_PIPE_CLK: u32 = 118;
 const GCC_USB_PHY_CFG_AHB2PHY_CLK: u32 = 119;
+const GCC_QUPV3_WRAP0_S4_CLK: u32 = 66;
 const GCC_QUPV3_WRAP1_S1_CLK: u32 = 74;
+const GCC_SDCC1_AHB_CLK: u32 = 88;
+const GCC_SDCC1_APPS_CLK: u32 = 89;
 const GCC_LPASS_CFG_NOC_SWAY_CLK: u32 = 131;
 
 const LPASS_CFG_CLOCK: SimpleClockDescriptor = SimpleClockDescriptor {
@@ -132,10 +141,36 @@ const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
     },
 ];
 
-const GCC_QUPV3_WRAP1_S1_CMD_RCGR: usize = 0x18148;
-const GCC_QUPV3_WRAP1_S1_HALT: usize = 0x18144;
 const GCC_APSS_CLOCK_BRANCH_ENA_VOTE: usize = 0x52008;
-const GCC_QUPV3_WRAP1_S1_VOTE: u32 = 1 << 23;
+
+#[derive(Clone, Copy)]
+struct QupSerialClockDescriptor {
+    id: u32,
+    name: &'static str,
+    command: usize,
+    halt: usize,
+    vote: u32,
+    log_name: &'static str,
+}
+
+const QUP_SERIAL_CLOCKS: [QupSerialClockDescriptor; 2] = [
+    QupSerialClockDescriptor {
+        id: GCC_QUPV3_WRAP0_S4_CLK,
+        name: "gcc_qupv3_wrap0_s4_clk",
+        command: 0x174f4,
+        halt: 0x174f0,
+        vote: 1 << 14,
+        log_name: "wrap0 SE4",
+    },
+    QupSerialClockDescriptor {
+        id: GCC_QUPV3_WRAP1_S1_CLK,
+        name: "gcc_qupv3_wrap1_s1_clk",
+        command: 0x18148,
+        halt: 0x18144,
+        vote: 1 << 23,
+        log_name: "wrap1 SE1",
+    },
+];
 
 const GCC_QUSB2PHY_PRIM_BCR: u32 = 0;
 const GCC_USB30_PRIM_BCR: u32 = 3;
@@ -150,9 +185,14 @@ const GDSC_SW_COLLAPSE: u32 = 1;
 const GDSC_POWER_ON: u32 = 1 << 31;
 const RCG_UPDATE: u32 = 1;
 const RCG_CFG_OFFSET: usize = 4;
+const RCG_M_OFFSET: usize = 8;
+const RCG_N_OFFSET: usize = 12;
+const RCG_D_OFFSET: usize = 16;
+const RCG_MND_MASK: u32 = 0xff;
 const RCG_SRC_DIV_MASK: u32 = 0x1f;
 const RCG_SRC_SEL_MASK: u32 = 0x7 << 8;
 const RCG_MODE_MASK: u32 = 0x3 << 12;
+const RCG_MODE_DUAL_EDGE: u32 = 0x2 << 12;
 const RCG_HW_CLK_CTRL: u32 = 1 << 20;
 const BRANCH_TIMEOUT_US: u64 = 1_000;
 const RCG_TIMEOUT_US: u64 = 500;
@@ -161,6 +201,8 @@ const USB_MASTER_ASSIGNED_RATE: u64 = 150_000_000;
 const USB_MASTER_RATE: u64 = 200_000_000;
 const USB_MOCK_UTMI_RATE: u64 = 19_200_000;
 const QUP_SERIAL_RATE: u64 = 19_200_000;
+const SDCC1_AHB_RATE: u64 = 19_200_000;
+const SDCC1_APPS_DEFAULT_RATE: u64 = 400_000;
 
 static GCC_BASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -256,11 +298,21 @@ fn configure_rcg(
     source: u32,
     divider: u32,
 ) -> Result<(), ClkError> {
+    configure_rcg_with_mode(registers, command, source, divider, 0)
+}
+
+fn configure_rcg_with_mode(
+    registers: RegisterWindow,
+    command: usize,
+    source: u32,
+    divider: u32,
+    mode: u32,
+) -> Result<(), ClkError> {
     let config = command + RCG_CFG_OFFSET;
     registers.update_bits(
         config,
         RCG_SRC_DIV_MASK | RCG_SRC_SEL_MASK | RCG_MODE_MASK | RCG_HW_CLK_CTRL,
-        divider | (source << 8),
+        divider | (source << 8) | mode,
     );
     registers.set_bits(command, RCG_UPDATE);
     arch::io_wmb();
@@ -508,10 +560,223 @@ impl Clk for Sc7180UsbClock {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sdcc1AppsRate {
+    rate: u64,
+    source: u32,
+    hid_divider: u32,
+    m: u32,
+    n: u32,
+}
+
+// This is Linux 6.6's ftbl_gcc_sdcc1_apps_clk_src table.  `hid_divider` is
+// the hardware encoding (2 * pre-divider - 1), not the arithmetic divisor.
+const SDCC1_APPS_RATES: [Sdcc1AppsRate; 9] = [
+    Sdcc1AppsRate {
+        rate: 144_000,
+        source: 0, // BI_TCXO
+        hid_divider: 31,
+        m: 3,
+        n: 25,
+    },
+    Sdcc1AppsRate {
+        rate: 400_000,
+        source: 0, // BI_TCXO
+        hid_divider: 23,
+        m: 1,
+        n: 4,
+    },
+    Sdcc1AppsRate {
+        rate: 19_200_000,
+        source: 0, // BI_TCXO
+        hid_divider: 1,
+        m: 0,
+        n: 0,
+    },
+    Sdcc1AppsRate {
+        rate: 20_000_000,
+        source: 6, // GPLL0_OUT_EVEN
+        hid_divider: 9,
+        m: 1,
+        n: 3,
+    },
+    Sdcc1AppsRate {
+        rate: 25_000_000,
+        source: 6, // GPLL0_OUT_EVEN
+        hid_divider: 11,
+        m: 1,
+        n: 2,
+    },
+    Sdcc1AppsRate {
+        rate: 50_000_000,
+        source: 6, // GPLL0_OUT_EVEN
+        hid_divider: 11,
+        m: 0,
+        n: 0,
+    },
+    Sdcc1AppsRate {
+        rate: 100_000_000,
+        source: 6, // GPLL0_OUT_EVEN
+        hid_divider: 5,
+        m: 0,
+        n: 0,
+    },
+    Sdcc1AppsRate {
+        rate: 192_000_000,
+        source: 2, // GPLL6_OUT_MAIN
+        hid_divider: 3,
+        m: 0,
+        n: 0,
+    },
+    Sdcc1AppsRate {
+        rate: 384_000_000,
+        source: 2, // GPLL6_OUT_MAIN
+        hid_divider: 1,
+        m: 0,
+        n: 0,
+    },
+];
+
+fn sdcc1_apps_rate_for_request(rate: u64) -> Result<Sdcc1AppsRate, ClkError> {
+    // gcc_sdcc1_apps_clk_src uses clk_rcg2_floor_ops: a 26 MHz request, for
+    // example, selects the 25 MHz table entry instead of overclocking eMMC.
+    SDCC1_APPS_RATES
+        .iter()
+        .rev()
+        .find(|entry| entry.rate <= rate)
+        .copied()
+        .ok_or(ClkError::InvalidRate)
+}
+
+fn rcg_mnd_register_values(m: u32, n: u32) -> Result<(u32, u32, u32), ClkError> {
+    if m == 0 || m > n || n > RCG_MND_MASK {
+        return Err(ClkError::InvalidRate);
+    }
+
+    // Qualcomm RCG2 stores N and D inverted.  This matches
+    // __clk_rcg2_configure() in Linux's drivers/clk/qcom/clk-rcg2.c.
+    let n_minus_m = n - m;
+    let d = n.clamp(m, n_minus_m * 2);
+    Ok((m, !n_minus_m & RCG_MND_MASK, !d & RCG_MND_MASK))
+}
+
+fn configure_sdcc1_apps_rcg(
+    registers: RegisterWindow,
+    entry: Sdcc1AppsRate,
+) -> Result<(), ClkError> {
+    let mode = if entry.n == 0 {
+        0
+    } else {
+        let (m, n, d) = rcg_mnd_register_values(entry.m, entry.n)?;
+        registers.update_bits(GCC_SDCC1_APPS_CMD_RCGR + RCG_M_OFFSET, RCG_MND_MASK, m);
+        registers.update_bits(GCC_SDCC1_APPS_CMD_RCGR + RCG_N_OFFSET, RCG_MND_MASK, n);
+        registers.update_bits(GCC_SDCC1_APPS_CMD_RCGR + RCG_D_OFFSET, RCG_MND_MASK, d);
+        RCG_MODE_DUAL_EDGE
+    };
+
+    configure_rcg_with_mode(
+        registers,
+        GCC_SDCC1_APPS_CMD_RCGR,
+        entry.source,
+        entry.hid_divider,
+        mode,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sdcc1ClockKind {
+    Ahb,
+    Apps,
+}
+
+#[derive(Clone, Copy)]
+struct Sdcc1ClockDescriptor {
+    id: u32,
+    name: &'static str,
+    branch: usize,
+    kind: Sdcc1ClockKind,
+}
+
+const SDCC1_CLOCKS: [Sdcc1ClockDescriptor; 2] = [
+    Sdcc1ClockDescriptor {
+        id: GCC_SDCC1_AHB_CLK,
+        name: "gcc_sdcc1_ahb_clk",
+        branch: GCC_SDCC1_AHB_BRANCH,
+        kind: Sdcc1ClockKind::Ahb,
+    },
+    Sdcc1ClockDescriptor {
+        id: GCC_SDCC1_APPS_CLK,
+        name: "gcc_sdcc1_apps_clk",
+        branch: GCC_SDCC1_APPS_BRANCH,
+        kind: Sdcc1ClockKind::Apps,
+    },
+];
+
+struct Sc7180Sdcc1Clock {
+    registers: RegisterWindow,
+    descriptor: Sdcc1ClockDescriptor,
+    apps_rate: Arc<AtomicU64>,
+}
+
+impl Clk for Sc7180Sdcc1Clock {
+    fn name(&self) -> &'static str {
+        self.descriptor.name
+    }
+
+    fn enable(&self) -> Result<(), ClkError> {
+        if self.descriptor.kind == Sdcc1ClockKind::Apps {
+            // The eMMC source is owned here, rather than inherited from
+            // U-Boot's incomplete SDCC1 rate setup.  A 400 kHz default is
+            // safe for controller discovery when no consumer chose a rate.
+            let entry = sdcc1_apps_rate_for_request(self.apps_rate.load(Ordering::Relaxed))?;
+            configure_sdcc1_apps_rcg(self.registers, entry)?;
+        }
+        enable_branch(self.registers, self.descriptor.branch, true)
+    }
+
+    fn disable(&self) {
+        self.registers
+            .clear_bits(self.descriptor.branch, BRANCH_ENABLE);
+        arch::io_wmb();
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.registers.read(self.descriptor.branch) & BRANCH_ENABLE != 0
+    }
+
+    fn recalc_rate(&self, _parent_rate: u64) -> u64 {
+        match self.descriptor.kind {
+            Sdcc1ClockKind::Ahb => SDCC1_AHB_RATE,
+            Sdcc1ClockKind::Apps => self.apps_rate.load(Ordering::Relaxed),
+        }
+    }
+
+    fn round_rate(&self, rate: u64, _parent_rate: u64) -> Result<u64, ClkError> {
+        match self.descriptor.kind {
+            Sdcc1ClockKind::Ahb if rate == SDCC1_AHB_RATE => Ok(rate),
+            Sdcc1ClockKind::Apps => sdcc1_apps_rate_for_request(rate).map(|entry| entry.rate),
+            _ => Err(ClkError::InvalidRate),
+        }
+    }
+
+    fn set_rate(&self, rate: u64, _parent_rate: u64) -> Result<u64, ClkError> {
+        match self.descriptor.kind {
+            Sdcc1ClockKind::Ahb => self.round_rate(rate, 0),
+            Sdcc1ClockKind::Apps => {
+                let entry = sdcc1_apps_rate_for_request(rate)?;
+                configure_sdcc1_apps_rcg(self.registers, entry)?;
+                self.apps_rate.store(entry.rate, Ordering::Relaxed);
+                Ok(entry.rate)
+            }
+        }
+    }
+}
+
 struct Sc7180GccProvider {
     gpll0_out_main: ClkHandle,
     clocks: [ClkHandle; USB_CLOCKS.len()],
-    trackpad_i2c_clock: ClkHandle,
+    sdcc1_clocks: [ClkHandle; SDCC1_CLOCKS.len()],
+    qup_serial_clocks: [ClkHandle; QUP_SERIAL_CLOCKS.len()],
     lpass_cfg_clock: ClkHandle,
     gpu_clocks: [ClkHandle; GPU_CLOCKS.len()],
 }
@@ -528,7 +793,20 @@ impl Sc7180GccProvider {
                 mock_utmi_rate: Arc::clone(&mock_utmi_rate),
             }))
         });
-        let trackpad_i2c_clock = ClkHandle::new(Arc::new(Sc7180QupSerialClock { registers }));
+        let sdcc1_apps_rate = Arc::new(AtomicU64::new(SDCC1_APPS_DEFAULT_RATE));
+        let sdcc1_clocks = core::array::from_fn(|index| {
+            ClkHandle::new(Arc::new(Sc7180Sdcc1Clock {
+                registers,
+                descriptor: SDCC1_CLOCKS[index],
+                apps_rate: Arc::clone(&sdcc1_apps_rate),
+            }))
+        });
+        let qup_serial_clocks = core::array::from_fn(|index| {
+            ClkHandle::new(Arc::new(Sc7180QupSerialClock {
+                registers,
+                descriptor: QUP_SERIAL_CLOCKS[index],
+            }))
+        });
         let lpass_cfg_clock = ClkHandle::new(Arc::new(Sc7180GccSimpleClock {
             registers,
             descriptor: LPASS_CFG_CLOCK,
@@ -542,7 +820,8 @@ impl Sc7180GccProvider {
         Self {
             gpll0_out_main: ClkHandle::new(Arc::new(Sc7180Gpll0MainClock)),
             clocks,
-            trackpad_i2c_clock,
+            sdcc1_clocks,
+            qup_serial_clocks,
             lpass_cfg_clock,
             gpu_clocks,
         }
@@ -627,47 +906,49 @@ impl Clk for Sc7180GccSimpleClock {
 
 struct Sc7180QupSerialClock {
     registers: RegisterWindow,
+    descriptor: QupSerialClockDescriptor,
 }
 
 impl Clk for Sc7180QupSerialClock {
     fn name(&self) -> &'static str {
-        "gcc_qupv3_wrap1_s1_clk"
+        self.descriptor.name
     }
 
     fn enable(&self) -> Result<(), ClkError> {
-        // SE1 runs from BI_TCXO at 19.2 MHz. Program the source while taking
-        // ownership because U-Boot deliberately leaves the trackpad bus off.
-        configure_rcg(self.registers, GCC_QUPV3_WRAP1_S1_CMD_RCGR, 0, 1)?;
+        // Each serial engine runs from BI_TCXO at 19.2 MHz. Program the source
+        // while taking ownership because U-Boot leaves unused buses off.
+        configure_rcg(self.registers, self.descriptor.command, 0, 1)?;
         self.registers
-            .set_bits(GCC_APSS_CLOCK_BRANCH_ENA_VOTE, GCC_QUPV3_WRAP1_S1_VOTE);
+            .set_bits(GCC_APSS_CLOCK_BRANCH_ENA_VOTE, self.descriptor.vote);
         arch::io_wmb();
         wait_for(
             self.registers,
-            GCC_QUPV3_WRAP1_S1_HALT,
+            self.descriptor.halt,
             BRANCH_OFF,
             0,
             BRANCH_TIMEOUT_US,
         )
         .map_err(|_| ClkError::HardwareError)?;
         early_println!(
-            "[qcom-sc7180-gcc] QUPv3 wrap1 SE1 ready: rate={} cmd={:#010x} vote={:#010x} halt={:#010x}",
+            "[qcom-sc7180-gcc] QUPv3 {} ready: rate={} cmd={:#010x} vote={:#010x} halt={:#010x}",
+            self.descriptor.log_name,
             QUP_SERIAL_RATE,
-            self.registers.read(GCC_QUPV3_WRAP1_S1_CMD_RCGR),
+            self.registers.read(self.descriptor.command),
             self.registers.read(GCC_APSS_CLOCK_BRANCH_ENA_VOTE),
-            self.registers.read(GCC_QUPV3_WRAP1_S1_HALT),
+            self.registers.read(self.descriptor.halt),
         );
         Ok(())
     }
 
     fn disable(&self) {
         self.registers
-            .clear_bits(GCC_APSS_CLOCK_BRANCH_ENA_VOTE, GCC_QUPV3_WRAP1_S1_VOTE);
+            .clear_bits(GCC_APSS_CLOCK_BRANCH_ENA_VOTE, self.descriptor.vote);
         arch::io_wmb();
     }
 
     fn is_enabled(&self) -> bool {
-        self.registers.read(GCC_APSS_CLOCK_BRANCH_ENA_VOTE) & GCC_QUPV3_WRAP1_S1_VOTE != 0
-            && self.registers.read(GCC_QUPV3_WRAP1_S1_HALT) & BRANCH_OFF == 0
+        self.registers.read(GCC_APSS_CLOCK_BRANCH_ENA_VOTE) & self.descriptor.vote != 0
+            && self.registers.read(self.descriptor.halt) & BRANCH_OFF == 0
     }
 
     fn recalc_rate(&self, _parent_rate: u64) -> u64 {
@@ -686,7 +967,7 @@ impl Clk for Sc7180QupSerialClock {
         if rate != QUP_SERIAL_RATE {
             return Err(ClkError::InvalidRate);
         }
-        configure_rcg(self.registers, GCC_QUPV3_WRAP1_S1_CMD_RCGR, 0, 1)?;
+        configure_rcg(self.registers, self.descriptor.command, 0, 1)?;
         Ok(rate)
     }
 }
@@ -707,14 +988,17 @@ impl ClkProvider for Sc7180GccProvider {
         if *id == GCC_GPLL0_OUT_MAIN {
             return Ok(self.gpll0_out_main.clone());
         }
-        if *id == GCC_QUPV3_WRAP1_S1_CLK {
-            return Ok(self.trackpad_i2c_clock.clone());
+        if let Some(index) = QUP_SERIAL_CLOCKS.iter().position(|clock| clock.id == *id) {
+            return Ok(self.qup_serial_clocks[index].clone());
         }
         if *id == GCC_LPASS_CFG_NOC_SWAY_CLK {
             return Ok(self.lpass_cfg_clock.clone());
         }
         if let Some(index) = GPU_CLOCKS.iter().position(|clock| clock.id == *id) {
             return Ok(self.gpu_clocks[index].clone());
+        }
+        if let Some(index) = SDCC1_CLOCKS.iter().position(|clock| clock.id == *id) {
+            return Ok(self.sdcc1_clocks[index].clone());
         }
         USB_CLOCKS
             .iter()
@@ -903,7 +1187,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     GCC_BASE.store(base, Ordering::Release);
 
     early_println!(
-        "[qcom-sc7180-gcc] registered display/USB/QUP clocks and USB resets for phandle {:#x}",
+        "[qcom-sc7180-gcc] registered display/USB/SDCC1/QUP clocks and USB resets for phandle {:#x}",
         phandle
     );
     Ok(())
@@ -943,11 +1227,71 @@ mod tests {
     }
 
     #[test]
-    fn trackpad_i2c_clock_id_matches_sc7180_binding() {
-        assert_eq!(GCC_QUPV3_WRAP1_S1_CLK, 74);
-        assert_eq!(GCC_QUPV3_WRAP1_S1_CMD_RCGR, 0x18148);
-        assert_eq!(GCC_QUPV3_WRAP1_S1_HALT, 0x18144);
-        assert_eq!(GCC_QUPV3_WRAP1_S1_VOTE, 1 << 23);
+    fn sdcc1_clock_ids_and_registers_match_sc7180_bindings() {
+        assert_eq!(GCC_SDCC1_AHB_CLK, 88);
+        assert_eq!(GCC_SDCC1_APPS_CLK, 89);
+        assert_eq!(GCC_SDCC1_AHB_BRANCH, 0x12008);
+        assert_eq!(GCC_SDCC1_APPS_BRANCH, 0x1200c);
+        assert_eq!(GCC_SDCC1_APPS_CMD_RCGR, 0x12028);
+        assert_eq!(
+            SDCC1_CLOCKS.map(|clock| (clock.id, clock.name, clock.branch)),
+            [
+                (88, "gcc_sdcc1_ahb_clk", 0x12008),
+                (89, "gcc_sdcc1_apps_clk", 0x1200c),
+            ]
+        );
+    }
+
+    #[test]
+    fn sdcc1_apps_rate_requests_follow_linux_floor_table() {
+        assert_eq!(
+            sdcc1_apps_rate_for_request(400_000),
+            Ok(Sdcc1AppsRate {
+                rate: 400_000,
+                source: 0,
+                hid_divider: 23,
+                m: 1,
+                n: 4,
+            })
+        );
+        assert_eq!(
+            sdcc1_apps_rate_for_request(26_000_000).map(|entry| entry.rate),
+            Ok(25_000_000)
+        );
+        assert_eq!(
+            sdcc1_apps_rate_for_request(200_000_000).map(|entry| entry.rate),
+            Ok(192_000_000)
+        );
+        assert_eq!(
+            sdcc1_apps_rate_for_request(100_000),
+            Err(ClkError::InvalidRate)
+        );
+    }
+
+    #[test]
+    fn sdcc1_fractional_rates_use_linux_rcg2_mnd_encoding() {
+        // 19.2 MHz / 12 * 1 / 4 = 400 kHz.  RCG2 stores N and D inverted.
+        assert_eq!(rcg_mnd_register_values(1, 4), Ok((1, 0xfc, 0xfb)));
+        // 300 MHz / 6 * 1 / 2 = 25 MHz.
+        assert_eq!(rcg_mnd_register_values(1, 2), Ok((1, 0xfe, 0xfd)));
+        assert_eq!(rcg_mnd_register_values(0, 4), Err(ClkError::InvalidRate));
+    }
+
+    #[test]
+    fn coachz_i2c_clock_ids_and_registers_match_sc7180_binding() {
+        assert_eq!(
+            QUP_SERIAL_CLOCKS.map(|clock| (
+                clock.id,
+                clock.name,
+                clock.command,
+                clock.halt,
+                clock.vote,
+            )),
+            [
+                (66, "gcc_qupv3_wrap0_s4_clk", 0x174f4, 0x174f0, 1 << 14),
+                (74, "gcc_qupv3_wrap1_s1_clk", 0x18148, 0x18144, 1 << 23),
+            ]
+        );
     }
 
     #[test]

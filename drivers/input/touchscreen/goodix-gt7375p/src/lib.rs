@@ -4,25 +4,23 @@
 
 //! Goodix GT7375P touchscreen support for Google CoachZ.
 //!
-//! The controller uses the GT9xx register protocol exposed by the Linux Goodix
-//! driver. CoachZ connects it to AP I2C4 at address `0x5d`, with GPIO 8 as an
-//! active-low reset and GPIO 9 as an active-low interrupt.
+//! The controller uses I2C-HID with the Goodix-specific power/reset sequencing
+//! implemented by Linux's `i2c-hid-of-goodix` driver. CoachZ connects it to AP
+//! I2C4 at address `0x5d`, with GPIO 8 as active-low reset and GPIO 9 as an
+//! active-low interrupt.
 //!
-//! Scarlet does not yet expose multitouch slot metadata or axis capability
-//! descriptors. This driver therefore publishes one honest direct-touch
-//! stream on `tabletN`: the first reported contact becomes `ABS_X`, `ABS_Y`,
-//! `ABS_PRESSURE`, and `BTN_TOUCH`. Additional contacts are parsed and cleared
-//! at the controller, but are not advertised as supported.
+//! The controller's raw HID contact records are published as Linux type-B
+//! multitouch slots. The primary contact is also mirrored to `ABS_X`, `ABS_Y`,
+//! and `ABS_PRESSURE` for consumers which only understand direct-touch input.
 //!
 //! Runtime reports normally arrive through the SC7180 TLMM GPIO interrupt
 //! demultiplexer. If GPIO IRQ registration is unavailable, the driver falls
-//! back to polling the physical active-low IRQ line at the same 17 ms interval
-//! used by Linux's Goodix polling mode.
+//! back to polling the physical active-low IRQ line at a 17 ms interval.
 //!
 //! # Provenance
 //!
-//! Register addresses, reset timing, report framing, and contact decoding are
-//! adapted from Linux `drivers/input/touchscreen/goodix.{c,h}` (GPL-2.0-only).
+//! Reset timing and I2C-HID framing are adapted from Linux
+//! `drivers/hid/i2c-hid/{i2c-hid-of-goodix,i2c-hid-core}.c` (GPL-2.0-only).
 
 extern crate alloc;
 
@@ -34,13 +32,27 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+mod hid;
+
+use hid::{
+    HidField, HidTouchLayout, SlotTracker, TouchFrame, decode_contacts, decode_input_length,
+    encode_simple_command, parse_touch_layout,
+};
+
 use scarlet::{
     device::{
         events::InterruptCapableDevice,
         gpio::{GpioController, GpioIrqTrigger},
         i2c::{I2cAddress, I2cBus, I2cError, I2cMessage},
         input::{
-            event_device::EventDevice,
+            abs_codes::{
+                ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_PRESSURE, ABS_MT_SLOT,
+                ABS_MT_TOUCH_MAJOR, ABS_MT_TRACKING_ID,
+            },
+            event_device::{
+                EventDevice, INPUT_CAP_DIRECT_TOUCH, INPUT_CAP_KEY, InputDeviceKind,
+                InputDeviceMetadata,
+            },
             event_types::{EV_ABS, EV_KEY, EV_SYN},
             syn_codes::SYN_REPORT,
         },
@@ -54,18 +66,18 @@ use scarlet::{
 };
 
 const GOODIX_ADDRESS: u8 = 0x5d;
-const GOODIX_REG_CONFIG: u16 = 0x8047;
-const GOODIX_REG_ID: u16 = 0x8140;
-const GOODIX_REG_COORDINATES: u16 = 0x814e;
-
-const CONFIG_LENGTH: usize = 240;
-const CONFIG_RESOLUTION_OFFSET: usize = 1;
-const CONFIG_MAX_CONTACTS_OFFSET: usize = 5;
-const MAX_CONTACTS: usize = 10;
-const CONTACT_SIZE: usize = 8;
-const READY: u8 = 1 << 7;
+const I2C_HID_DESCRIPTOR_REGISTER: u16 = 0x0001;
+const I2C_HID_DESCRIPTOR_LENGTH: usize = 30;
+const GOODIX_HID_VENDOR_ID: u16 = 0x27c6;
+const COACHZ_GT7375P_PRODUCT_IDS: [u16; 2] = [0x0e51, 0x0e94];
+const I2C_HID_OPCODE_RESET: u8 = 0x01;
+const I2C_HID_OPCODE_SET_POWER: u8 = 0x08;
+const I2C_HID_POWER_ON_DELAY_US: u64 = 60_000;
+const I2C_HID_RESET_TIMEOUT_US: u64 = 5_000_000;
+const MAX_INPUT_LENGTH: usize = 512;
+const MAX_REPORT_DESCRIPTOR_LENGTH: usize = 4096;
 const POLL_INTERVAL_NS: u64 = 17_000_000;
-const REPORT_READY_RETRIES: usize = 20;
+const MAX_TOUCH_SLOTS: usize = 5;
 
 // Linux input-event ABI values. Scarlet currently defines EV_ABS but does not
 // yet export the associated direct-touch axis/button code constants.
@@ -95,9 +107,9 @@ struct GoodixGt7375p {
     address: I2cAddress,
     irq: GpioLine,
     event: Arc<EventDevice>,
-    max_contacts: usize,
-    resolution: (u16, u16),
-    touching: IrqSpinLock<bool>,
+    max_input_length: usize,
+    layout: HidTouchLayout,
+    slots: IrqSpinLock<SlotTracker>,
     poll_fallback: AtomicBool,
     irq_work_pending: AtomicBool,
     active: AtomicBool,
@@ -105,90 +117,64 @@ struct GoodixGt7375p {
 }
 
 impl GoodixGt7375p {
-    fn read_register(&self, register: u16, destination: &mut [u8]) -> Result<(), I2cError> {
-        let address = register.to_be_bytes();
-        let mut messages = vec![
-            I2cMessage::write(self.address, &address, false),
-            I2cMessage::read(self.address, destination.len(), true),
-        ];
-        self.bus.transfer(&mut messages)?;
-        destination.copy_from_slice(&messages[1].data);
-        Ok(())
-    }
-
-    fn write_register_u8(&self, register: u16, value: u8) -> Result<(), I2cError> {
-        let [high, low] = register.to_be_bytes();
-        self.bus
-            .transfer(&mut [I2cMessage::write(self.address, &[high, low, value], true)])
-    }
-
-    fn read_ready_header(&self, header: &mut [u8; 1 + CONTACT_SIZE + 1]) -> Result<bool, I2cError> {
-        for _ in 0..REPORT_READY_RETRIES {
-            self.read_register(GOODIX_REG_COORDINATES, header)?;
-            if header[0] & READY != 0 {
-                return Ok(true);
+    fn emit_touch_frame(&self, frame: TouchFrame) {
+        for update in frame.updates {
+            self.event
+                .push_event(EV_ABS, ABS_MT_SLOT, update.slot as i32);
+            if update.began {
+                self.event
+                    .push_event(EV_ABS, ABS_MT_TRACKING_ID, update.tracking_id);
             }
-            time::udelay(1_000);
+            self.event
+                .push_event(EV_ABS, ABS_MT_POSITION_X, update.contact.x);
+            self.event
+                .push_event(EV_ABS, ABS_MT_POSITION_Y, update.contact.y);
+            if let Some(pressure) = update.contact.pressure {
+                self.event.push_event(EV_ABS, ABS_MT_PRESSURE, pressure);
+            }
+            if let Some(touch_major) = update.contact.touch_major {
+                self.event
+                    .push_event(EV_ABS, ABS_MT_TOUCH_MAJOR, touch_major);
+            }
         }
-        Ok(false)
-    }
-
-    fn emit_release(&self) {
-        let mut touching = self.touching.lock();
-        if *touching {
-            self.event.push_event(EV_KEY, BTN_TOUCH, 0);
-            self.event.push_event(EV_SYN, SYN_REPORT, 0);
-            *touching = false;
+        for slot in frame.releases {
+            self.event.push_event(EV_ABS, ABS_MT_SLOT, slot as i32);
+            self.event.push_event(EV_ABS, ABS_MT_TRACKING_ID, -1);
         }
+        if let Some(primary) = frame.primary {
+            self.event.push_event(EV_ABS, ABS_X, primary.x);
+            self.event.push_event(EV_ABS, ABS_Y, primary.y);
+            if let Some(pressure) = primary.pressure {
+                self.event.push_event(EV_ABS, ABS_PRESSURE, pressure);
+            }
+        }
+        self.event
+            .push_event(EV_KEY, BTN_TOUCH, i32::from(frame.any_contact));
+        self.event.push_event(EV_SYN, SYN_REPORT, 0);
     }
 
     fn process_report_inner(&self) -> Result<(), I2cError> {
-        let mut header = [0u8; 1 + CONTACT_SIZE + 1];
-        if !self.read_ready_header(&mut header)? {
+        let mut message = I2cMessage::read(self.address, self.max_input_length, true);
+        self.bus.transfer(core::slice::from_mut(&mut message))?;
+        let declared_length = decode_input_length(&message.data).ok_or(I2cError::BusError)?;
+        if declared_length == 0 {
             return Ok(());
         }
-
-        let count = usize::from(header[0] & 0x0f);
-        if count > self.max_contacts || count > MAX_CONTACTS {
-            return Err(I2cError::InvalidArg);
+        if declared_length < 2 || declared_length > message.data.len() {
+            return Err(I2cError::BusError);
         }
-
-        // Consume the complete report before acknowledging it, even though
-        // Scarlet currently exposes only the first contact to userspace.
-        if count > 1 {
-            let mut remaining = [0u8; CONTACT_SIZE * (MAX_CONTACTS - 1)];
-            let bytes = CONTACT_SIZE * (count - 1);
-            self.read_register(
-                GOODIX_REG_COORDINATES + (header.len() as u16),
-                &mut remaining[..bytes],
-            )?;
+        let report = &message.data[2..declared_length];
+        if self.layout.report_id != 0 && report.first().copied() != Some(self.layout.report_id) {
+            return Ok(());
         }
-
-        if count == 0 {
-            self.emit_release();
-        } else {
-            let contact = &header[1..1 + CONTACT_SIZE];
-            let x = i32::from(u16::from_le_bytes([contact[1], contact[2]]));
-            let y = i32::from(u16::from_le_bytes([contact[3], contact[4]]));
-            let pressure = i32::from(u16::from_le_bytes([contact[5], contact[6]]));
-
-            self.event.push_event(EV_ABS, ABS_X, x);
-            self.event.push_event(EV_ABS, ABS_Y, y);
-            self.event.push_event(EV_ABS, ABS_PRESSURE, pressure);
-            self.event.push_event(EV_KEY, BTN_TOUCH, 1);
-            self.event.push_event(EV_SYN, SYN_REPORT, 0);
-            *self.touching.lock() = true;
-        }
-
+        let contacts = decode_contacts(report, &self.layout).map_err(|_| I2cError::BusError)?;
+        let frame = self.slots.lock().apply(&contacts);
+        self.emit_touch_frame(frame);
         Ok(())
     }
 
     fn process_report(&self) -> Result<(), I2cError> {
-        let result = self.process_report_inner();
-        // Linux acknowledges every IRQ/poll attempt, including a spurious
-        // finger-up notification whose READY bit never becomes set.
-        let acknowledge = self.write_register_u8(GOODIX_REG_COORDINATES, 0);
-        result.and(acknowledge)
+        self.process_report_inner()
     }
 
     fn irq_asserted(&self) -> bool {
@@ -217,9 +203,9 @@ impl GoodixGt7375p {
         }
 
         if self.active.load(Ordering::Acquire) && !self.poll_fallback.load(Ordering::Acquire) {
-            // process_report() first clears the Goodix coordinate buffer,
-            // deasserting the level source. Clear the TLMM child latch next,
-            // then explicitly unmask the LowLevel GPIO.
+            // Reading the complete I2C-HID input report deasserts the level
+            // source. Clear the TLMM child latch next, then explicitly unmask
+            // the LowLevel GPIO.
             self.irq.controller.ack_irq(self.irq.pin);
             self.irq
                 .controller
@@ -325,8 +311,6 @@ fn resolve_interrupt_gpio(device: &PlatformDeviceInfo) -> Result<GpioLine, &'sta
 }
 
 fn reset_controller(reset: &GpioLine, irq: &GpioLine) {
-    // Goodix address selection: holding INT low during reset selects 7-bit
-    // address 0x5d (wire addresses 0xba/0xbb).
     let reset_high_before = reset.controller.get_value(reset.pin);
     let irq_high_before = irq.controller.get_value(irq.pin);
     let reset_asserted_high = !reset.active_low;
@@ -336,17 +320,14 @@ fn reset_controller(reset: &GpioLine, irq: &GpioLine) {
         .controller
         .set_direction_output(reset.pin, reset_asserted_high);
     time::udelay(20_000);
-    irq.controller.set_direction_output(irq.pin, false);
-    time::udelay(200);
     reset.set_asserted(false);
-    time::udelay(6_000);
-
-    // Synchronize and return INT to input mode (Linux T5 = 50 ms).
-    irq.controller.set_direction_output(irq.pin, false);
-    time::udelay(50_000);
+    // GT7375P is I2C-HID, not a GT9xx register device. Linux's Goodix
+    // I2C-HID power sequence waits 180 ms after releasing reset and does not
+    // drive INT for legacy GT9xx address selection.
+    time::udelay(180_000);
     irq.controller.set_direction_input(irq.pin);
     early_println!(
-        "[goodix-gt7375p] reset/address select: reset-high {}->{} irq-high {}->{} addr=0x{:02x}",
+        "[goodix-gt7375p] I2C-HID reset: reset-high {}->{} irq-high {}->{} addr=0x{:02x}",
         reset_high_before,
         reset.controller.get_value(reset.pin),
         irq_high_before,
@@ -355,93 +336,204 @@ fn reset_controller(reset: &GpioLine, irq: &GpioLine) {
     );
 }
 
+fn send_i2c_hid_command(
+    bus: &Arc<dyn I2cBus>,
+    command_register: u16,
+    opcode: u8,
+) -> Result<(), I2cError> {
+    let command = encode_simple_command(command_register, opcode);
+    bus.transfer(&mut [I2cMessage::write(
+        I2cAddress::SevenBit(GOODIX_ADDRESS),
+        &command,
+        true,
+    )])
+}
+
+fn wait_for_reset_completion(
+    bus: &Arc<dyn I2cBus>,
+    irq: &GpioLine,
+    max_input_length: usize,
+) -> Result<(), I2cError> {
+    let start = time::current_time();
+    while time::current_time().saturating_sub(start) < I2C_HID_RESET_TIMEOUT_US {
+        let irq_high = irq.controller.get_value(irq.pin);
+        let irq_asserted = if irq.active_low { !irq_high } else { irq_high };
+        if !irq_asserted {
+            time::udelay(1_000);
+            continue;
+        }
+
+        let mut message =
+            I2cMessage::read(I2cAddress::SevenBit(GOODIX_ADDRESS), max_input_length, true);
+        bus.transfer(core::slice::from_mut(&mut message))?;
+        let length = decode_input_length(&message.data).ok_or(I2cError::BusError)?;
+        if length == 0 {
+            return Ok(());
+        }
+    }
+    Err(I2cError::Timeout)
+}
+
+fn initialize_i2c_hid(
+    bus: &Arc<dyn I2cBus>,
+    irq: &GpioLine,
+    command_register: u16,
+    max_input_length: usize,
+) -> Result<(), I2cError> {
+    send_i2c_hid_command(bus, command_register, I2C_HID_OPCODE_SET_POWER)?;
+    time::udelay(I2C_HID_POWER_ON_DELAY_US);
+    send_i2c_hid_command(bus, command_register, I2C_HID_OPCODE_RESET)?;
+    wait_for_reset_completion(bus, irq, max_input_length)?;
+
+    // Linux powers the device on again after a successful reset unless the
+    // controller carries the NO_WAKEUP_AFTER_RESET quirk. GT7375P does not.
+    send_i2c_hid_command(bus, command_register, I2C_HID_OPCODE_SET_POWER)?;
+    time::udelay(I2C_HID_POWER_ON_DELAY_US);
+    Ok(())
+}
+
+fn axis_range(fields: &[HidField]) -> Option<(i32, i32)> {
+    let first = fields.first()?;
+    Some(fields.iter().skip(1).fold(
+        (first.logical_minimum, first.logical_maximum),
+        |(minimum, maximum), field| {
+            (
+                minimum.min(field.logical_minimum),
+                maximum.max(field.logical_maximum),
+            )
+        },
+    ))
+}
+
 fn read_identity(bus: Arc<dyn I2cBus>, irq: GpioLine) -> Result<Arc<GoodixGt7375p>, &'static str> {
-    let event = Arc::new(EventDevice::new("tablet"));
-    let mut device = GoodixGt7375p {
+    let mut descriptor_messages = vec![
+        I2cMessage::write(
+            I2cAddress::SevenBit(GOODIX_ADDRESS),
+            &I2C_HID_DESCRIPTOR_REGISTER.to_le_bytes(),
+            false,
+        ),
+        I2cMessage::read(
+            I2cAddress::SevenBit(GOODIX_ADDRESS),
+            I2C_HID_DESCRIPTOR_LENGTH,
+            true,
+        ),
+    ];
+    bus.transfer(&mut descriptor_messages).map_err(|error| {
+        early_println!(
+            "[goodix-gt7375p] I2C-HID descriptor read failed: {:?}",
+            error
+        );
+        "goodix-gt7375p: I2C-HID descriptor read failed"
+    })?;
+    let descriptor = &descriptor_messages[1].data;
+    let word = |offset: usize| {
+        descriptor
+            .get(offset..offset + 2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    if word(0) != Some(I2C_HID_DESCRIPTOR_LENGTH as u16) || word(2) != Some(0x0100) {
+        return Err("goodix-gt7375p: invalid I2C-HID descriptor");
+    }
+    let vendor_id = word(20).ok_or("goodix: missing HID vendor ID")?;
+    let product_id = word(22).ok_or("goodix: missing HID product ID")?;
+    if vendor_id != GOODIX_HID_VENDOR_ID || !COACHZ_GT7375P_PRODUCT_IDS.contains(&product_id) {
+        early_println!(
+            "[goodix-gt7375p] rejected I2C-HID identity vendor={:#06x} product={:#06x}",
+            vendor_id,
+            product_id,
+        );
+        return Err("goodix-gt7375p: unsupported I2C-HID identity");
+    }
+    let report_descriptor_length = usize::from(word(4).ok_or("goodix: missing report length")?);
+    let report_descriptor_register = word(6).ok_or("goodix: missing report register")?;
+    let max_input_length = usize::from(word(10).ok_or("goodix: missing input length")?);
+    let command_register = word(16).ok_or("goodix: missing command register")?;
+    if report_descriptor_length == 0
+        || report_descriptor_length > MAX_REPORT_DESCRIPTOR_LENGTH
+        || max_input_length < 3
+        || max_input_length > MAX_INPUT_LENGTH
+    {
+        return Err("goodix-gt7375p: invalid I2C-HID buffer lengths");
+    }
+    initialize_i2c_hid(&bus, &irq, command_register, max_input_length).map_err(|error| {
+        early_println!(
+            "[goodix-gt7375p] I2C-HID power/reset initialization failed: {:?}",
+            error,
+        );
+        "goodix-gt7375p: I2C-HID power/reset initialization failed"
+    })?;
+    let mut report_messages = vec![
+        I2cMessage::write(
+            I2cAddress::SevenBit(GOODIX_ADDRESS),
+            &report_descriptor_register.to_le_bytes(),
+            false,
+        ),
+        I2cMessage::read(
+            I2cAddress::SevenBit(GOODIX_ADDRESS),
+            report_descriptor_length,
+            true,
+        ),
+    ];
+    bus.transfer(&mut report_messages).map_err(|error| {
+        early_println!(
+            "[goodix-gt7375p] HID report descriptor read failed: {:?}",
+            error
+        );
+        "goodix-gt7375p: HID report descriptor read failed"
+    })?;
+    let layout = parse_touch_layout(&report_messages[1].data)?;
+    let (x_minimum, x_maximum) =
+        axis_range(&layout.x).ok_or("goodix-gt7375p: missing HID X logical range")?;
+    let (y_minimum, y_maximum) =
+        axis_range(&layout.y).ok_or("goodix-gt7375p: missing HID Y logical range")?;
+    let mut metadata = InputDeviceMetadata::new(
+        InputDeviceKind::Touchscreen,
+        INPUT_CAP_KEY | INPUT_CAP_DIRECT_TOUCH,
+    )
+    .with_multitouch_slots(MAX_TOUCH_SLOTS)?
+    .with_absolute_axis(ABS_X, x_minimum, x_maximum)?
+    .with_absolute_axis(ABS_Y, y_minimum, y_maximum)?
+    .with_absolute_axis(ABS_MT_SLOT, 0, (MAX_TOUCH_SLOTS - 1) as i32)?
+    .with_absolute_axis(ABS_MT_TRACKING_ID, -1, i32::MAX)?
+    .with_absolute_axis(ABS_MT_POSITION_X, x_minimum, x_maximum)?
+    .with_absolute_axis(ABS_MT_POSITION_Y, y_minimum, y_maximum)?;
+    if let Some((pressure_minimum, pressure_maximum)) = axis_range(&layout.pressure) {
+        metadata = metadata
+            .with_absolute_axis(ABS_PRESSURE, pressure_minimum, pressure_maximum)?
+            .with_absolute_axis(ABS_MT_PRESSURE, pressure_minimum, pressure_maximum)?;
+    }
+    if let Some((major_minimum, major_maximum)) = axis_range(&layout.touch_major) {
+        metadata = metadata.with_absolute_axis(ABS_MT_TOUCH_MAJOR, major_minimum, major_maximum)?;
+    }
+    let event = Arc::new(EventDevice::new_with_metadata("touchscreen", metadata));
+    let contacts = layout.contact_capacity().min(MAX_TOUCH_SLOTS);
+    let device = GoodixGt7375p {
         bus,
         address: I2cAddress::SevenBit(GOODIX_ADDRESS),
         irq,
         event,
-        max_contacts: MAX_CONTACTS,
-        resolution: (4096, 4096),
-        touching: IrqSpinLock::new(false),
+        max_input_length,
+        layout,
+        slots: IrqSpinLock::new(SlotTracker::new(MAX_TOUCH_SLOTS)),
         poll_fallback: AtomicBool::new(false),
         irq_work_pending: AtomicBool::new(false),
         active: AtomicBool::new(true),
         device_id: IrqSpinLock::new(None),
     };
 
-    // Match Linux goodix_i2c_test(): retry the ID register once after 20 ms.
-    // Preserve the concrete GENI error in the log instead of collapsing a
-    // NACK, bus error, and timeout into the same probe message.
-    let mut test = [0u8; 1];
-    let mut last_error = None;
-    for attempt in 1..=2 {
-        match device.read_register(GOODIX_REG_ID, &mut test) {
-            Ok(()) => {
-                last_error = None;
-                break;
-            }
-            Err(error) => {
-                last_error = Some(error);
-                early_println!(
-                    "[goodix-gt7375p] ID probe attempt {} at 0x{:02x} failed: {:?}",
-                    attempt,
-                    GOODIX_ADDRESS,
-                    error,
-                );
-                time::udelay(20_000);
-            }
-        }
-    }
-    if last_error.is_some() {
-        return Err("goodix-gt7375p: device-ID read failed");
-    }
-
-    let mut identity = [0u8; 6];
-    device
-        .read_register(GOODIX_REG_ID, &mut identity)
-        .map_err(|error| {
-            early_println!(
-                "[goodix-gt7375p] full ID read at 0x{:02x} failed after successful bus test: {:?}",
-                GOODIX_ADDRESS,
-                error,
-            );
-            "goodix-gt7375p: full device-ID read failed"
-        })?;
-    if identity[..4].iter().all(|byte| *byte == 0 || *byte == 0xff) {
-        return Err("goodix-gt7375p: invalid device ID");
-    }
-
-    let mut config = [0u8; CONFIG_LENGTH];
-    if device.read_register(GOODIX_REG_CONFIG, &mut config).is_ok() {
-        let width = u16::from_le_bytes([
-            config[CONFIG_RESOLUTION_OFFSET],
-            config[CONFIG_RESOLUTION_OFFSET + 1],
-        ]);
-        let height = u16::from_le_bytes([
-            config[CONFIG_RESOLUTION_OFFSET + 2],
-            config[CONFIG_RESOLUTION_OFFSET + 3],
-        ]);
-        let contacts = usize::from(config[CONFIG_MAX_CONTACTS_OFFSET] & 0x0f);
-        if width != 0 && height != 0 {
-            device.resolution = (width, height);
-        }
-        if contacts != 0 {
-            device.max_contacts = contacts.min(MAX_CONTACTS);
-        }
-    }
-
     early_println!(
-        "[goodix-gt7375p] ID={}{}{}{} version={:#06x} resolution={}x{} contacts={} ABI=single-contact-absolute",
-        identity[0] as char,
-        identity[1] as char,
-        identity[2] as char,
-        identity[3] as char,
-        u16::from_le_bytes([identity[4], identity[5]]),
-        device.resolution.0,
-        device.resolution.1,
-        device.max_contacts,
+        "[goodix-gt7375p] I2C-HID vendor={:#06x} product={:#06x} version={:#06x} report={} input={} touch-report={} x-range={}..{} y-range={}..{} contacts={} ABI=type-b-multitouch",
+        vendor_id,
+        product_id,
+        word(24).unwrap_or(0),
+        report_descriptor_length,
+        max_input_length,
+        device.layout.report_id,
+        x_minimum,
+        x_maximum,
+        y_minimum,
+        y_maximum,
+        contacts,
     );
 
     Ok(Arc::new(device))
@@ -513,7 +605,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     // CoachZ's pp3300_ts regulator is firmware-enabled. Scarlet has no PMIC
     // regulator provider yet, so retain that rail and only perform the
-    // controller-defined reset/address-selection sequence here.
+    // controller-defined I2C-HID reset sequence here.
     reset_controller(&reset, &irq);
     let touch = read_identity(bus, irq)?;
     let event = touch.event.clone();

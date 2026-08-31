@@ -14,6 +14,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "adreno-a6xx-layout"
+version = "0.1.0"
+
+[[package]]
 name = "adreno-a6xx-pm4"
 version = "0.1.0"
 
@@ -32,6 +36,7 @@ dependencies = [
 name = "sgfx-codegen-adreno-a6xx"
 version = "0.1.0"
 dependencies = [
+ "adreno-a6xx-layout",
  "adreno-a6xx-pm4",
  "adreno-a6xx-shader-pack",
  "sgfx-core",

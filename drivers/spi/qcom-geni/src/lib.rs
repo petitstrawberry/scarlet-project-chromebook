@@ -510,14 +510,38 @@ impl SpiBus for QcomGeniSpi {
                 time::udelay(segment.delay_before_us);
                 let read = segment.flags.contains(SpiTransferFlags::READ);
                 let write = segment.flags.contains(SpiTransferFlags::WRITE);
-                match (read, write) {
-                    (false, false) if segment.data.is_empty() => {}
-                    (false, false) => return Err(SpiError::InvalidArg),
-                    (false, true) => self.run_transfer(Some(&segment.data), None)?,
-                    (true, false) => self.run_transfer(None, Some(&mut segment.data))?,
-                    (true, true) => {
-                        let tx = segment.data.clone();
-                        self.run_transfer(Some(&tx), Some(&mut segment.data))?;
+                if let Some(condition) = segment.read_until {
+                    if !read
+                        || write
+                        || condition.max_bytes == 0
+                        || condition.value & !condition.mask != 0
+                    {
+                        return Err(SpiError::InvalidArg);
+                    }
+                    segment.data.clear();
+                    let mut matched = false;
+                    for _ in 0..condition.max_bytes {
+                        let mut byte = [0u8; 1];
+                        self.run_transfer(None, Some(&mut byte))?;
+                        segment.data.push(byte[0]);
+                        if byte[0] & condition.mask == condition.value {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        return Err(SpiError::Timeout);
+                    }
+                } else {
+                    match (read, write) {
+                        (false, false) if segment.data.is_empty() => {}
+                        (false, false) => return Err(SpiError::InvalidArg),
+                        (false, true) => self.run_transfer(Some(&segment.data), None)?,
+                        (true, false) => self.run_transfer(None, Some(&mut segment.data))?,
+                        (true, true) => {
+                            let tx = segment.data.clone();
+                            self.run_transfer(Some(&tx), Some(&mut segment.data))?;
+                        }
                     }
                 }
                 time::udelay(segment.delay_after_us);
