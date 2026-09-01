@@ -7,11 +7,22 @@ use scarlet_driver_ti_sn65dsi86::DisplayTiming;
 
 use crate::registers::RegisterWindow;
 
+// The DPU register block begins 0x1000 bytes into the parent MDSS mapping.
+// SC7180 routes INTF1's video-mode VSYNC through MDP_SSPP_TOP0_INTR bit 27.
+const TOP_BASE: usize = 0x01000;
 const CONTROL_BASE: usize = 0x02000;
 const SOURCE_PIPE_BASE: usize = 0x05000;
 const LAYER_MIXER_BASE: usize = 0x45000;
 const INTERFACE_BASE: usize = 0x6b800;
 const VBIF_BASE: usize = 0xb0000;
+
+const TOP_INTERRUPT2_ENABLE: usize = 0x008;
+const TOP_INTERRUPT2_CLEAR: usize = 0x02c;
+const TOP_INTERRUPT_ENABLE: usize = 0x010;
+const TOP_INTERRUPT_STATUS: usize = 0x014;
+const TOP_INTERRUPT_CLEAR: usize = 0x018;
+const TOP_HISTOGRAM_INTERRUPT_ENABLE: usize = 0x01c;
+const TOP_HISTOGRAM_INTERRUPT_CLEAR: usize = 0x024;
 
 const CONTROL_LAYER0: usize = 0x000;
 const CONTROL_TOP: usize = 0x014;
@@ -83,6 +94,14 @@ const FLUSH_VIG0: u32 = 1;
 const FLUSH_MIXER0: u32 = 1 << 6;
 const FLUSH_CONTROL: u32 = 1 << 17;
 const FLUSH_INTERFACE: u32 = 1 << 31;
+const INTERFACE1_VSYNC_INTERRUPT: u32 = 1 << 27;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VsyncInterruptClaim {
+    NotMine,
+    FlushPending,
+    Complete,
+}
 
 pub(crate) struct Dpu {
     registers: RegisterWindow,
@@ -364,5 +383,54 @@ impl Dpu {
     pub(crate) fn pending_flush(&self) -> u32 {
         arch::io_rmb();
         self.read(CONTROL_BASE, CONTROL_FLUSH)
+    }
+
+    pub(crate) fn mask_interrupts(&self) {
+        self.write(TOP_BASE, TOP_INTERRUPT_ENABLE, 0);
+        self.write(TOP_BASE, TOP_INTERRUPT2_ENABLE, 0);
+        self.write(TOP_BASE, TOP_HISTOGRAM_INTERRUPT_ENABLE, 0);
+        arch::io_wmb();
+    }
+
+    pub(crate) fn clear_pending_interrupts(&self) {
+        self.write(TOP_BASE, TOP_INTERRUPT_CLEAR, u32::MAX);
+        self.write(TOP_BASE, TOP_INTERRUPT2_CLEAR, u32::MAX);
+        self.write(TOP_BASE, TOP_HISTOGRAM_INTERRUPT_CLEAR, u32::MAX);
+        arch::io_wmb();
+    }
+
+    pub(crate) fn unmask_vsync_interrupt(&self) {
+        self.write(TOP_BASE, TOP_INTERRUPT_ENABLE, INTERFACE1_VSYNC_INTERRUPT);
+        arch::io_wmb();
+    }
+
+    pub(crate) fn mask_vsync_interrupt(&self) {
+        self.write(TOP_BASE, TOP_INTERRUPT_ENABLE, 0);
+        arch::io_wmb();
+    }
+
+    pub(crate) fn clear_vsync_interrupt(&self) {
+        self.write(TOP_BASE, TOP_INTERRUPT_CLEAR, INTERFACE1_VSYNC_INTERRUPT);
+        arch::io_wmb();
+    }
+
+    pub(crate) fn claim_vsync_interrupt(&self) -> VsyncInterruptClaim {
+        arch::io_rmb();
+        let status = self.read(TOP_BASE, TOP_INTERRUPT_STATUS);
+        if status & INTERFACE1_VSYNC_INTERRUPT == 0 {
+            return VsyncInterruptClaim::NotMine;
+        }
+
+        let flush_pending = self.pending_flush() != 0;
+        self.write(TOP_BASE, TOP_INTERRUPT_CLEAR, INTERFACE1_VSYNC_INTERRUPT);
+        if !flush_pending {
+            self.write(TOP_BASE, TOP_INTERRUPT_ENABLE, 0);
+        }
+        arch::io_wmb();
+        if flush_pending {
+            VsyncInterruptClaim::FlushPending
+        } else {
+            VsyncInterruptClaim::Complete
+        }
     }
 }

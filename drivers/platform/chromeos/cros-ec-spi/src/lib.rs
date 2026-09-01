@@ -46,14 +46,60 @@ const SPI_RX_BAD_DATA: u8 = 0xfb;
 const SPI_NOT_READY: u8 = 0xfc;
 
 const COMMAND_PWM_SET_DUTY: u16 = 0x0025;
+const COMMAND_PWM_GET_DUTY: u16 = 0x0026;
+const COMMAND_GET_FEATURES: u16 = 0x000d;
 const PWM_DISPLAY_LIGHT: u8 = 2;
 const PWM_FULL_SCALE: u32 = 0xffff;
+
+const COMMAND_MOTION_SENSE: u16 = 0x002b;
+const MOTION_SENSE_VERSION_LEGACY: u8 = 1;
+const MOTION_SENSE_VERSION_FIFO: u8 = 2;
+const MOTION_SENSE_VERSION_INFO_EXTENDED: u8 = 3;
+const MOTION_SENSE_COMMAND_DUMP: u8 = 0;
+const MOTION_SENSE_COMMAND_INFO: u8 = 1;
+const MOTION_SENSE_COMMAND_SENSOR_ODR: u8 = 3;
+const MOTION_SENSE_COMMAND_SENSOR_RANGE: u8 = 4;
+const MOTION_SENSE_COMMAND_DATA: u8 = 6;
+const MOTION_SENSE_COMMAND_FIFO_INFO: u8 = 7;
+const MOTION_SENSE_COMMAND_FIFO_READ: u8 = 9;
+const MOTION_SENSE_COMMAND_FIFO_INT_ENABLE: u8 = 15;
+const MOTION_SENSE_REQUEST_BYTES: usize = 13;
+const MOTION_SENSOR_DATA_BYTES: usize = 8;
+const MOTION_FIFO_INFO_FIXED_BYTES: usize = 10;
+const MOTION_FIFO_READ_FIXED_BYTES: usize = 4;
+const MKBP_SENSOR_FIFO_ALIGNMENT_BYTES: usize = 3;
+const MKBP_SENSOR_FIFO_EVENT_BYTES: usize =
+    MKBP_SENSOR_FIFO_ALIGNMENT_BYTES + MOTION_FIFO_INFO_FIXED_BYTES;
+const MOTION_FIFO_INT_QUERY: i8 = -1;
+const MOTION_SENSE_QUERY_VALUE: i32 = -1;
+const EC_RESULT_INVALID_VERSION: u16 = 6;
+const EC_FEATURE_MOTION_SENSE: u8 = 6;
+const EC_FEATURE_MOTION_SENSE_FIFO: u8 = 24;
+const EC_FEATURE_MOTION_SENSE_TIGHT_TIMESTAMPS: u8 = 36;
+
+/// FIFO entry marks a synchronization flush; its union payload is metadata.
+pub const CROS_EC_MOTION_SENSOR_FLAG_FLUSH: u8 = 1 << 0;
+/// FIFO entry stores an EC timestamp in the data union rather than XYZ values.
+pub const CROS_EC_MOTION_SENSOR_FLAG_TIMESTAMP: u8 = 1 << 1;
+/// FIFO entry originated from a wake-up sensor.
+pub const CROS_EC_MOTION_SENSOR_FLAG_WAKEUP: u8 = 1 << 2;
+/// FIFO entry reports an EC tablet-mode transition rather than XYZ values.
+pub const CROS_EC_MOTION_SENSOR_FLAG_TABLET_MODE: u8 = 1 << 3;
+/// FIFO entry reports a sensor ODR change rather than XYZ values.
+pub const CROS_EC_MOTION_SENSOR_FLAG_ODR: u8 = 1 << 4;
 
 // At the inherited 1.01 MHz Trogdor EC clock this is about 32 ms of polling.
 // PWM_SET_DUTY completes quickly, while keeping the allocation bounded and the
 // complete response inside one CS assertion.
 const RESPONSE_CLOCK_BYTES: usize = 4096;
 const CHIP_SELECT_COOLDOWN_US: u64 = 200;
+// A 256-vector response is 2052 payload bytes, leaving ample room for the
+// SPI response-start bytes and protocol-3 header inside the fixed 4096-byte
+// clock window.  Consumers must drain larger backlogs in chunks.
+/// Largest motion FIFO batch that fits safely in one EC SPI response window.
+///
+/// Callers draining a larger backlog must issue multiple reads.
+pub const CROS_EC_MAX_MOTION_FIFO_VECTORS: u32 = 256;
 
 const COMMAND_GET_NEXT_EVENT: u16 = 0x0067;
 const GET_NEXT_EVENT_VERSION: u8 = 2;
@@ -75,8 +121,11 @@ pub trait CrosEcEventListener: Send + Sync {
     ///
     /// # Returns
     ///
-    /// This callback has no return value.
-    fn on_cros_ec_event(&self, event_type: u8, data: &[u8]);
+    /// `true` when the event was consumed successfully. Returning `false`
+    /// keeps the EC IRQ masked and makes the worker retry with bounded
+    /// backoff, so a level-triggered source cannot turn a broken listener into
+    /// a kernel busy loop.
+    fn on_cros_ec_event(&self, event_type: u8, data: &[u8]) -> bool;
 }
 
 struct EventListenerEntry {
@@ -124,12 +173,382 @@ pub enum CrosEcError {
     EcResult(u16),
     /// A caller supplied a value outside the command's valid range.
     InvalidArgument,
+    /// A registered MKBP listener could not consume an event.
+    EventListenerFailed,
+}
+
+/// Summary returned by the Chrome EC motion-sense `DUMP` command.
+///
+/// The EC owns `sensor_count` motion sensors and advertises their module-wide
+/// status bits through `module_flags`.  A zero-count `DUMP` intentionally does
+/// not include any individual sensor samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrosEcMotionSensorSummary {
+    /// EC-defined module status flags.
+    pub module_flags: u8,
+    /// Number of motion sensors managed by the EC.
+    pub sensor_count: u8,
+}
+
+/// Static metadata for one Chrome EC motion sensor.
+///
+/// `sensor_type`, `location`, and `chip` retain the numeric values from the
+/// Chromium EC protocol.  The extended frequency and FIFO fields are absent
+/// when an older EC accepts only INFO version 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrosEcMotionSensorInfo {
+    /// Protocol `motionsensor_type` value.
+    pub sensor_type: u8,
+    /// Protocol `motionsensor_location` value.
+    pub location: u8,
+    /// Protocol `motionsensor_chip` value.
+    pub chip: u8,
+    /// Minimum sampling frequency in millihertz, if INFO version 3 was used.
+    pub min_frequency_millihz: Option<u32>,
+    /// Maximum sampling frequency in millihertz, if INFO version 3 was used.
+    pub max_frequency_millihz: Option<u32>,
+    /// Maximum FIFO event count, if INFO version 3 was used.
+    pub fifo_max_event_count: Option<u32>,
+}
+
+/// One three-axis motion-sensor sample returned by the Chrome EC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrosEcMotionSensorData {
+    /// EC-defined per-sample flags.
+    pub flags: u8,
+    /// Sensor index that produced this sample.
+    pub sensor_num: u8,
+    /// Raw X-axis value in the sensor's protocol-defined unit.
+    pub x: i16,
+    /// Raw Y-axis value in the sensor's protocol-defined unit.
+    pub y: i16,
+    /// Raw Z-axis value in the sensor's protocol-defined unit.
+    pub z: i16,
+}
+
+impl CrosEcMotionSensorData {
+    /// Return the EC timestamp carried by a timestamp FIFO entry.
+    ///
+    /// The Chromium EC overlays the XYZ union with a reserved 16-bit word and
+    /// a little-endian 32-bit timestamp.  `None` means this is not a timestamp
+    /// entry, so callers must not infer a timestamp from normal axis data.
+    ///
+    /// # Returns
+    ///
+    /// The timestamp in microseconds for a timestamp entry, otherwise `None`.
+    pub const fn timestamp_us(&self) -> Option<u32> {
+        if self.flags & CROS_EC_MOTION_SENSOR_FLAG_TIMESTAMP == 0 {
+            return None;
+        }
+        Some((self.y as u16 as u32) | ((self.z as u16 as u32) << 16))
+    }
+
+    /// Return whether this FIFO entry contains an XYZ vector sample.
+    ///
+    /// Wake-up is an annotation on an otherwise normal sample, but timestamp,
+    /// flush, ODR, and tablet-mode entries repurpose the payload union and are
+    /// therefore classified as metadata.
+    ///
+    /// # Returns
+    ///
+    /// `true` only when the XYZ fields are a sensor vector rather than
+    /// protocol metadata.
+    pub const fn is_vector_sample(&self) -> bool {
+        self.flags
+            & (CROS_EC_MOTION_SENSOR_FLAG_TIMESTAMP
+                | CROS_EC_MOTION_SENSOR_FLAG_FLUSH
+                | CROS_EC_MOTION_SENSOR_FLAG_ODR
+                | CROS_EC_MOTION_SENSOR_FLAG_TABLET_MODE)
+            == 0
+    }
+}
+
+/// Status of the Chrome EC motion FIFO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrosEcMotionFifoInfo {
+    /// Total FIFO capacity in vectors.
+    pub size: u16,
+    /// Vectors currently buffered by the EC.
+    pub count: u16,
+    /// EC timestamp in microseconds for the FIFO notification.
+    pub timestamp_us: u32,
+    /// Total number of vectors lost since boot.
+    pub total_lost: u16,
+    /// Vectors lost since the preceding `FIFO_INFO`, indexed by sensor.
+    pub lost_per_sensor: Vec<u16>,
+}
+
+/// A bounded batch of motion samples drained from the Chrome EC FIFO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrosEcMotionFifoData {
+    /// Samples in the same order in which the EC returned them.
+    pub samples: Vec<CrosEcMotionSensorData>,
+}
+
+/// Feature bits advertised by the Chrome EC through `EC_CMD_GET_FEATURES`.
+///
+/// The wire response contains two little-endian 32-bit words, representing
+/// feature numbers 0 through 63.  Unknown feature numbers are retained so
+/// callers can make conservative compatibility decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrosEcFeatures {
+    flags: [u32; 2],
+}
+
+impl CrosEcFeatures {
+    /// Return whether this EC advertises a feature number in the 0..64 range.
+    ///
+    /// # Arguments
+    ///
+    /// * `feature` - Chromium EC feature number to inspect.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the feature bit is set; feature numbers outside 0..64 are
+    /// reported as unsupported.
+    pub const fn has_feature(&self, feature: u8) -> bool {
+        if feature >= 64 {
+            return false;
+        }
+        let word = (feature / 32) as usize;
+        let bit = feature % 32;
+        self.flags[word] & (1u32 << bit) != 0
+    }
+
+    /// Return whether the EC owns motion sensors.
+    ///
+    /// # Returns
+    ///
+    /// `true` when feature bit 6 is set.
+    pub const fn supports_motion_sense(&self) -> bool {
+        self.has_feature(EC_FEATURE_MOTION_SENSE)
+    }
+
+    /// Return whether the EC implements the motion-sensor FIFO commands.
+    ///
+    /// # Returns
+    ///
+    /// `true` when feature bit 24 is set.
+    pub const fn supports_motion_sense_fifo(&self) -> bool {
+        self.has_feature(EC_FEATURE_MOTION_SENSE_FIFO)
+    }
+
+    /// Return whether FIFO samples use the EC's tight-timestamp extension.
+    ///
+    /// # Returns
+    ///
+    /// `true` when feature bit 36 is set.
+    pub const fn supports_motion_sense_tight_timestamps(&self) -> bool {
+        self.has_feature(EC_FEATURE_MOTION_SENSE_TIGHT_TIMESTAMPS)
+    }
 }
 
 impl From<SpiError> for CrosEcError {
     fn from(error: SpiError) -> Self {
         Self::Spi(error)
     }
+}
+
+fn pwm_duty_from_percent(percent: u8) -> Result<u16, CrosEcError> {
+    if percent > 100 {
+        return Err(CrosEcError::InvalidArgument);
+    }
+    let scaled = u32::from(percent)
+        .checked_mul(PWM_FULL_SCALE)
+        .ok_or(CrosEcError::InvalidArgument)?;
+    u16::try_from((scaled + 50) / 100).map_err(|_| CrosEcError::InvalidArgument)
+}
+
+fn pwm_percent_from_duty(duty: u16) -> u8 {
+    let scaled = u32::from(duty)
+        .saturating_mul(100)
+        .saturating_add(PWM_FULL_SCALE / 2)
+        / PWM_FULL_SCALE;
+    u8::try_from(scaled.min(100)).unwrap_or(100)
+}
+
+fn parse_features(response: &[u8]) -> Result<CrosEcFeatures, CrosEcError> {
+    if response.len() != 8 {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    Ok(CrosEcFeatures {
+        flags: [
+            u32::from_le_bytes([response[0], response[1], response[2], response[3]]),
+            u32::from_le_bytes([response[4], response[5], response[6], response[7]]),
+        ],
+    })
+}
+
+fn build_motion_sense_payload(
+    subcommand: u8,
+    parameters: &[u8],
+) -> Result<[u8; MOTION_SENSE_REQUEST_BYTES], CrosEcError> {
+    if parameters.len() >= MOTION_SENSE_REQUEST_BYTES {
+        return Err(CrosEcError::InvalidArgument);
+    }
+    // The Chromium EC ABI sends sizeof(struct ec_params_motion_sense), whose
+    // packed command byte plus 12-byte SET_ACTIVITY union member occupies 13 B.
+    let mut payload = [0u8; MOTION_SENSE_REQUEST_BYTES];
+    payload[0] = subcommand;
+    payload[1..1 + parameters.len()].copy_from_slice(parameters);
+    Ok(payload)
+}
+
+fn parse_motion_sensor_summary(response: &[u8]) -> Result<CrosEcMotionSensorSummary, CrosEcError> {
+    let [module_flags, sensor_count] = response else {
+        return Err(CrosEcError::InvalidResponse);
+    };
+    Ok(CrosEcMotionSensorSummary {
+        module_flags: *module_flags,
+        sensor_count: *sensor_count,
+    })
+}
+
+fn parse_motion_sensor_info_v1(response: &[u8]) -> Result<CrosEcMotionSensorInfo, CrosEcError> {
+    let [sensor_type, location, chip] = response else {
+        return Err(CrosEcError::InvalidResponse);
+    };
+    Ok(CrosEcMotionSensorInfo {
+        sensor_type: *sensor_type,
+        location: *location,
+        chip: *chip,
+        min_frequency_millihz: None,
+        max_frequency_millihz: None,
+        fifo_max_event_count: None,
+    })
+}
+
+fn parse_motion_sensor_info_v3(response: &[u8]) -> Result<CrosEcMotionSensorInfo, CrosEcError> {
+    if response.len() != 16 {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    Ok(CrosEcMotionSensorInfo {
+        sensor_type: response[0],
+        location: response[1],
+        chip: response[2],
+        // INFO v3 uses C's natural 4-byte alignment after the three u8 fields.
+        min_frequency_millihz: Some(u32::from_le_bytes([
+            response[4],
+            response[5],
+            response[6],
+            response[7],
+        ])),
+        max_frequency_millihz: Some(u32::from_le_bytes([
+            response[8],
+            response[9],
+            response[10],
+            response[11],
+        ])),
+        fifo_max_event_count: Some(u32::from_le_bytes([
+            response[12],
+            response[13],
+            response[14],
+            response[15],
+        ])),
+    })
+}
+
+fn parse_motion_sensor_data(response: &[u8]) -> Result<CrosEcMotionSensorData, CrosEcError> {
+    if response.len() != MOTION_SENSOR_DATA_BYTES {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    Ok(CrosEcMotionSensorData {
+        flags: response[0],
+        sensor_num: response[1],
+        x: i16::from_le_bytes([response[2], response[3]]),
+        y: i16::from_le_bytes([response[4], response[5]]),
+        z: i16::from_le_bytes([response[6], response[7]]),
+    })
+}
+
+fn parse_motion_fifo_info(
+    response: &[u8],
+    sensor_count: u8,
+) -> Result<CrosEcMotionFifoInfo, CrosEcError> {
+    let lost_bytes = usize::from(sensor_count)
+        .checked_mul(2)
+        .ok_or(CrosEcError::InvalidResponse)?;
+    let expected_len = MOTION_FIFO_INFO_FIXED_BYTES
+        .checked_add(lost_bytes)
+        .ok_or(CrosEcError::InvalidResponse)?;
+    if response.len() != expected_len {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    let mut lost_per_sensor = Vec::with_capacity(usize::from(sensor_count));
+    for bytes in response[MOTION_FIFO_INFO_FIXED_BYTES..].chunks_exact(2) {
+        lost_per_sensor.push(u16::from_le_bytes([bytes[0], bytes[1]]));
+    }
+    Ok(CrosEcMotionFifoInfo {
+        size: u16::from_le_bytes([response[0], response[1]]),
+        count: u16::from_le_bytes([response[2], response[3]]),
+        timestamp_us: u32::from_le_bytes([response[4], response[5], response[6], response[7]]),
+        total_lost: u16::from_le_bytes([response[8], response[9]]),
+        lost_per_sensor,
+    })
+}
+
+/// Decode the fixed FIFO snapshot embedded in an MKBP sensor-FIFO event.
+///
+/// The event data starts with three alignment bytes followed by the fixed
+/// ten-byte `ec_response_motion_sense_fifo_info`. Per-sensor loss counters do
+/// not fit in the MKBP event and must be queried separately when
+/// `total_lost != 0`.
+pub fn parse_motion_fifo_event(data: &[u8]) -> Result<CrosEcMotionFifoInfo, CrosEcError> {
+    if data.len() != MKBP_SENSOR_FIFO_EVENT_BYTES {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    parse_motion_fifo_info(&data[MKBP_SENSOR_FIFO_ALIGNMENT_BYTES..], 0)
+}
+
+fn parse_motion_fifo_data(
+    response: &[u8],
+    requested_vectors: u32,
+) -> Result<CrosEcMotionFifoData, CrosEcError> {
+    if response.len() < MOTION_FIFO_READ_FIXED_BYTES {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    let count = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+    if count > requested_vectors || count > CROS_EC_MAX_MOTION_FIFO_VECTORS {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    let sample_bytes = usize::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(MOTION_SENSOR_DATA_BYTES))
+        .ok_or(CrosEcError::InvalidResponse)?;
+    let expected_len = MOTION_FIFO_READ_FIXED_BYTES
+        .checked_add(sample_bytes)
+        .ok_or(CrosEcError::InvalidResponse)?;
+    if response.len() != expected_len {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    let mut samples = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+    for bytes in response[MOTION_FIFO_READ_FIXED_BYTES..].chunks_exact(MOTION_SENSOR_DATA_BYTES) {
+        samples.push(parse_motion_sensor_data(bytes)?);
+    }
+    Ok(CrosEcMotionFifoData { samples })
+}
+
+fn parse_motion_fifo_interrupt_enabled(response: &[u8]) -> Result<bool, CrosEcError> {
+    if response.len() != 4 {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    match i32::from_le_bytes([response[0], response[1], response[2], response[3]]) {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(CrosEcError::InvalidResponse),
+    }
+}
+
+fn parse_motion_i32_response(response: &[u8]) -> Result<i32, CrosEcError> {
+    if response.len() != 4 {
+        return Err(CrosEcError::InvalidResponse);
+    }
+    Ok(i32::from_le_bytes([
+        response[0],
+        response[1],
+        response[2],
+        response[3],
+    ]))
 }
 
 /// One Chrome EC reached through a Scarlet SPI bus.
@@ -297,14 +716,94 @@ impl CrosEcSpi {
         Self::decode_response(&segments[1].data).map(<[u8]>::to_vec)
     }
 
-    /// Set the display backlight to an integer percentage.
-    pub fn set_display_backlight_percent(&self, percent: u8) -> Result<(), CrosEcError> {
-        if percent > 100 {
-            return Err(CrosEcError::InvalidArgument);
+    fn motion_sense_command(
+        &self,
+        version: u8,
+        subcommand: u8,
+        parameters: &[u8],
+    ) -> Result<Vec<u8>, CrosEcError> {
+        let payload = build_motion_sense_payload(subcommand, parameters)?;
+        self.command(COMMAND_MOTION_SENSE, version, &payload)
+    }
+
+    /// Read the two-word Chrome EC feature bitmap.
+    ///
+    /// The response to `EC_CMD_GET_FEATURES` must be exactly two
+    /// little-endian 32-bit words.
+    ///
+    /// # Returns
+    ///
+    /// The complete 64-bit feature bitmap, or a transport/protocol error.
+    pub fn features(&self) -> Result<CrosEcFeatures, CrosEcError> {
+        let response = self.command(COMMAND_GET_FEATURES, 0, &[])?;
+        parse_features(&response)
+    }
+
+    /// Return whether this EC advertises motion-sensor support.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the live EC feature bitmap includes motion sense.
+    pub fn supports_motion_sense(&self) -> Result<bool, CrosEcError> {
+        Ok(self.features()?.supports_motion_sense())
+    }
+
+    /// Return whether this EC advertises motion FIFO support.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the live EC feature bitmap includes the motion FIFO.
+    pub fn supports_motion_sense_fifo(&self) -> Result<bool, CrosEcError> {
+        Ok(self.features()?.supports_motion_sense_fifo())
+    }
+
+    /// Return whether this EC advertises tight motion-sensor timestamps.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the live EC feature bitmap includes tight timestamps.
+    pub fn supports_motion_sense_tight_timestamps(&self) -> Result<bool, CrosEcError> {
+        Ok(self.features()?.supports_motion_sense_tight_timestamps())
+    }
+
+    /// Read the display backlight level as a rounded integer percentage.
+    ///
+    /// This uses `EC_CMD_PWM_GET_DUTY` with display-light PWM type 2 and
+    /// index 0.  The EC response is required to contain exactly one
+    /// little-endian 16-bit duty value.
+    ///
+    /// # Returns
+    ///
+    /// The rounded display brightness in the inclusive 0..=100 range.
+    pub fn get_display_backlight_percent(&self) -> Result<u8, CrosEcError> {
+        let response = self.command(COMMAND_PWM_GET_DUTY, 0, &[PWM_DISPLAY_LIGHT, 0])?;
+        if response.len() != 2 {
+            return Err(CrosEcError::InvalidResponse);
         }
-        let duty = u16::try_from(u32::from(percent) * PWM_FULL_SCALE / 100)
-            .map_err(|_| CrosEcError::InvalidArgument)?;
-        let payload = [duty as u8, (duty >> 8) as u8, PWM_DISPLAY_LIGHT, 0];
+        Ok(pwm_percent_from_duty(u16::from_le_bytes([
+            response[0],
+            response[1],
+        ])))
+    }
+
+    /// Set the display backlight to an integer percentage.
+    ///
+    /// The value is rounded to the nearest representable Chrome EC 16-bit PWM
+    /// duty cycle.  It must be within the inclusive range 0 through 100.
+    ///
+    /// # Arguments
+    ///
+    /// * `percent` - Requested display brightness in the inclusive 0..=100
+    ///   range.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after the EC accepted an empty successful response, or an
+    /// error if the percentage, transport, or response is invalid.
+    pub fn set_display_backlight_percent(&self, percent: u8) -> Result<(), CrosEcError> {
+        let duty = pwm_duty_from_percent(percent)?;
+        let duty = duty.to_le_bytes();
+        let payload = [duty[0], duty[1], PWM_DISPLAY_LIGHT, 0];
         let response = self.command(COMMAND_PWM_SET_DUTY, 0, &payload)?;
         if !response.is_empty() {
             return Err(CrosEcError::InvalidResponse);
@@ -312,7 +811,241 @@ impl CrosEcSpi {
         Ok(())
     }
 
-    fn dispatch_event(&self, event_type: u8, data: &[u8]) {
+    /// Return the Chrome EC's module-wide motion-sensor state and sensor count.
+    ///
+    /// The method issues `MOTIONSENSE_CMD_DUMP` with `max_sensor_count = 0`,
+    /// so the EC returns exactly the two-byte summary without snapshot data.
+    ///
+    /// # Returns
+    ///
+    /// The module flags and sensor count, or an error for a malformed/failed
+    /// host command.
+    pub fn motion_sensor_summary(&self) -> Result<CrosEcMotionSensorSummary, CrosEcError> {
+        let response = self.motion_sense_command(
+            MOTION_SENSE_VERSION_LEGACY,
+            MOTION_SENSE_COMMAND_DUMP,
+            &[0],
+        )?;
+        parse_motion_sensor_summary(&response)
+    }
+
+    /// Read static metadata for one Chrome EC motion sensor.
+    ///
+    /// INFO version 3 exposes sensor frequency and FIFO capacity.  Firmware
+    /// which reports `EC_RES_INVALID_VERSION` is retried once with INFO
+    /// version 1, preserving the three fields that older firmware supports.
+    ///
+    /// # Arguments
+    ///
+    /// * `sensor_num` - EC motion-sensor index obtained from the summary.
+    ///
+    /// # Returns
+    ///
+    /// The sensor metadata. Extended fields are `None` after an INFO v1
+    /// fallback.
+    pub fn motion_sensor_info(
+        &self,
+        sensor_num: u8,
+    ) -> Result<CrosEcMotionSensorInfo, CrosEcError> {
+        match self.motion_sense_command(
+            MOTION_SENSE_VERSION_INFO_EXTENDED,
+            MOTION_SENSE_COMMAND_INFO,
+            &[sensor_num],
+        ) {
+            Ok(response) => parse_motion_sensor_info_v3(&response),
+            Err(CrosEcError::EcResult(EC_RESULT_INVALID_VERSION)) => {
+                let response = self.motion_sense_command(
+                    MOTION_SENSE_VERSION_LEGACY,
+                    MOTION_SENSE_COMMAND_INFO,
+                    &[sensor_num],
+                )?;
+                parse_motion_sensor_info_v1(&response)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Read a motion sensor's current output-data rate in millihertz.
+    ///
+    /// The query sends the Chromium EC `EC_MOTION_SENSE_NO_VALUE` sentinel
+    /// rather than changing the sampling configuration.  The response is an
+    /// exact little-endian signed 32-bit value.
+    ///
+    /// # Arguments
+    ///
+    /// * `sensor_num` - EC motion-sensor index to query.
+    ///
+    /// # Returns
+    ///
+    /// The current output-data rate in millihertz.
+    pub fn motion_sensor_odr_millihz(&self, sensor_num: u8) -> Result<i32, CrosEcError> {
+        self.motion_sensor_parameter_query(MOTION_SENSE_COMMAND_SENSOR_ODR, sensor_num)
+    }
+
+    /// Read a motion sensor's current range in its protocol-defined unit.
+    ///
+    /// Accelerometers use ±g and gyroscopes use ±degrees/second.  The query
+    /// does not modify the configuration and requires an exact signed 32-bit
+    /// little-endian response.
+    ///
+    /// # Arguments
+    ///
+    /// * `sensor_num` - EC motion-sensor index to query.
+    ///
+    /// # Returns
+    ///
+    /// The current range in the queried sensor type's protocol unit.
+    pub fn motion_sensor_range(&self, sensor_num: u8) -> Result<i32, CrosEcError> {
+        self.motion_sensor_parameter_query(MOTION_SENSE_COMMAND_SENSOR_RANGE, sensor_num)
+    }
+
+    fn motion_sensor_parameter_query(
+        &self,
+        subcommand: u8,
+        sensor_num: u8,
+    ) -> Result<i32, CrosEcError> {
+        let mut parameters = [0u8; 8];
+        parameters[0] = sensor_num;
+        // roundup = 0 and reserved = 0; -1 is EC_MOTION_SENSE_NO_VALUE.
+        parameters[4..8].copy_from_slice(&MOTION_SENSE_QUERY_VALUE.to_le_bytes());
+        let response =
+            self.motion_sense_command(MOTION_SENSE_VERSION_LEGACY, subcommand, &parameters)?;
+        parse_motion_i32_response(&response)
+    }
+
+    /// Read one current three-axis sample from a Chrome EC motion sensor.
+    ///
+    /// The legacy motion-sense command version has the broadest firmware
+    /// compatibility.  The returned response is required to be the exact
+    /// eight-byte `ec_response_motion_sensor_data` wire structure.
+    ///
+    /// # Arguments
+    ///
+    /// * `sensor_num` - EC motion-sensor index to sample.
+    ///
+    /// # Returns
+    ///
+    /// One current three-axis sample with the EC-provided flags and source
+    /// sensor index.
+    pub fn motion_sensor_data(
+        &self,
+        sensor_num: u8,
+    ) -> Result<CrosEcMotionSensorData, CrosEcError> {
+        let response = self.motion_sense_command(
+            MOTION_SENSE_VERSION_LEGACY,
+            MOTION_SENSE_COMMAND_DATA,
+            &[sensor_num],
+        )?;
+        parse_motion_sensor_data(&response)
+    }
+
+    /// Query whether motion FIFO notifications are enabled at the EC.
+    ///
+    /// `MOTIONSENSE_CMD_FIFO_INT_ENABLE` accepts -1 as a query and returns an
+    /// exact little-endian signed 32-bit 0 or 1 state value.
+    ///
+    /// # Returns
+    ///
+    /// Whether the EC currently emits motion FIFO notifications.
+    pub fn motion_fifo_interrupt_enabled(&self) -> Result<bool, CrosEcError> {
+        self.motion_fifo_interrupt_enabled_raw(MOTION_FIFO_INT_QUERY)
+    }
+
+    /// Enable or disable Chrome EC MKBP motion-FIFO notifications.
+    ///
+    /// The returned boolean is the state confirmed by the EC after the update.
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - Whether the EC should emit motion FIFO notifications.
+    ///
+    /// # Returns
+    ///
+    /// The state confirmed by the EC after processing the request.
+    pub fn set_motion_fifo_interrupt_enabled(&self, enabled: bool) -> Result<bool, CrosEcError> {
+        self.motion_fifo_interrupt_enabled_raw(i8::from(enabled))
+    }
+
+    fn motion_fifo_interrupt_enabled_raw(&self, value: i8) -> Result<bool, CrosEcError> {
+        let response = self.motion_sense_command(
+            MOTION_SENSE_VERSION_FIFO,
+            MOTION_SENSE_COMMAND_FIFO_INT_ENABLE,
+            &[value as u8],
+        )?;
+        parse_motion_fifo_interrupt_enabled(&response)
+    }
+
+    /// Return motion FIFO capacity, fill state, timestamp, and loss counters.
+    ///
+    /// The EC's variable-length response contains one 16-bit loss counter per
+    /// sensor.  This method first obtains the authoritative sensor count from
+    /// a zero-count `DUMP` and rejects any response with a different length.
+    ///
+    /// # Returns
+    ///
+    /// FIFO status including exactly one loss counter for every EC sensor.
+    pub fn motion_fifo_info(&self) -> Result<CrosEcMotionFifoInfo, CrosEcError> {
+        let summary = self.motion_sensor_summary()?;
+        self.motion_fifo_info_for_sensor_count(summary.sensor_count)
+    }
+
+    /// Return motion FIFO status using a sensor count already obtained at probe.
+    ///
+    /// Sensor hubs that cached the immutable count from
+    /// [`Self::motion_sensor_summary`] should use this method for each FIFO
+    /// event: it issues only `MOTIONSENSE_CMD_FIFO_INFO` and still requires the
+    /// response to contain exactly one loss counter per supplied sensor.
+    ///
+    /// # Arguments
+    ///
+    /// * `sensor_count` - Immutable count returned during sensor-hub probe.
+    ///
+    /// # Returns
+    ///
+    /// FIFO status when the exact response length matches `sensor_count`.
+    pub fn motion_fifo_info_for_sensor_count(
+        &self,
+        sensor_count: u8,
+    ) -> Result<CrosEcMotionFifoInfo, CrosEcError> {
+        // Linux and Chromium EC send only the command byte for FIFO_INFO.
+        // Padding this parameterless request to sizeof(ec_params_motion_sense)
+        // is not accepted by every EC implementation.
+        let response = self.command(
+            COMMAND_MOTION_SENSE,
+            MOTION_SENSE_VERSION_FIFO,
+            &[MOTION_SENSE_COMMAND_FIFO_INFO],
+        )?;
+        parse_motion_fifo_info(&response, sensor_count)
+    }
+
+    /// Drain up to `max_vectors` motion samples from the EC FIFO.
+    ///
+    /// Requests larger than the bounded SPI response capacity are rejected
+    /// before reaching the EC.  The response count and byte length must match
+    /// exactly, preventing a malformed FIFO payload from being consumed.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_vectors` - Maximum samples to read, from 0 through
+    ///   [`CROS_EC_MAX_MOTION_FIFO_VECTORS`].
+    ///
+    /// # Returns
+    ///
+    /// Samples returned by the EC in FIFO order; the batch may contain fewer
+    /// than `max_vectors` samples when the FIFO is empty or partially drained.
+    pub fn motion_fifo_read(&self, max_vectors: u32) -> Result<CrosEcMotionFifoData, CrosEcError> {
+        if max_vectors > CROS_EC_MAX_MOTION_FIFO_VECTORS {
+            return Err(CrosEcError::InvalidArgument);
+        }
+        let response = self.motion_sense_command(
+            MOTION_SENSE_VERSION_FIFO,
+            MOTION_SENSE_COMMAND_FIFO_READ,
+            &max_vectors.to_le_bytes(),
+        )?;
+        parse_motion_fifo_data(&response, max_vectors)
+    }
+
+    fn dispatch_event(&self, event_type: u8, data: &[u8]) -> bool {
         let listeners = {
             let mut registered = self.event_listeners.lock();
             let mut live = Vec::with_capacity(registered.len());
@@ -326,12 +1059,14 @@ impl CrosEcSpi {
             });
             live
         };
+        let mut consumed = true;
         for listener in listeners {
             if !self.active.load(Ordering::Acquire) {
                 break;
             }
-            listener.on_cros_ec_event(event_type, data);
+            consumed &= listener.on_cros_ec_event(event_type, data);
         }
+        consumed
     }
 
     fn drain_events(&self) -> Result<(), CrosEcError> {
@@ -342,7 +1077,9 @@ impl CrosEcSpi {
                 Err(error) => return Err(error),
             };
             let event = parse_mkbp_event(&response)?;
-            self.dispatch_event(event.event_type, event.data);
+            if !self.dispatch_event(event.event_type, event.data) {
+                return Err(CrosEcError::EventListenerFailed);
+            }
             if !event.more {
                 return Ok(());
             }
@@ -666,5 +1403,266 @@ mod tests {
         assert_eq!(event_retry_delay_ns(3), 1_000_000_000);
         assert_eq!(event_retry_delay_ns(6), EVENT_RETRY_MAX_NS);
         assert_eq!(event_retry_delay_ns(u64::MAX), EVENT_RETRY_MAX_NS);
+    }
+
+    #[test]
+    fn converts_display_pwm_percentages_without_overflow() {
+        assert_eq!(pwm_duty_from_percent(0), Ok(0));
+        assert_eq!(pwm_duty_from_percent(50), Ok(32_768));
+        assert_eq!(pwm_duty_from_percent(100), Ok(65_535));
+        assert_eq!(
+            pwm_duty_from_percent(101),
+            Err(CrosEcError::InvalidArgument)
+        );
+        for percent in 0..=100 {
+            let duty = pwm_duty_from_percent(percent).unwrap();
+            assert_eq!(pwm_percent_from_duty(duty), percent);
+        }
+    }
+
+    #[test]
+    fn parses_exact_feature_words_and_motion_feature_positions() {
+        let response = [
+            1 << EC_FEATURE_MOTION_SENSE,
+            0,
+            0,
+            1 << (EC_FEATURE_MOTION_SENSE_FIFO - 24),
+            1 << (EC_FEATURE_MOTION_SENSE_TIGHT_TIMESTAMPS - 32),
+            0,
+            0,
+            0,
+        ];
+        let features = parse_features(&response).unwrap();
+        assert!(features.supports_motion_sense());
+        assert!(features.supports_motion_sense_fifo());
+        assert!(features.supports_motion_sense_tight_timestamps());
+        assert!(!features.has_feature(64));
+        assert_eq!(
+            parse_features(&response[..7]),
+            Err(CrosEcError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn parses_aligned_mkbp_motion_fifo_snapshot() {
+        let event = [
+            0xaa, 0xbb, 0xcc, // alignment bytes are not protocol data
+            0x00, 0x02, // size = 512
+            0x07, 0x00, // count = 7
+            0x78, 0x56, 0x34, 0x12, // timestamp
+            0x00, 0x00, // no losses in the compact event
+        ];
+        assert_eq!(
+            parse_motion_fifo_event(&event),
+            Ok(CrosEcMotionFifoInfo {
+                size: 512,
+                count: 7,
+                timestamp_us: 0x1234_5678,
+                total_lost: 0,
+                lost_per_sensor: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse_motion_fifo_event(&event[..event.len() - 1]),
+            Err(CrosEcError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn encodes_full_sized_motion_requests() {
+        assert_eq!(
+            build_motion_sense_payload(MOTION_SENSE_COMMAND_DUMP, &[0]),
+            Ok([
+                MOTION_SENSE_COMMAND_DUMP,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ])
+        );
+        assert_eq!(
+            build_motion_sense_payload(
+                MOTION_SENSE_COMMAND_SENSOR_ODR,
+                &[7, 0, 0, 0, 0xff, 0xff, 0xff, 0xff],
+            ),
+            Ok([
+                MOTION_SENSE_COMMAND_SENSOR_ODR,
+                7,
+                0,
+                0,
+                0,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0,
+                0,
+                0,
+                0,
+            ])
+        );
+        assert_eq!(
+            build_motion_sense_payload(MOTION_SENSE_COMMAND_DATA, &[0; 13]),
+            Err(CrosEcError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn parses_motion_summary_info_and_sensor_data_exactly() {
+        assert_eq!(
+            parse_motion_sensor_summary(&[0xa5, 2]),
+            Ok(CrosEcMotionSensorSummary {
+                module_flags: 0xa5,
+                sensor_count: 2,
+            })
+        );
+        assert_eq!(
+            parse_motion_sensor_summary(&[0xa5]),
+            Err(CrosEcError::InvalidResponse)
+        );
+        assert_eq!(
+            parse_motion_sensor_info_v1(&[0, 1, 24]),
+            Ok(CrosEcMotionSensorInfo {
+                sensor_type: 0,
+                location: 1,
+                chip: 24,
+                min_frequency_millihz: None,
+                max_frequency_millihz: None,
+                fifo_max_event_count: None,
+            })
+        );
+        assert_eq!(
+            parse_motion_sensor_info_v3(&[
+                0, 1, 24, 0, 0x10, 0, 0, 0, 0x20, 0, 0, 0, 0x30, 0, 0, 0,
+            ]),
+            Ok(CrosEcMotionSensorInfo {
+                sensor_type: 0,
+                location: 1,
+                chip: 24,
+                min_frequency_millihz: Some(16),
+                max_frequency_millihz: Some(32),
+                fifo_max_event_count: Some(48),
+            })
+        );
+        assert_eq!(
+            parse_motion_sensor_info_v3(&[0; 15]),
+            Err(CrosEcError::InvalidResponse)
+        );
+        assert_eq!(
+            parse_motion_sensor_data(&[0x80, 3, 0xfe, 0xff, 2, 0, 0, 0x80]),
+            Ok(CrosEcMotionSensorData {
+                flags: 0x80,
+                sensor_num: 3,
+                x: -2,
+                y: 2,
+                z: i16::MIN,
+            })
+        );
+        let timestamp = parse_motion_sensor_data(&[
+            CROS_EC_MOTION_SENSOR_FLAG_TIMESTAMP,
+            3,
+            0,
+            0,
+            0x78,
+            0x56,
+            0x34,
+            0x12,
+        ])
+        .unwrap();
+        assert_eq!(timestamp.timestamp_us(), Some(0x1234_5678));
+        assert!(!timestamp.is_vector_sample());
+        assert!(
+            CrosEcMotionSensorData {
+                flags: CROS_EC_MOTION_SENSOR_FLAG_WAKEUP,
+                sensor_num: 0,
+                x: 0,
+                y: 0,
+                z: 0,
+            }
+            .is_vector_sample()
+        );
+        assert_eq!(
+            parse_motion_sensor_data(&[0; 7]),
+            Err(CrosEcError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn parses_motion_fifo_with_strict_count_and_lengths() {
+        assert_eq!(CROS_EC_MAX_MOTION_FIFO_VECTORS, 256);
+        let info = [0x40, 0, 3, 0, 1, 0, 0, 0, 9, 0, 2, 0, 4, 0];
+        assert_eq!(
+            parse_motion_fifo_info(&info, 2),
+            Ok(CrosEcMotionFifoInfo {
+                size: 64,
+                count: 3,
+                timestamp_us: 1,
+                total_lost: 9,
+                lost_per_sensor: vec![2, 4],
+            })
+        );
+        assert_eq!(
+            parse_motion_fifo_info(&info[..13], 2),
+            Err(CrosEcError::InvalidResponse)
+        );
+
+        let data = [
+            2, 0, 0, 0, 0, 1, 1, 0, 2, 0, 3, 0, 0, 2, 0xfe, 0xff, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            parse_motion_fifo_data(&data, 2),
+            Ok(CrosEcMotionFifoData {
+                samples: vec![
+                    CrosEcMotionSensorData {
+                        flags: 0,
+                        sensor_num: 1,
+                        x: 1,
+                        y: 2,
+                        z: 3,
+                    },
+                    CrosEcMotionSensorData {
+                        flags: 0,
+                        sensor_num: 2,
+                        x: -2,
+                        y: 0,
+                        z: 0,
+                    },
+                ],
+            })
+        );
+        assert_eq!(
+            parse_motion_fifo_data(&data, 1),
+            Err(CrosEcError::InvalidResponse)
+        );
+        assert_eq!(
+            parse_motion_fifo_data(&data[..19], 2),
+            Err(CrosEcError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn parses_exact_motion_parameter_and_fifo_interrupt_responses() {
+        assert_eq!(parse_motion_i32_response(&[0xff, 0xff, 0xff, 0xff]), Ok(-1));
+        assert_eq!(
+            parse_motion_i32_response(&[0; 3]),
+            Err(CrosEcError::InvalidResponse)
+        );
+        assert_eq!(
+            parse_motion_fifo_interrupt_enabled(&[0, 0, 0, 0]),
+            Ok(false)
+        );
+        assert_eq!(parse_motion_fifo_interrupt_enabled(&[1, 0, 0, 0]), Ok(true));
+        assert_eq!(
+            parse_motion_fifo_interrupt_enabled(&[2, 0, 0, 0]),
+            Err(CrosEcError::InvalidResponse)
+        );
     }
 }

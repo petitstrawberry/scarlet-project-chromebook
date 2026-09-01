@@ -180,7 +180,7 @@ mod runtime {
     }
 
     impl CrosEcEventListener for ChromeEcMkbpSwitch {
-        fn on_cros_ec_event(&self, event_type: u8, data: &[u8]) {
+        fn on_cros_ec_event(&self, event_type: u8, data: &[u8]) -> bool {
             match parse_switch_event(event_type, data) {
                 Ok(Some(state)) => self.accept_state(state),
                 Ok(None) => {}
@@ -188,6 +188,7 @@ mod runtime {
                     early_println!("[chrome-ec-mkbp-switch] discarded malformed switch event")
                 }
             }
+            true
         }
     }
 

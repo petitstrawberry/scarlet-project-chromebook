@@ -97,7 +97,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-chrome-ec-mkbp-button"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-cros-ec-spi",
+]
+
+[[package]]
 name = "scarlet-driver-chrome-ec-mkbp-switch"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-cros-ec-spi",
+]
+
+[[package]]
+name = "scarlet-driver-chrome-ec-motion-sense"
 version = "0.1.0"
 dependencies = [
  "scarlet",
@@ -356,7 +372,9 @@ name = "scarlet-modules"
 version = "0.1.0"
 dependencies = [
  "scarlet",
+ "scarlet-driver-chrome-ec-mkbp-button",
  "scarlet-driver-chrome-ec-mkbp-switch",
+ "scarlet-driver-chrome-ec-motion-sense",
  "scarlet-driver-chrome-ec-usb-touchpad",
  "scarlet-driver-cros-ec-spi",
  "scarlet-driver-goodix-gt7375p",

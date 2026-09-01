@@ -70,7 +70,8 @@ const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
 const SAMPLE_BITS: u64 = 16;
 const BIT_CLOCK_RATE: u64 = SAMPLE_RATE as u64 * SAMPLE_BITS * CHANNELS as u64;
-const MAX_IN_FLIGHT_PERIODS: usize = 4;
+const PCM_BYTES_PER_SECOND: u64 = BIT_CLOCK_RATE / 8;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 // ChromeOS CoachZ calibration from
 // sc7180-adau7002-max98357a's explicit Speaker volume curve. Values are signed
@@ -150,6 +151,11 @@ struct PlaybackState {
     params: Option<AudioPcmParams>,
     buffer: Option<AudioPcmBuffer>,
     dma_mapping: Option<DmaMapping>,
+    dma_addr: u32,
+    buffer_bytes: usize,
+    period_bytes: usize,
+    last_dma_offset: usize,
+    last_position_ns: u64,
     queued_periods: usize,
     running: bool,
 }
@@ -160,10 +166,61 @@ impl PlaybackState {
             params: None,
             buffer: None,
             dma_mapping: None,
+            dma_addr: 0,
+            buffer_bytes: 0,
+            period_bytes: 0,
+            last_dma_offset: 0,
+            last_position_ns: 0,
             queued_periods: 0,
             running: false,
         }
     }
+}
+
+fn dma_ring_offset(dma_addr: u32, buffer_bytes: usize, current: u32) -> Option<usize> {
+    let offset = u64::from(current).checked_sub(u64::from(dma_addr))?;
+    let offset = usize::try_from(offset).ok()?;
+    (offset < buffer_bytes).then_some(offset)
+}
+
+fn completed_periods_from_dma_position(
+    last_offset: usize,
+    current_offset: usize,
+    buffer_bytes: usize,
+    period_bytes: usize,
+    elapsed_ns: u64,
+) -> usize {
+    if buffer_bytes == 0
+        || period_bytes == 0
+        || last_offset >= buffer_bytes
+        || current_offset >= buffer_bytes
+    {
+        return 0;
+    }
+
+    let modulo_advance = if current_offset >= last_offset {
+        current_offset - last_offset
+    } else {
+        buffer_bytes - last_offset + current_offset
+    };
+    let expected_advance = ((u128::from(elapsed_ns) * u128::from(PCM_BYTES_PER_SECOND))
+        / u128::from(NANOS_PER_SECOND))
+    .min(usize::MAX as u128) as usize;
+
+    // RDMACURR is a ring position, so a delayed completion worker loses whole
+    // revolutions. Select the revolution count closest to the elapsed audio
+    // time. Normal callbacks never need this correction; it matters when
+    // period IRQs coalesce during a scheduler or interrupt stall.
+    let revolutions = if expected_advance > modulo_advance {
+        expected_advance
+            .saturating_sub(modulo_advance)
+            .saturating_add(buffer_bytes / 2)
+            / buffer_bytes
+    } else {
+        0
+    };
+    let advanced = modulo_advance.saturating_add(revolutions.saturating_mul(buffer_bytes));
+    (last_offset % period_bytes).saturating_add(advanced) / period_bytes
 }
 
 /// Direct SC7180 LPAIF secondary-MI2S playback controller.
@@ -179,7 +236,7 @@ pub struct Sc7180Lpass {
     route: IrqSpinLock<Option<PlaybackRoute>>,
     state: IrqSpinLock<PlaybackState>,
     completion_callback: IrqSpinLock<Option<AudioCompletionCallback>>,
-    pending_completions: AtomicUsize,
+    fault_completions: AtomicUsize,
 }
 
 impl Sc7180Lpass {
@@ -244,19 +301,9 @@ impl Sc7180Lpass {
     }
 
     fn handle_period_interrupt(&self) {
-        let completed = {
-            let mut state = self.state.lock();
-            if !state.running || state.queued_periods == 0 {
-                false
-            } else {
-                state.queued_periods -= 1;
-                true
-            }
-        };
-        if !completed {
+        if !self.state.lock().running {
             return;
         }
-        self.pending_completions.fetch_add(1, Ordering::Release);
         let callback = self.completion_callback.lock().clone();
         if let Some(callback) = callback {
             callback();
@@ -264,20 +311,28 @@ impl Sc7180Lpass {
     }
 
     fn handle_stream_error(&self, status: u32) {
-        {
+        let forced_completions = {
             let mut state = self.state.lock();
+            let forced = state.queued_periods.saturating_add(1);
             state.running = false;
             state.queued_periods = 0;
-        }
+            forced
+        };
         self.registers.update(RDMA_CONTROL, RDMA_ENABLE, 0);
         self.registers.write(IRQ_ENABLE, 0);
         self.registers.update(I2S_CONTROL, I2S_SPK_ENABLE, 0);
         arch::io_wmb();
+        self.fault_completions
+            .store(forced_completions, Ordering::Release);
         early_println!(
             "[qcom-sc7180-lpass] playback fault status={:#x} current={:#010x}",
             status,
             self.registers.read(RDMA_CURRENT),
         );
+        let callback = self.completion_callback.lock().clone();
+        if let Some(callback) = callback {
+            callback();
+        }
     }
 }
 
@@ -348,9 +403,14 @@ impl AudioPlaybackDevice for Sc7180Lpass {
         state.params = Some(*params);
         state.buffer = Some(buffer);
         state.dma_mapping = Some(dma_mapping);
+        state.dma_addr = dma_addr;
+        state.buffer_bytes = buffer_bytes;
+        state.period_bytes = period_bytes;
+        state.last_dma_offset = 0;
+        state.last_position_ns = 0;
         state.queued_periods = 0;
         state.running = false;
-        self.pending_completions.store(0, Ordering::Release);
+        self.fault_completions.store(0, Ordering::Release);
         early_println!(
             "[qcom-sc7180-lpass] configured secondary MI2S dma={:#010x} buffer={} period={} bclk={}",
             dma_addr,
@@ -376,24 +436,32 @@ impl AudioPlaybackDevice for Sc7180Lpass {
         }
 
         let route = self.route()?;
-        self.registers.write(IRQ_CLEAR, IRQ_ALL);
-        self.registers.write(IRQ_ENABLE, IRQ_ALL);
         self.bit_clock
             .prepare_enable()
             .map_err(|_| "qcom-sc7180-lpass: failed to enable secondary MI2S bit clock")?;
+        if let Err(error) = route.codec.set_playback_powered(true) {
+            self.bit_clock.disable_unprepare();
+            return Err(error);
+        }
+
+        self.registers.write(IRQ_CLEAR, IRQ_ALL);
+        self.fault_completions.store(0, Ordering::Release);
+        {
+            let mut state = self.state.lock();
+            state.last_dma_offset = 0;
+            state.last_position_ns = time::current_time_ns();
+            state.running = true;
+        }
+        self.registers.write(IRQ_ENABLE, IRQ_ALL);
         self.registers.update(I2S_CONTROL, 0, I2S_SPK_ENABLE);
         self.registers.update(RDMA_CONTROL, 0, RDMA_ENABLE);
         arch::io_wmb();
         time::udelay(1);
-        if let Err(error) = route.codec.set_playback_powered(true) {
-            self.disable_hardware(Some(&route.codec));
-            return Err(error);
-        }
         if let Err(error) = route.codec.set_playback_muted(false) {
+            self.state.lock().running = false;
             self.disable_hardware(Some(&route.codec));
             return Err(error);
         }
-        self.state.lock().running = true;
         Ok(())
     }
 
@@ -403,9 +471,10 @@ impl AudioPlaybackDevice for Sc7180Lpass {
             let mut state = self.state.lock();
             state.running = false;
             state.queued_periods = 0;
+            state.last_position_ns = 0;
         }
         self.disable_hardware(route.as_ref().map(|route| &route.codec));
-        self.pending_completions.store(0, Ordering::Release);
+        self.fault_completions.store(0, Ordering::Release);
         Ok(())
     }
 
@@ -415,6 +484,11 @@ impl AudioPlaybackDevice for Sc7180Lpass {
             let mut state = self.state.lock();
             state.params = None;
             state.buffer = None;
+            state.dma_addr = 0;
+            state.buffer_bytes = 0;
+            state.period_bytes = 0;
+            state.last_dma_offset = 0;
+            state.last_position_ns = 0;
             state.dma_mapping.take()
         };
         // IOMMU teardown can invalidate page tables and wait for TLB sync.
@@ -442,7 +516,8 @@ impl AudioPlaybackDevice for Sc7180Lpass {
         {
             return Err("qcom-sc7180-lpass: invalid PCM period");
         }
-        if state.queued_periods >= MAX_IN_FLIGHT_PERIODS {
+        let period_capacity = buffer.buffer_bytes / period_bytes;
+        if period_capacity == 0 || state.queued_periods >= period_capacity {
             return Err("qcom-sc7180-lpass: PCM period queue is full");
         }
         state.queued_periods += 1;
@@ -450,7 +525,63 @@ impl AudioPlaybackDevice for Sc7180Lpass {
     }
 
     fn process_completions(&self) -> usize {
-        self.pending_completions.swap(0, Ordering::AcqRel)
+        let forced = self.fault_completions.swap(0, Ordering::AcqRel);
+        if forced != 0 {
+            return forced;
+        }
+
+        let now_ns = time::current_time_ns();
+        let current = self.registers.read(RDMA_CURRENT);
+        arch::io_rmb();
+        let (completed, queued_before, dma_addr, buffer_bytes) = {
+            let mut state = self.state.lock();
+            if !state.running {
+                return 0;
+            }
+            let Some(current_offset) = dma_ring_offset(state.dma_addr, state.buffer_bytes, current)
+            else {
+                return 0;
+            };
+            let completed = completed_periods_from_dma_position(
+                state.last_dma_offset,
+                current_offset,
+                state.buffer_bytes,
+                state.period_bytes,
+                now_ns.saturating_sub(state.last_position_ns),
+            );
+            state.last_dma_offset = current_offset;
+            state.last_position_ns = now_ns;
+            if completed == 0 {
+                return 0;
+            }
+
+            let queued_before = state.queued_periods;
+            if completed > queued_before {
+                state.queued_periods = 0;
+                state.running = false;
+            } else {
+                state.queued_periods -= completed;
+            }
+            (completed, queued_before, state.dma_addr, state.buffer_bytes)
+        };
+
+        if completed > queued_before {
+            // Stop the DMA path immediately. Codec power and the bit clock are
+            // released by the normal stop/recovery path outside IRQ context.
+            self.registers.update(RDMA_CONTROL, RDMA_ENABLE, 0);
+            self.registers.write(IRQ_ENABLE, 0);
+            self.registers.update(I2S_CONTROL, I2S_SPK_ENABLE, 0);
+            arch::io_wmb();
+            early_println!(
+                "[qcom-sc7180-lpass] playback underrun completed={} queued={} current={:#010x} base={:#010x} buffer={}",
+                completed,
+                queued_before,
+                current,
+                dma_addr,
+                buffer_bytes,
+            );
+        }
+        completed
     }
 
     fn set_completion_callback(&self, callback: Option<AudioCompletionCallback>) {
@@ -458,7 +589,11 @@ impl AudioPlaybackDevice for Sc7180Lpass {
     }
 
     fn max_in_flight_periods(&self) -> usize {
-        MAX_IN_FLIGHT_PERIODS
+        let state = self.state.lock();
+        if state.period_bytes == 0 {
+            return 1;
+        }
+        (state.buffer_bytes / state.period_bytes).max(1)
     }
 }
 
@@ -602,7 +737,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         route: IrqSpinLock::new(None),
         state: IrqSpinLock::new(PlaybackState::new()),
         completion_callback: IrqSpinLock::new(None),
-        pending_completions: AtomicUsize::new(0),
+        fault_completions: AtomicUsize::new(0),
     });
     let source: Arc<dyn InterruptSource> = controller.clone();
     InterruptManager::global()
@@ -667,5 +802,35 @@ mod tests {
         assert_eq!(RDMA_CONTROL, 0xc000);
         assert_eq!(RDMA_AUDIO_INTERFACE_SECONDARY, 2 << 12);
         assert_eq!(BIT_CLOCK_RATE, 1_536_000);
+    }
+
+    #[test]
+    fn dma_position_counts_normal_and_wrapped_periods() {
+        const BUFFER: usize = 38_400;
+        const PERIOD: usize = 3_840;
+
+        assert_eq!(
+            completed_periods_from_dma_position(0, PERIOD * 2, BUFFER, PERIOD, 40_000_000),
+            2
+        );
+        assert_eq!(
+            completed_periods_from_dma_position(PERIOD * 9, PERIOD, BUFFER, PERIOD, 40_000_000,),
+            2
+        );
+    }
+
+    #[test]
+    fn dma_position_recovers_coalesced_full_revolutions() {
+        const BUFFER: usize = 38_400;
+        const PERIOD: usize = 3_840;
+
+        assert_eq!(
+            completed_periods_from_dma_position(1_024, 1_024, BUFFER, PERIOD, 200_000_000),
+            10
+        );
+        assert_eq!(
+            completed_periods_from_dma_position(1_024, 1_024 + PERIOD, BUFFER, PERIOD, 220_000_000,),
+            11
+        );
     }
 }

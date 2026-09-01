@@ -34,10 +34,10 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::{
     any::Any,
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use dpu::Dpu;
+use dpu::{Dpu, VsyncInterruptClaim};
 use dsi::DsiHost;
 use phy::DsiPhy;
 use registers::RegisterWindow;
@@ -56,17 +56,21 @@ use scarlet::{
         },
     },
     environment::PAGE_SIZE,
+    interrupt::{
+        InterruptClaim, InterruptError, InterruptId, InterruptManager, InterruptResult,
+        InterruptSource, MaskableInterruptSource,
+    },
     mem::page::ContiguousPages,
     object::capability::{
         ControlOps, MemoryMappingOps,
         selectable::{ReadyInterest, SelectWaitOutcome, Selectable},
     },
     println,
-    sync::Mutex,
+    sync::{IrqSpinLock, Mutex, Waker},
     time,
     vm::{self, vmem::MemoryAttribute},
 };
-use scarlet_driver_cros_ec_spi::get_primary_cros_ec_spi;
+use scarlet_driver_cros_ec_spi::{CrosEcSpi, get_primary_cros_ec_spi};
 use scarlet_driver_qcom_sc7180_dispcc::Sc7180DispCc;
 #[cfg(any(feature = "diagnostic-color-bar", feature = "diagnostic-dsi-pattern"))]
 use scarlet_driver_ti_sn65dsi86::Sn65dsi86ColorBar;
@@ -79,6 +83,7 @@ const MAXIMUM_SCANOUT_ADDRESS: usize = u32::MAX as usize;
 const SCANOUT_BUFFER_COUNT: usize = 2;
 const GPU_SCANOUT_CACHE_CAPACITY: usize = 4;
 const PRESENT_TIMEOUT_US: u64 = 50_000;
+const PRESENT_IRQ_WATCHDOG_US: u64 = 20_000;
 
 #[derive(Clone, Copy)]
 struct GpioSpecifier {
@@ -89,12 +94,14 @@ struct GpioSpecifier {
 
 struct Sc7180DisplayEngine {
     dpu: Dpu,
+    interrupt_lock: IrqSpinLock<()>,
 }
 
 impl Sc7180DisplayEngine {
     fn new(mdss: RegisterWindow) -> Self {
         Self {
             dpu: Dpu::new(mdss),
+            interrupt_lock: IrqSpinLock::new(()),
         }
     }
 
@@ -342,36 +349,118 @@ impl Sc7180DisplayEngine {
         Ok(())
     }
 
-    fn present(&self, scanout_dma_addr: usize) -> Result<(), &'static str> {
-        self.dpu.present(scanout_dma_addr)?;
+    fn present(
+        &self,
+        scanout_dma_addr: usize,
+        present_pending: &AtomicBool,
+        vblank_count: &AtomicUsize,
+        vblank_waker: &Waker,
+    ) -> Result<(), &'static str> {
+        present_pending.store(true, Ordering::Release);
+        let completion_before = {
+            let _interrupt = self.interrupt_lock.lock();
+            self.dpu.mask_vsync_interrupt();
+            self.dpu.clear_vsync_interrupt();
+            let completion_before = vblank_count.load(Ordering::Acquire);
+            self.dpu.unmask_vsync_interrupt();
+            if let Err(error) = self.dpu.present(scanout_dma_addr) {
+                self.dpu.mask_vsync_interrupt();
+                self.dpu.clear_vsync_interrupt();
+                present_pending.store(false, Ordering::Release);
+                return Err(error);
+            }
+            if self.dpu.pending_flush() == 0 {
+                self.dpu.mask_vsync_interrupt();
+                self.dpu.clear_vsync_interrupt();
+                present_pending.store(false, Ordering::Release);
+                return Ok(());
+            }
+            completion_before
+        };
 
-        // SC7180 video-mode commits clear CTL_FLUSH at the vblank where the
-        // new source address becomes active. Do not release the previous
-        // front buffer back to the compositor before that boundary.
         let start = time::current_time();
-        while self.dpu.pending_flush() != 0 {
+        let mut observed_vblank = completion_before;
+        let mut result: Result<(), &'static str> = loop {
+            let flush_consumed = {
+                let _interrupt = self.interrupt_lock.lock();
+                if self.dpu.pending_flush() == 0 {
+                    self.dpu.mask_vsync_interrupt();
+                    self.dpu.clear_vsync_interrupt();
+                    true
+                } else {
+                    false
+                }
+            };
+            if flush_consumed {
+                arch::io_rmb();
+                break Ok(());
+            }
+
+            let current_vblank = vblank_count.load(Ordering::Acquire);
+            if current_vblank != observed_vblank {
+                observed_vblank = current_vblank;
+                continue;
+            }
+
             let elapsed = time::current_time().saturating_sub(start);
             if elapsed >= PRESENT_TIMEOUT_US {
-                return Err("qcom-sc7180-mdss: timeout waiting for page flip");
+                break Err("qcom-sc7180-mdss: timeout waiting for page flip");
             }
-            if elapsed < 50 {
-                core::hint::spin_loop();
-            } else if let Some(task) = scarlet::task::mytask() {
-                // The flip is vblank-paced and can be almost one frame away.
-                // Yield the submitting task instead of burning that interval
-                // in the kernel with preemption otherwise enabled.
-                scarlet::sched::scheduler::schedule(task.get_trapframe());
+            if let Some(task) = scarlet::task::mytask() {
+                let wait_us = PRESENT_TIMEOUT_US
+                    .saturating_sub(elapsed)
+                    .min(PRESENT_IRQ_WATCHDOG_US);
+                let _ = vblank_waker.wait_with_timeout(
+                    task.get_id(),
+                    task.get_trapframe(),
+                    Some(wait_us.saturating_mul(1_000)),
+                );
             } else {
                 core::hint::spin_loop();
             }
+        };
+
+        if result.is_err() {
+            let (pending_flush, completion_after) = {
+                let _interrupt = self.interrupt_lock.lock();
+                let pending_flush = self.dpu.pending_flush();
+                let completion_after = vblank_count.load(Ordering::Acquire);
+                self.dpu.mask_vsync_interrupt();
+                self.dpu.clear_vsync_interrupt();
+                (pending_flush, completion_after)
+            };
+            if pending_flush == 0 {
+                arch::io_rmb();
+                result = Ok(());
+            } else {
+                println!(
+                    "[qcom-sc7180-mdss] page-flip timeout pending-flush={:#010x} completion={}->{}",
+                    pending_flush, completion_before, completion_after,
+                );
+            }
         }
-        Ok(())
+        present_pending.store(false, Ordering::Release);
+        result
+    }
+
+    fn mask_interrupts(&self) {
+        self.dpu.mask_interrupts();
+    }
+
+    fn clear_pending_interrupts(&self) {
+        self.dpu.clear_pending_interrupts();
+    }
+
+    fn claim_vsync_interrupt(&self) -> VsyncInterruptClaim {
+        let _interrupt = self.interrupt_lock.lock();
+        self.dpu.claim_vsync_interrupt()
     }
 }
 
 pub struct Sc7180GraphicsDevice {
     config: FramebufferConfig,
     timing: DisplayTiming,
+    ec: Arc<CrosEcSpi>,
     scanout: [ContiguousPages; SCANOUT_BUFFER_COUNT],
     scanout_dma: [DmaMapping; SCANOUT_BUFFER_COUNT],
     dma_context: DmaContext,
@@ -380,6 +469,10 @@ pub struct Sc7180GraphicsDevice {
     gpu_present_count: AtomicUsize,
     front: AtomicUsize,
     present_lock: Mutex<()>,
+    interrupt_id: InterruptId,
+    present_pending: AtomicBool,
+    vblank_count: AtomicUsize,
+    vblank_waker: Waker,
     engine: Sc7180DisplayEngine,
 }
 
@@ -486,6 +579,15 @@ impl GpuStagingState {
 }
 
 impl Sc7180GraphicsDevice {
+    fn present_dma(&self, dma_address: usize) -> Result<(), &'static str> {
+        self.engine.present(
+            dma_address,
+            &self.present_pending,
+            &self.vblank_count,
+            &self.vblank_waker,
+        )
+    }
+
     fn clean_regions(
         &self,
         scanout: &ContiguousPages,
@@ -582,7 +684,7 @@ impl Sc7180GraphicsDevice {
         // Order that completed producer writeback before selecting its memory
         // as the DPU source, then retain both its mapping and owner in state.
         arch::io_wmb();
-        self.engine.present(dma_address)?;
+        self.present_dma(dma_address)?;
         self.gpu_direct.lock().mark_direct(backing);
         if self.gpu_present_count.fetch_add(1, Ordering::Relaxed) == 0 {
             println!(
@@ -721,9 +823,58 @@ impl Device for Sc7180GraphicsDevice {
     }
 }
 
+impl InterruptSource for Sc7180GraphicsDevice {
+    fn interrupt_id(&self) -> Option<InterruptId> {
+        Some(self.interrupt_id)
+    }
+
+    fn claim_interrupt(&self) -> InterruptResult<InterruptClaim> {
+        match self.engine.claim_vsync_interrupt() {
+            VsyncInterruptClaim::NotMine => return Ok(InterruptClaim::NotMine),
+            VsyncInterruptClaim::FlushPending | VsyncInterruptClaim::Complete => {}
+        }
+        self.vblank_count.fetch_add(1, Ordering::Release);
+        if self.present_pending.load(Ordering::Acquire) {
+            self.vblank_waker.wake_one();
+        }
+        Ok(InterruptClaim::Handled)
+    }
+}
+
+impl MaskableInterruptSource for Sc7180GraphicsDevice {
+    fn mask_source(&self) -> InterruptResult<()> {
+        self.engine.mask_interrupts();
+        Ok(())
+    }
+
+    fn unmask_source(&self) -> InterruptResult<()> {
+        Ok(())
+    }
+
+    fn clear_pending_source(&self) -> InterruptResult<()> {
+        self.engine.clear_pending_interrupts();
+        Ok(())
+    }
+}
+
 impl GraphicsDevice for Sc7180GraphicsDevice {
     fn get_display_name(&self) -> &'static str {
         "coachz-internal-panel"
+    }
+
+    fn get_brightness_percent(&self) -> Result<u8, &'static str> {
+        self.ec
+            .get_display_backlight_percent()
+            .map_err(|_| "qcom-sc7180-mdss: failed to read EC display brightness")
+    }
+
+    fn set_brightness_percent(&self, percent: u8) -> Result<(), &'static str> {
+        if percent > 100 {
+            return Err("qcom-sc7180-mdss: display brightness must be in the range 0..=100");
+        }
+        self.ec
+            .set_display_backlight_percent(percent)
+            .map_err(|_| "qcom-sc7180-mdss: failed to set EC display brightness")
     }
 
     fn get_framebuffer_config(&self) -> Result<FramebufferConfig, &'static str> {
@@ -748,8 +899,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
             return Err("qcom-sc7180-mdss: framebuffer does not match back scanout");
         }
         self.clean_regions(&self.scanout[back], &[region])?;
-        self.engine
-            .present(dpu_dma_address(&self.scanout_dma[back])?)?;
+        self.present_dma(dpu_dma_address(&self.scanout_dma[back])?)?;
         self.gpu_direct.lock().mark_staged();
         self.gpu_staging.lock().reset();
         self.front.store(back, Ordering::Release);
@@ -798,7 +948,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         }
 
         self.clean_regions(scanout, regions)?;
-        self.engine.present(dpu_dma_address(scanout_dma)?)?;
+        self.present_dma(dpu_dma_address(scanout_dma)?)?;
         self.gpu_direct.lock().mark_staged();
         self.gpu_staging.lock().reset();
         self.front.store(index, Ordering::Release);
@@ -878,8 +1028,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         let copy_us = time::current_time().saturating_sub(copy_start);
         #[cfg(debug_assertions)]
         let flip_start = time::current_time();
-        self.engine
-            .present(dpu_dma_address(&self.scanout_dma[back])?)?;
+        self.present_dma(dpu_dma_address(&self.scanout_dma[back])?)?;
         self.gpu_direct.lock().mark_staged();
         #[cfg(debug_assertions)]
         let flip_us = time::current_time().saturating_sub(flip_start);
@@ -1207,6 +1356,16 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .iter()
         .find(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .ok_or("qcom-sc7180-mdss: missing MDSS memory resource")?;
+    let irq_resource = device
+        .get_resources()
+        .iter()
+        .find(|resource| resource.res_type == PlatformDeviceResourceType::IRQ)
+        .ok_or("qcom-sc7180-mdss: missing MDSS interrupt")?;
+    let interrupt_id = match scarlet::interrupt::resolve_platform_irq(irq_resource) {
+        Ok(interrupt_id) => interrupt_id,
+        Err(InterruptError::ControllerNotFound) => return probe_defer(),
+        Err(_) => return Err("qcom-sc7180-mdss: failed to resolve MDSS interrupt"),
+    };
     let mdss_vaddr = vm::ioremap(mdss_resource.start, MDSS_MAP_SIZE)
         .map_err(|_| "qcom-sc7180-mdss: MDSS ioremap failed")?;
     let mdss = RegisterWindow::new(mdss_vaddr);
@@ -1248,6 +1407,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let graphics = Arc::new(Sc7180GraphicsDevice {
         config,
         timing,
+        ec,
         scanout,
         scanout_dma,
         dma_context,
@@ -1256,8 +1416,16 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         gpu_present_count: AtomicUsize::new(0),
         front: AtomicUsize::new(0),
         present_lock: Mutex::new(()),
+        interrupt_id,
+        present_pending: AtomicBool::new(false),
+        vblank_count: AtomicUsize::new(0),
+        vblank_waker: Waker::new_uninterruptible("qcom-mdss-vblank"),
         engine,
     });
+    let interrupt_source: Arc<dyn MaskableInterruptSource> = graphics.clone();
+    InterruptManager::global()
+        .register_and_enable_interrupt_source(interrupt_source, arch::get_cpu().get_cpuid() as u32)
+        .map_err(|_| "qcom-sc7180-mdss: failed to enable MDSS interrupt")?;
     let device_id = DeviceManager::get_manager()
         .register_device_with_name(String::from("qcom-sc7180-mdss"), graphics.clone());
     if let Err(error) = scarlet::device::graphics::manager::GraphicsManager::get_manager()
@@ -1271,7 +1439,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         scarlet::earlyfb::deactivate();
     }
     println!(
-        "[qcom-sc7180-mdss] native panel {}x{} pixel-clock={} kHz scanout-paddr=[{:#x}, {:#x}] scanout-dma=[{:#x}, {:#x}] bytes={} refresh={} mHz",
+        "[qcom-sc7180-mdss] native panel {}x{} pixel-clock={} kHz scanout-paddr=[{:#x}, {:#x}] scanout-dma=[{:#x}, {:#x}] bytes={} refresh={} mHz irq={}",
         graphics.timing.hactive,
         graphics.timing.vactive,
         graphics.timing.pixel_clock_khz,
@@ -1283,6 +1451,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         u64::from(graphics.timing.pixel_clock_khz) * 1_000_000
             / u64::from(graphics.timing.horizontal_total())
             / u64::from(graphics.timing.vertical_total()),
+        graphics.interrupt_id,
     );
     Ok(())
 }

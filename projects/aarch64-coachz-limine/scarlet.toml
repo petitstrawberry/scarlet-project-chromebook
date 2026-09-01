@@ -44,6 +44,8 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-dwc3" = { path = "../../drivers/usb/dwc3/qcom-dwc3", enabled = true }
 "scarlet-driver-chrome-ec-usb-touchpad" = { path = "../../drivers/input/trackpad/chrome-ec-usb-touchpad", enabled = true }
 "scarlet-driver-chrome-ec-mkbp-switch" = { path = "../../drivers/input/switch/chrome-ec-mkbp-switch", enabled = true }
+"scarlet-driver-chrome-ec-mkbp-button" = { path = "../../drivers/input/button/chrome-ec-mkbp-button", enabled = true }
+"scarlet-driver-chrome-ec-motion-sense" = { path = "../../drivers/sensor/chrome-ec-motion-sense", enabled = true }
 "scarlet-driver-goodix-gt7375p" = { path = "../../drivers/input/touchscreen/goodix-gt7375p", enabled = true }
 "scarlet-driver-ti-sn65dsi86" = { path = "../../drivers/display/bridge/ti-sn65dsi86", enabled = true }
 "scarlet-driver-qcom-sc7180-mdss" = { path = "../../drivers/display/qcom-sc7180-mdss", enabled = true }
