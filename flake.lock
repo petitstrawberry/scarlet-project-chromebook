@@ -83,11 +83,11 @@
     "scarlet-sdk": {
       "flake": false,
       "locked": {
-        "lastModified": 1786975649,
-        "narHash": "sha256-Nam5HyNUuPRv5zKP8Amec2Jav/QgvK4EpjGh0fHttAY=",
+        "lastModified": 1788222970,
+        "narHash": "sha256-313CNlBIIChD4TbtLRq5g9v8Vzp8Zu9sWOo4Eq46FkA=",
         "ref": "main",
-        "rev": "523afd75133d9ec110abce016762a27656dd45f4",
-        "revCount": 42,
+        "rev": "ab51c8503666f5aa1bce98daba3018a6b9042602",
+        "revCount": 43,
         "type": "git",
         "url": "https://github.com/petitstrawberry/scarlet-sdk.git"
       },
