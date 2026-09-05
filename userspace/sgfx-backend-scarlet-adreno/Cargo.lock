@@ -147,7 +147,7 @@ dependencies = [
 [[package]]
 name = "sgfx-core"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#376ace058863949043f2560810bee4ac23c9c93a"
+source = "git+https://github.com/petitstrawberry/sgfx#0e7b2b47856c3889648cdccb60b3c30d2082e4a2"
 
 [[package]]
 name = "spin"

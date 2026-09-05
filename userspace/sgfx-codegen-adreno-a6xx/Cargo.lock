@@ -27,4 +27,4 @@ dependencies = [
 [[package]]
 name = "sgfx-core"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#a55d11a0843148c5438d4938e07a221e14da3546"
+source = "git+https://github.com/petitstrawberry/sgfx#0e7b2b47856c3889648cdccb60b3c30d2082e4a2"

@@ -28,4 +28,4 @@ adreno-a6xx-submit-wire = { path = "../../../shared/adreno-a6xx-submit-wire" }
 
 [dev-dependencies]
 sgfx-codegen-adreno-a6xx = { path = "../../../userspace/sgfx-codegen-adreno-a6xx" }
-sgfx-core = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "sgfx-core", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", default-features = false }
