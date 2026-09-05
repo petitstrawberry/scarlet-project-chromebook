@@ -1,0 +1,79 @@
+name: SGFX
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SCARLET_TOOLCHAIN: github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [scarlet, upstream]
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2025-12-31
+      CARGO_TARGET_DIR: target/${{ matrix.toolchain }}-host
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        if: matrix.toolchain == 'scarlet'
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-substituters = https://scarlet-rust-toolchain.cachix.org
+            extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
+      - name: Install the pinned Scarlet Rust toolchain
+        if: matrix.toolchain == 'scarlet'
+        run: |
+          scarlet_toolchain_path="$(nix build "${SCARLET_TOOLCHAIN}^out" --no-link --print-out-paths)"
+          echo "$scarlet_toolchain_path/bin" >> "$GITHUB_PATH"
+      - name: Install upstream Rust for portability checks
+        if: matrix.toolchain == 'upstream'
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
+      - name: Show the selected compiler
+        run: |
+          rustc -vV
+          rustc --print sysroot
+      - name: Check formatting
+        run: |
+          cargo-fmt fmt --manifest-path userspace/sgfx-codegen-adreno-a6xx/Cargo.toml --check
+          cargo-fmt fmt --manifest-path tests/a618-submit-validation/Cargo.toml --check
+      - name: Test portable code generation
+        run: cargo test --locked --manifest-path userspace/sgfx-codegen-adreno-a6xx/Cargo.toml
+      - name: Test the userspace-to-kernel submit boundary
+        # Compiles the driver's real validator on the host; no GPU required.
+        run: cargo test --locked --manifest-path tests/a618-submit-validation/Cargo.toml
+
+  scarlet:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [riscv64gc-unknown-scarlet, aarch64-unknown-scarlet]
+    env:
+      CARGO_TARGET_DIR: target/scarlet-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-substituters = https://scarlet-rust-toolchain.cachix.org
+            extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
+      - name: Check SGFX core source identity
+        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo tree --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target '${{ matrix.target }}' --invert sgfx-core
+      - name: Check the std-enabled Adreno backend
+        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo check --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target '${{ matrix.target }}'
