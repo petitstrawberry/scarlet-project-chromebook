@@ -2834,9 +2834,11 @@ mod tests {
 
     #[test]
     fn addressed_ccu_clean_sequence_must_be_contiguous() {
+        // Use a valid addressed event so the validator reaches the ordering
+        // check instead of rejecting the packet's missing timestamp bit.
         let pm4 = [
             type7(opcode::EVENT_WRITE, 4).unwrap(),
-            super::EVENT_CCU_FLUSH_COLOR_TS,
+            super::EVENT_CCU_FLUSH_COLOR_TS | super::EVENT_WRITE_TIMESTAMP,
             0,
             0,
             1,
@@ -3237,7 +3239,7 @@ mod tests {
         );
 
         let mut unsafe_depth_control = artifact.clone();
-        let packet = Packets::new(&unsafe_depth_control.words)
+        let depth_control_word_offset = Packets::new(&unsafe_depth_control.words)
             .collect::<Result<std::vec::Vec<_>, _>>()
             .unwrap()
             .into_iter()
@@ -3250,8 +3252,9 @@ mod tests {
                     }
                 ) && packet.payload != [0]
             })
-            .unwrap();
-        unsafe_depth_control.words[packet.word_offset as usize + 1] |= 1 << 7;
+            .unwrap()
+            .word_offset as usize;
+        unsafe_depth_control.words[depth_control_word_offset + 1] |= 1 << 7;
         assert!(accept_codegen(&unsafe_depth_control).is_err());
     }
 

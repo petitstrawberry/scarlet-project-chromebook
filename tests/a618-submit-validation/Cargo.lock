@@ -6,6 +6,7 @@ version = 4
 name = "a618-submit-validation-tests"
 version = "0.1.0"
 dependencies = [
+ "adreno-a6xx-layout",
  "adreno-a6xx-pm4",
  "adreno-a6xx-shader-pack",
  "adreno-a6xx-submit-wire",
