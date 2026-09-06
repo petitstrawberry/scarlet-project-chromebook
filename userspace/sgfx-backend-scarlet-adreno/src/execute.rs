@@ -55,7 +55,8 @@ fn monotonic_time_ns() -> u64 {
 
 #[cfg(not(feature = "std"))]
 fn monotonic_time_ns() -> u64 {
-    std::syscall::syscall0(std::syscall::Syscall::MonotonicTime) as u64
+    // SAFETY: This fixed clock query has no arguments or userspace memory effects.
+    (unsafe { std::syscall::syscall0(std::syscall::Syscall::MonotonicTime) }) as u64
 }
 
 #[derive(Clone, Copy)]

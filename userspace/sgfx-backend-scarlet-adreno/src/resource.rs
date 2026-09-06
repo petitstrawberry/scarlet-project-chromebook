@@ -144,19 +144,23 @@ impl RawBuffer {
         let mapping_len =
             usize::try_from(raw.allocated_size()).map_err(|_| HandleError::InvalidParameter)?;
         let mapping = raw.as_handle().as_memory_mapping()?;
-        let mapping_address = mapping
-            .mmap(0, mapping_len, prot::READ | prot::WRITE, flags::SHARED, 0)
-            .map_err(|_| HandleError::SystemError(-1))?;
+        // SAFETY: This creates a fresh mapping. RawBuffer retains the allocation,
+        // bounds CPU accesses to it and owns the mapping until teardown.
+        let mapping_address =
+            unsafe { mapping.mmap(0, mapping_len, prot::READ | prot::WRITE, flags::SHARED, 0) }
+                .map_err(|_| HandleError::SystemError(-1))?;
         let attachment_token = match context.raw.attach_buffer(&raw) {
             Ok(token) => token,
             Err(error) => {
-                let _ = MemoryMappingOps::munmap(mapping_address, mapping_len);
+                // SAFETY: Attachment failed before any buffer access was exposed.
+                let _ = unsafe { MemoryMappingOps::munmap(mapping_address, mapping_len) };
                 return Err(error);
             }
         };
         if attachment_token == 0 {
             let _ = context.raw.detach_buffer(&raw);
-            let _ = MemoryMappingOps::munmap(mapping_address, mapping_len);
+            // SAFETY: The failed attachment was detached and no CPU view escaped.
+            let _ = unsafe { MemoryMappingOps::munmap(mapping_address, mapping_len) };
             return Err(HandleError::InvalidParameter);
         }
         Ok(Self {
@@ -221,7 +225,9 @@ impl Drop for RawBuffer {
         // The mapping must be retired before the capability-backed allocation
         // is dropped. Teardown cannot report an error, and the kernel still
         // revokes the address space when the process exits.
-        let _ = MemoryMappingOps::munmap(self.mapping_address, self.mapping_len);
+        // SAFETY: RawBuffer owns this CPU mapping and no borrowed CPU view can
+        // outlive it. Kernel-held GPU backing is independent of the CPU mapping.
+        let _ = unsafe { MemoryMappingOps::munmap(self.mapping_address, self.mapping_len) };
     }
 }
 
