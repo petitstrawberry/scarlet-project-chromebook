@@ -12,11 +12,11 @@ scarlet-std = ["dep:scarlet-std", "gpu-raw/scarlet-std"]
 [dependencies]
 adreno-a6xx-layout = { path = "../../shared/adreno-a6xx-layout" }
 adreno-a6xx-submit-wire = { path = "../../shared/adreno-a6xx-submit-wire" }
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "gpu-raw", default-features = false }
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-os", default-features = false, features = ["std"], optional = true }
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-std", optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "85f0cead4cb4c9add021360f1b469f08bf0d23a9", package = "gpu-raw", default-features = false }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "85f0cead4cb4c9add021360f1b469f08bf0d23a9", package = "scarlet-os", default-features = false, features = ["std"], optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "85f0cead4cb4c9add021360f1b469f08bf0d23a9", package = "scarlet-std", optional = true }
 sgfx-codegen-adreno-a6xx = { path = "../sgfx-codegen-adreno-a6xx" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "0b4cf0984d9b17bd0646612428c44bf1505393a8", default-features = false }
 
 [lib]
 name = "sgfx_backend_scarlet_adreno"
