@@ -79,9 +79,10 @@ The development shell provides the pinned Scarlet Rust toolchain,
 `cargo-scarlet`, the Limine image plugin, AArch64 build tools, PyUSB/libusb,
 device-tree tools, `mtools`, and serial-console utilities.
 
-The Scarlet kernel and reusable filesystem bundles are fetched from the
-Scarlet `dev` branch through cargo-scarlet. A sibling Scarlet checkout is not
-required.
+The CoachZ project uses a sibling `../Scarlet` checkout for its kernel,
+filesystem bundles and userspace workspace. Use compatible published revisions
+in its Cargo lockfile; the A618 driver requires Scarlet commit
+`d8a199815249c784a04c9dec60b6efedbb79d84e` or a compatible successor.
 
 With direnv installed, the checked-in `.envrc` can enter the same environment:
 
@@ -179,17 +180,11 @@ From the Nix development shell:
 ./scripts/build-coachz-limine-image.sh
 ```
 
-By default this uses the lock-pinned ScarletUI source and does not look for a
-sibling checkout. To test an in-development ScarletUI tree, opt in with its
-actual location:
-
-```sh
-./scripts/build-coachz-limine-image.sh --local-scarlet-ui /path/to/scarlet-ui
-```
-
-`SCARLET_UI_ROOT=/path/to/scarlet-ui` provides the same development override.
-Use `--release-sources` to ignore that environment variable and force the
-lock-pinned source.
+The normal Scarlet bundles build userspace with their checked-in Cargo locks.
+SGFX, Adreno and ScarletUI are selected by published commit revisions. Update
+those references with `cargo update --precise <commit>` before building a new
+source set. The image build does not inject local source patches or rebuild
+the graphics stack through a separate rootfs hook.
 
 The release images are written under:
 
@@ -203,9 +198,8 @@ The image to deploy to a USB drive is:
 projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
 ```
 
-The wrapper deliberately invalidates cargo-scarlet's packaging stamps because
-the CoachZ SGFX layer consumes local transitive sources that those stamps do not
-track.  It also verifies that the EFI kernel and all packaged SGFX binaries
+The wrapper deliberately invalidates cargo-scarlet's packaging stamps so each
+image is repackaged from the selected sources. It also verifies that the EFI kernel and all packaged SGFX binaries
 match the artifacts built in the same invocation.  Use the wrapper rather than
 invoking `cargo scarlet image` directly for development images.
 

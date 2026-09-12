@@ -7,7 +7,6 @@ profile_flag="--release"
 profile_dir="release"
 staging_dir="$project_dir/.scarlet/staging"
 stamp_dir="$project_dir/.scarlet/image-stamps"
-local_scarlet_ui_root="${SCARLET_UI_ROOT:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -16,37 +15,12 @@ while [[ $# -gt 0 ]]; do
       profile_dir="debug"
       shift
       ;;
-    --local-scarlet-ui)
-      [[ $# -ge 2 && -n "$2" ]] || {
-        echo "--local-scarlet-ui requires a checkout path" >&2
-        exit 2
-      }
-      local_scarlet_ui_root="$2"
-      shift 2
-      ;;
-    --release-sources)
-      local_scarlet_ui_root=""
-      shift
-      ;;
     *)
-      echo "usage: $0 [--debug] [--local-scarlet-ui PATH | --release-sources]" >&2
+      echo "usage: $0 [--debug]" >&2
       exit 2
       ;;
   esac
 done
-
-if [[ -n "$local_scarlet_ui_root" ]]; then
-  [[ -f "$local_scarlet_ui_root/Cargo.toml" ]] || {
-    echo "not a ScarletUI checkout: $local_scarlet_ui_root" >&2
-    exit 1
-  }
-  SCARLET_UI_ROOT="$(cd "$local_scarlet_ui_root" && pwd)"
-  export SCARLET_UI_ROOT
-  echo "CoachZ source mode: development ScarletUI at $SCARLET_UI_ROOT" >&2
-else
-  unset SCARLET_UI_ROOT
-  echo "CoachZ source mode: release (lock-pinned ScarletUI)" >&2
-fi
 
 # cargo-scarlet leaves this generated tree behind when an image build fails.
 # Starting from it again can collide with bundle-created symlinks.
@@ -54,12 +28,8 @@ if [[ -d "$staging_dir" ]]; then
   rm -rf -- "$staging_dir"
 fi
 
-# Image stamps only fingerprint the declared layer entrypoints.  The CoachZ
-# rootfs script builds SGFX from local transitive sources outside the project
-# directory, so a source edit can otherwise leave a valid-looking but stale
-# rootfs (and therefore a stale combined disk image).  These four files are
-# regenerable cache metadata; invalidate them explicitly for the canonical
-# working-tree build command while retaining Cargo's compilation cache.
+# Repackage every image from this build while retaining Cargo's compilation
+# cache. Dependency revisions come from the source workspaces' Cargo.lock files.
 for image_name in initramfs rootfs boot disk; do
   stamp_path="$stamp_dir/$image_name.stamp"
   if [[ -e "$stamp_path" ]]; then
@@ -75,7 +45,7 @@ fi
 
 # Refuse to hand off an image assembled from stale cached binaries.  This
 # checks both halves of the A618 ABI: the kernel in the EFI image and every
-# locally rebuilt SGFX consumer in the ext2 rootfs.
+# packaged SGFX consumer in the ext2 rootfs.
 kernel_elf="$project_dir/bsp/target/aarch64-unknown-none-elf/$profile_dir/scarlet"
 esp_image="$project_dir/.scarlet/images/esp-aarch64-coachz.img"
 rootfs_image="$project_dir/.scarlet/images/rootfs-aarch64-coachz-full.ext2"
@@ -88,8 +58,8 @@ if [[ "$image_kernel_hash" != "$kernel_hash" ]]; then
 fi
 
 for binary in \
-  sgfx-probe taskbar terminal ui-demo ui-benchmark settings \
-  sws clock files launcher notepad task-manager ui-sgfx-showcase \
+  sgfx-probe terminal ui-demo ui-benchmark settings video-player \
+  sws scarlet-shell clock files notepad task-manager ui-sgfx-showcase \
   sgfx-cube sgfx-texture sgfx-showcase boxcraft
 do
   staged_binary="$staging_dir/rootfs/system/scarlet/bin/$binary"

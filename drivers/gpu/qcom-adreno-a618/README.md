@@ -42,17 +42,17 @@ GPU transfers for its uploads.
 The driver uses Scarlet's 64-bit physical-address API, explicit `PhysAddr`,
 `Iova`, and `DmaAddr` boundaries, and generic CPU-access guards. Use Scarlet
 commit `d8a199815249c784a04c9dec60b6efedbb79d84e` or a compatible successor.
-The [integration script](../../../scripts/check-a618-kernel-integration.sh)
-checks a selected source checkout using a separate config and lockfile:
+The checked-in lockfile selects the published kernel revision:
 
 ```sh
 cargo test --locked --manifest-path tests/a618-async-queue/Cargo.toml
-scripts/check-a618-kernel-integration.sh /path/to/Scarlet
+cargo check --locked --manifest-path drivers/gpu/qcom-adreno-a618/Cargo.toml --target aarch64-unknown-none --features scarlet/network
+cargo check --locked --manifest-path drivers/gpu/qcom-adreno-a618/Cargo.toml --target aarch64-unknown-none --release --features scarlet/network,strict-command-validation
 ```
 
 The host tests cover admission ownership, running and quarantined capacity,
 FIFO checkpoints, observer-independent lifetime, CPU-access reservation and
-error cleanup, and exact fence matching. The integration script checks the real
+error cleanup, and exact fence matching. The target checks use the real
 kernel interfaces in debug and release with strict command validation.
 Hardware validation remains necessary on CoachZ: burst admission until Busy,
 drop all observers while work is pending, detach/close resources before the

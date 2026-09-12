@@ -82,7 +82,7 @@ Use the Scarlet toolchain for the backend target checks:
 ```sh
 cargo check --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target aarch64-unknown-scarlet
 cargo check --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target riscv64gc-unknown-scarlet
-scripts/check-a618-kernel-integration.sh /path/to/Scarlet-checkout
+cargo check --locked --manifest-path drivers/gpu/qcom-adreno-a618/Cargo.toml --target aarch64-unknown-none --features scarlet/network
 ```
 
 The driver [hardware validation checklist](../../drivers/gpu/qcom-adreno-a618/README.md)
