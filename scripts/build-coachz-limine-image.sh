@@ -44,8 +44,8 @@ else
 fi
 
 # Refuse to hand off an image assembled from stale cached binaries.  This
-# checks both halves of the A618 ABI: the kernel in the EFI image and every
-# packaged SGFX consumer in the ext2 rootfs.
+# checks the kernel in the EFI image and the selected Scarlet graphics
+# applications listed below in the ext2 rootfs.
 kernel_elf="$project_dir/bsp/target/aarch64-unknown-none-elf/$profile_dir/scarlet"
 esp_image="$project_dir/.scarlet/images/esp-aarch64-coachz.img"
 rootfs_image="$project_dir/.scarlet/images/rootfs-aarch64-coachz-full.ext2"

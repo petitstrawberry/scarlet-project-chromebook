@@ -200,8 +200,10 @@ projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
 ```
 
 The wrapper deliberately invalidates cargo-scarlet's packaging stamps so each
-image is repackaged from the selected sources. It also verifies that the EFI kernel and all packaged SGFX binaries
-match the artifacts built in the same invocation.  Use the wrapper rather than
+image is repackaged from the selected sources. It also verifies that the EFI
+kernel and the Scarlet graphics applications listed in the script match the
+artifacts built in the same invocation. External applications retain their own
+workspace lockfiles. Use the wrapper rather than
 invoking `cargo scarlet image` directly for development images.
 
 It is a GPT disk image for a single USB drive with:
