@@ -62,9 +62,9 @@ for binary in \
   sws scarlet-shell clock files notepad task-manager ui-sgfx-showcase \
   sgfx-cube sgfx-texture sgfx-showcase boxcraft
 do
-  staged_binary="$staging_dir/rootfs/system/scarlet/bin/$binary"
+  staged_binary="$staging_dir/rootfs/bin/$binary"
   staged_hash=$(shasum -a 256 "$staged_binary" | awk '{print $1}')
-  image_hash=$(debugfs -R "cat /system/scarlet/bin/$binary" "$rootfs_image" 2>/dev/null | shasum -a 256 | awk '{print $1}')
+  image_hash=$(debugfs -R "cat /bin/$binary" "$rootfs_image" 2>/dev/null | shasum -a 256 | awk '{print $1}')
   if [[ "$image_hash" != "$staged_hash" ]]; then
     echo "CoachZ image verification failed: rootfs $binary is stale" >&2
     exit 1
