@@ -80,9 +80,11 @@ The development shell provides the pinned Scarlet Rust toolchain,
 device-tree tools, `mtools`, and serial-console utilities.
 
 The CoachZ project uses a sibling `../Scarlet` checkout for its kernel,
-filesystem bundles and userspace workspace. Use compatible published revisions
-in its Cargo lockfile; the A618 driver requires Scarlet commit
-`d8a199815249c784a04c9dec60b6efedbb79d84e` or a compatible successor.
+filesystem bundles and userspace workspace. Use Scarlet commit
+`85f0cead4cb4c9add021360f1b469f08bf0d23a9` or a compatible successor and the
+published revisions in its Cargo lockfile. The standard `/init` provides USB
+`rootwait` and constructs the current boot Environment; no project-local init
+replacement is needed.
 
 With direnv installed, the checked-in `.envrc` can enter the same environment:
 
