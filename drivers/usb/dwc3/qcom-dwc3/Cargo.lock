@@ -54,15 +54,21 @@ dependencies = [
 
 [[package]]
 name = "scarlet"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c576e77989a99689adfc13f000b37dd99f25dae1"
+version = "1.0.1"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
 dependencies = [
  "fdt",
  "font8x8",
  "hashbrown",
  "lock_api",
+ "scarlet-abi",
  "talc",
 ]
+
+[[package]]
+name = "scarlet-abi"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
 
 [[package]]
 name = "scarlet-driver-qcom-dwc3"

@@ -34,7 +34,7 @@ use scarlet::{
         },
         manager::DeviceManager,
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
 };
 #[cfg(target_os = "none")]
@@ -185,7 +185,7 @@ mod runtime {
                 Ok(Some(state)) => self.accept_state(state),
                 Ok(None) => {}
                 Err(_) => {
-                    early_println!("[chrome-ec-mkbp-switch] discarded malformed switch event")
+                    println!("[chrome-ec-mkbp-switch] discarded malformed switch event")
                 }
             }
             true
@@ -196,20 +196,20 @@ mod runtime {
 
     fn initialize() {
         let Some(ec) = get_primary_cros_ec_spi() else {
-            early_println!("[chrome-ec-mkbp-switch] primary Chrome EC unavailable");
+            println!("[chrome-ec-mkbp-switch] primary Chrome EC unavailable");
             return;
         };
         let supported = match query_switch_mask(ec.as_ref(), EC_MKBP_INFO_SUPPORTED) {
             Ok(supported) if supported & REQUIRED_SWITCHES == REQUIRED_SWITCHES => supported,
             Ok(supported) => {
-                early_println!(
+                println!(
                     "[chrome-ec-mkbp-switch] required switches unavailable: supported={:#x}",
                     supported
                 );
                 return;
             }
             Err(_) => {
-                early_println!("[chrome-ec-mkbp-switch] failed to query switch support");
+                println!("[chrome-ec-mkbp-switch] failed to query switch support");
                 return;
             }
         };
@@ -219,7 +219,7 @@ mod runtime {
         {
             Ok(metadata) => metadata,
             Err(error) => {
-                early_println!("[chrome-ec-mkbp-switch] invalid input metadata: {}", error);
+                println!("[chrome-ec-mkbp-switch] invalid input metadata: {}", error);
                 return;
             }
         };
@@ -240,7 +240,7 @@ mod runtime {
             Err(_) => {
                 let _ = ec.unregister_event_listener(listener_id);
                 *DEVICE.lock() = None;
-                early_println!("[chrome-ec-mkbp-switch] failed to read boot posture");
+                println!("[chrome-ec-mkbp-switch] failed to read boot posture");
                 return;
             }
         };
@@ -249,11 +249,9 @@ mod runtime {
         let name = event.get_name().into();
         let registered: Arc<dyn Device> = event;
         DeviceManager::get_manager().register_device_with_name(name, registered);
-        early_println!(
+        println!(
             "[chrome-ec-mkbp-switch] registered switch0 supported={:#x} lid_closed={} tablet_mode={} source=EC-MKBP-IRQ",
-            supported,
-            initial.lid_closed,
-            initial.tablet_mode,
+            supported, initial.lid_closed, initial.tablet_mode,
         );
     }
 

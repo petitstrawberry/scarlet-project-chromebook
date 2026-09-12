@@ -28,7 +28,7 @@ use scarlet::{
         },
         reset::ResetHandle,
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time, vm,
 };
@@ -90,7 +90,7 @@ struct Sc7180QmpUsb3 {
 impl Sc7180QmpUsb3 {
     fn log_clocks(&self, stage: &str) {
         for clock in &self.common_clocks {
-            early_println!(
+            println!(
                 "[qcom-qmp-usb3-dp] {} clock={} enabled={} rate={}",
                 stage,
                 clock.name(),
@@ -98,7 +98,7 @@ impl Sc7180QmpUsb3 {
                 clock.rate(),
             );
         }
-        early_println!(
+        println!(
             "[qcom-qmp-usb3-dp] {} clock={} enabled={} rate={}",
             stage,
             self.pipe_clock.name(),
@@ -108,7 +108,7 @@ impl Sc7180QmpUsb3 {
     }
 
     fn log_snapshot(&self, stage: &str) {
-        early_println!(
+        println!(
             "[qcom-qmp-usb3-dp] {} com mode={:#010x} power={:#010x} reset={:#010x} swi={:#010x} typec={:#010x}",
             stage,
             self.registers.read(DP_COM_PHY_MODE_CTRL),
@@ -117,7 +117,7 @@ impl Sc7180QmpUsb3 {
             self.registers.read(DP_COM_SWI_CTRL),
             self.registers.read(DP_COM_TYPEC_CTRL),
         );
-        early_println!(
+        println!(
             "[qcom-qmp-usb3-dp] {} serdes cmn={:#010x} reset-sm={:#010x} c-ready={:#010x} ivco={:#010x}",
             stage,
             self.registers.read(SERDES_CMN_STATUS),
@@ -125,7 +125,7 @@ impl Sc7180QmpUsb3 {
             self.registers.read(SERDES_C_READY_STATUS),
             self.registers.read(SERDES_PLL_IVCO),
         );
-        early_println!(
+        println!(
             "[qcom-qmp-usb3-dp] {} pcs reset={:#010x} power={:#010x} start={:#010x} status={:#010x} fll={:#010x} tx-highz={:#010x} rx-fastlock={:#010x}",
             stage,
             self.registers.read(PCS_SW_RESET),
@@ -140,18 +140,18 @@ impl Sc7180QmpUsb3 {
 
     fn enable_common(&self, orientation: PhyOrientation) -> Result<(), PhyError> {
         if self.phy_reset.assert().is_err() {
-            early_println!("[qcom-qmp-usb3-dp] external PHY reset assert failed");
+            println!("[qcom-qmp-usb3-dp] external PHY reset assert failed");
             return Err(PhyError::ResetFailed);
         }
         if self.phy_reset.deassert().is_err() {
-            early_println!("[qcom-qmp-usb3-dp] external PHY reset deassert failed");
+            println!("[qcom-qmp-usb3-dp] external PHY reset deassert failed");
             return Err(PhyError::ResetFailed);
         }
 
         let mut enabled = 0usize;
         for clock in &self.common_clocks {
             if clock.prepare_enable().is_err() {
-                early_println!(
+                println!(
                     "[qcom-qmp-usb3-dp] common clock {} failed to enable",
                     clock.name()
                 );
@@ -202,7 +202,7 @@ impl Sc7180QmpUsb3 {
             .write_table(USB3_SERDES_BASE, USB3_SERDES_TABLE);
 
         if self.pipe_clock.prepare_enable().is_err() {
-            early_println!("[qcom-qmp-usb3-dp] usb3_pipe failed to enable");
+            println!("[qcom-qmp-usb3-dp] usb3_pipe failed to enable");
             return Err(PhyError::PowerOnFailed);
         }
 
@@ -224,7 +224,7 @@ impl Sc7180QmpUsb3 {
         loop {
             let status = self.registers.read(PCS_STATUS);
             if status & PHY_STATUS == 0 {
-                early_println!(
+                println!(
                     "[qcom-qmp-usb3-dp] PHY ready after {} us (PCS_STATUS={:#010x})",
                     time::current_time().saturating_sub(started),
                     status,
@@ -232,10 +232,9 @@ impl Sc7180QmpUsb3 {
                 break;
             }
             if time::current_time().saturating_sub(started) >= PHY_READY_TIMEOUT_US {
-                early_println!(
+                println!(
                     "[qcom-qmp-usb3-dp] PHY ready timeout after {} us (PCS_STATUS={:#010x})",
-                    PHY_READY_TIMEOUT_US,
-                    status,
+                    PHY_READY_TIMEOUT_US, status,
                 );
                 self.log_clocks("timeout");
                 self.log_snapshot("timeout");
@@ -273,23 +272,22 @@ impl Phy for Sc7180QmpUsb3 {
             return Ok(());
         }
 
-        early_println!(
+        println!(
             "[qcom-qmp-usb3-dp] power_on begin mode={:?} orientation={:?}",
-            state.mode,
-            state.orientation,
+            state.mode, state.orientation,
         );
         self.enable_common(state.orientation)?;
         if let Err(error) = self.configure_usb3() {
-            early_println!("[qcom-qmp-usb3-dp] power_on failed: {:?}", error);
+            println!("[qcom-qmp-usb3-dp] power_on failed: {:?}", error);
             self.stop_usb3("rollback");
             self.disable_common();
-            early_println!(
+            println!(
                 "[qcom-qmp-usb3-dp] rollback complete: PCS reset asserted, PCS/SerDes stopped, PCS power-down asserted, common disabled"
             );
             return Err(error);
         }
         state.powered = true;
-        early_println!("[qcom-qmp-usb3-dp] power_on complete");
+        println!("[qcom-qmp-usb3-dp] power_on complete");
         Ok(())
     }
 
@@ -391,10 +389,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| matches!(resource.res_type, PlatformDeviceResourceType::MEM))
         .ok_or("qcom-qmp-usb3-dp: missing memory resource")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|value| value.checked_add(1))
-        .ok_or("qcom-qmp-usb3-dp: invalid memory resource")?;
+        .size()
+        .map_err(|_| "qcom-qmp-usb3-dp: invalid memory resource")?;
     if size < REGISTER_WINDOW_SIZE {
         return Err("qcom-qmp-usb3-dp: memory resource is too small");
     }
@@ -426,10 +422,10 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     });
     manager.register_phy_provider(phandle, provider);
 
-    early_println!(
+    println!(
         "[qcom-qmp-usb3-dp] preserving firmware-managed vdda-phy and vdda-pll supplies (Scarlet regulator API unavailable)"
     );
-    early_println!(
+    println!(
         "[qcom-qmp-usb3-dp] registered SC7180 USB3 PHY provider phandle={:#x} #phy-cells=1",
         phandle
     );

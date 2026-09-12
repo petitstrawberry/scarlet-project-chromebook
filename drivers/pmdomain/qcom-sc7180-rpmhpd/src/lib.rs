@@ -21,7 +21,7 @@ use scarlet::{
         platform::{PlatformDeviceDriver, PlatformDeviceInfo},
         power::{PowerDomain, PowerDomainProvider, PowerManager},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
 };
 
@@ -81,7 +81,7 @@ impl PowerDomain for RpmhPowerDomain {
         if *enabled {
             return Ok(());
         }
-        early_println!(
+        println!(
             "[qcom-sc7180-rpmhpd] voting {} address={:#x} corner={}",
             self.label,
             self.address,
@@ -89,7 +89,7 @@ impl PowerDomain for RpmhPowerDomain {
         );
         self.rsc.write_active(self.address, self.maximum_corner)?;
         *enabled = true;
-        early_println!("[qcom-sc7180-rpmhpd] domain {} enabled", self.label);
+        println!("[qcom-sc7180-rpmhpd] domain {} enabled", self.label);
         Ok(())
     }
 
@@ -201,7 +201,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let provider = Arc::new(Sc7180RpmhPdProvider::new(&rsc)?);
     PowerManager::init();
     PowerManager::register_provider(phandle, provider);
-    early_println!(
+    println!(
         "[qcom-sc7180-rpmhpd] registered phandle={:#x} parent={:#x} domains={}",
         phandle,
         parent_phandle,

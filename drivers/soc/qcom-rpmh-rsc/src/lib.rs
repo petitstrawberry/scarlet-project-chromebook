@@ -20,7 +20,7 @@ use scarlet::{
             PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
         },
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time, vm,
 };
@@ -293,7 +293,7 @@ impl RpmhRsc {
         }
 
         #[cfg(debug_assertions)]
-        early_println!(
+        println!(
             "[qcom-rpmh-rsc] active batch begin tcs={} commands={} wait={:#x}",
             tcs_id,
             commands.len(),
@@ -335,7 +335,7 @@ impl RpmhRsc {
         )?;
         self.trigger(tcs_id)?;
         #[cfg(debug_assertions)]
-        early_println!("[qcom-rpmh-rsc] active batch triggered tcs={}", tcs_id);
+        println!("[qcom-rpmh-rsc] active batch triggered tcs={}", tcs_id);
 
         // CMD_STATUS is sticky across TCS reuse and may still contain the
         // bootloader's ISSUED/COMPL bits when Scarlet takes ownership.  Wait
@@ -374,7 +374,7 @@ impl RpmhRsc {
             return Err("qcom-rpmh-rsc: request completed without command acknowledgement");
         }
         #[cfg(debug_assertions)]
-        early_println!(
+        println!(
             "[qcom-rpmh-rsc] active batch complete tcs={} commands={}",
             tcs_id,
             commands.len(),
@@ -501,14 +501,12 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let phandle = read_phandle(device)?;
     let resource = resource_for_driver(device, driver_id)?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|span| span.checked_add(1))
-        .ok_or("qcom-rpmh-rsc: invalid MMIO resource")?;
+        .size()
+        .map_err(|_| "qcom-rpmh-rsc: invalid MMIO resource")?;
     let base = vm::ioremap(resource.start, size).map_err(|_| "qcom-rpmh-rsc: ioremap failed")?;
     let mapping = MmioMapping { base };
 
-    early_println!(
+    println!(
         "[qcom-rpmh-rsc] mapped drv-{} paddr={:#x} vaddr={:#x} size={:#x}; reading RSC id",
         driver_id,
         resource.start,
@@ -532,7 +530,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .ok_or("qcom-rpmh-rsc: driver id shift overflow")?;
     let max_tcs = hardware_config.checked_shr(shift).unwrap_or(0) & DRV_NUM_TCS_MASK;
     let commands_per_tcs = (hardware_config >> DRV_NCPT_SHIFT) & DRV_NCPT_MASK;
-    early_println!(
+    println!(
         "[qcom-rpmh-rsc] RSC id={:#010x} parent/child={:#010x}",
         rsc_id,
         hardware_config,
@@ -596,7 +594,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     };
     drop(previous);
 
-    early_println!(
+    println!(
         "[qcom-rpmh-rsc] registered phandle={:#x} drv={} version={}.{} active-tcs={}..{} ncpt={}",
         phandle,
         driver_id,

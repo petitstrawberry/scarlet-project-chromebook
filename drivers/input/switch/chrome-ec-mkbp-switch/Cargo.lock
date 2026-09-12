@@ -54,15 +54,21 @@ dependencies = [
 
 [[package]]
 name = "scarlet"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#03cb5f884ee3c4c5060236cdb5d3f7cba71c4ec8"
+version = "1.0.1"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
 dependencies = [
  "fdt",
  "font8x8",
  "hashbrown",
  "lock_api",
+ "scarlet-abi",
  "talc",
 ]
+
+[[package]]
+name = "scarlet-abi"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
 
 [[package]]
 name = "scarlet-driver-chrome-ec-mkbp-switch"

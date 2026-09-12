@@ -20,7 +20,7 @@ use scarlet::{
         DeviceInfo,
         clk::{ClkError, ClkHandle},
         fdt::FdtManager,
-        iommu::{IommuDomainConfig, IommuDomainType},
+        iommu::{IommuDomainConfig, IommuDomainType, Iova},
         manager::{DeviceManager, DriverPriority, is_probe_defer, probe_defer},
         phy::{PhyError, PhyHandle, PhyMode},
         platform::{
@@ -35,8 +35,8 @@ use scarlet::{
         },
         xhci::bind_xhci_mmio,
     },
-    early_println,
     interrupt::resolve_platform_irq,
+    println,
     sync::IrqSpinLock,
     time, vm,
 };
@@ -68,7 +68,7 @@ const GUCTL1_PARKMODE_DISABLE_SS: u32 = 1 << 17;
 const GEVNTSIZ_INTMASK: u32 = 1 << 31;
 
 const SC7180_USB_SID: u32 = 0x540;
-const SC7180_DWC3_SPI: usize = 133;
+const SC7180_DWC3_SPI: u64 = 133;
 // SC7180 exposes a 32-bit DMA window to USB. Keep page zero outside the IOVA
 // allocator so null DMA addresses remain invalid while the SMMU maps all xHCI
 // objects through a translated stage-1 domain.
@@ -93,15 +93,14 @@ impl Drop for QcomDwc3Wrapper {
             if let Some(original) = self.qscratch_original_general_cfg.take() {
                 let restored = qscratch_write_general_cfg(self.qscratch_base, original);
                 if restored != original {
-                    early_println!(
+                    println!(
                         "[qcom-dwc3] QSCRATCH cleanup failed under wrapper reset: GENERAL_CFG={:#010x} expected={:#010x}",
-                        restored,
-                        original
+                        restored, original
                     );
                 }
             }
         } else if self.qscratch_original_general_cfg.is_some() {
-            early_println!("[qcom-dwc3] QSCRATCH cleanup skipped: wrapper reset assertion failed");
+            println!("[qcom-dwc3] QSCRATCH cleanup skipped: wrapper reset assertion failed");
         }
         for clock in self.clocks.iter().rev() {
             clock.disable_unprepare();
@@ -184,15 +183,11 @@ fn wrapper_probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             let _ = reset.assert();
             "qcom-dwc3: missing QSCRATCH memory resource"
         })?;
-    let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
-        .ok_or_else(|| {
-            disable_clocks(&clocks);
-            let _ = reset.assert();
-            "qcom-dwc3: invalid QSCRATCH memory resource"
-        })?;
+    let size = resource.size().map_err(|_| {
+        disable_clocks(&clocks);
+        let _ = reset.assert();
+        "qcom-dwc3: invalid QSCRATCH memory resource"
+    })?;
     if size < QSCRATCH_REGISTER_WINDOW_SIZE {
         disable_clocks(&clocks);
         let _ = reset.assert();
@@ -216,7 +211,7 @@ fn wrapper_probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     });
     WRAPPER_PHANDLE.store(phandle, Ordering::Release);
     register_core_driver_once();
-    early_println!("[qcom-dwc3] SC7180 wrapper clocks, reset, and USB GDSC ready");
+    println!("[qcom-dwc3] SC7180 wrapper clocks, reset, and USB GDSC ready");
     log_core_dependency_preflight();
     Ok(())
 }
@@ -228,17 +223,17 @@ fn disable_clocks(clocks: &[ClkHandle]) {
 }
 
 fn core_probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
-    early_println!(
+    println!(
         "[qcom-dwc3] core stage 1/8: Standard pre-probe passed for {} (IOMMU and PHY providers resolved)",
         device.name()
     );
     let wrapper_phandle = WRAPPER_PHANDLE.load(Ordering::Acquire);
     if wrapper_phandle == 0 {
-        early_println!("[qcom-dwc3] core deferred: SC7180 wrapper is not ready");
+        println!("[qcom-dwc3] core deferred: SC7180 wrapper is not ready");
         return probe_defer();
     }
     if device.parent_phandle() != Some(wrapper_phandle) {
-        early_println!(
+        println!(
             "[qcom-dwc3] core rejected: parent={:?}, expected wrapper phandle={:#x}",
             device.parent_phandle(),
             wrapper_phandle
@@ -255,32 +250,28 @@ fn core_probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .ok_or("qcom-dwc3: missing DWC3 memory resource")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
-        .ok_or("qcom-dwc3: invalid DWC3 memory resource")?;
+        .size()
+        .map_err(|_| "qcom-dwc3: invalid DWC3 memory resource")?;
     if size < DWC3_REGISTER_WINDOW_SIZE {
         return Err("qcom-dwc3: DWC3 register resource is smaller than 0xe000 bytes");
     }
     let base = vm::ioremap(resource.start, size)
         .map_err(|_| log_stage_error("DWC3 MMIO map", "qcom-dwc3: ioremap failed"))?;
-    early_println!(
+    println!(
         "[qcom-dwc3] core stage 2/8: MMIO mapped paddr={:#x} vaddr={:#x} size={:#x}",
-        resource.start,
-        base,
-        size
+        resource.start, base, size
     );
 
     let manager = DeviceManager::get_manager();
-    early_println!("[qcom-dwc3] core stage 3/8: resolving usb2-phy in host mode");
+    println!("[qcom-dwc3] core stage 3/8: resolving usb2-phy in host mode");
     let usb2_phy = resolve_host_phy(manager, device, "usb2-phy")?;
-    early_println!("[qcom-dwc3] core stage 3/8: usb2-phy host mode ready");
-    early_println!("[qcom-dwc3] core stage 4/8: resolving usb3-phy in host mode");
+    println!("[qcom-dwc3] core stage 3/8: usb2-phy host mode ready");
+    println!("[qcom-dwc3] core stage 4/8: resolving usb3-phy in host mode");
     let usb3_phy = resolve_host_phy(manager, device, "usb3-phy")?;
-    early_println!("[qcom-dwc3] core stage 4/8: usb3-phy host mode ready");
+    println!("[qcom-dwc3] core stage 4/8: usb3-phy host mode ready");
 
     let core = Dwc3Core::new(base);
-    early_println!("[qcom-dwc3] core stage 5/8: resetting and initializing DWC3 core");
+    println!("[qcom-dwc3] core stage 5/8: resetting and initializing DWC3 core");
     initialize_core(
         &core,
         device,
@@ -301,7 +292,7 @@ fn core_probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             resource.res_type == PlatformDeviceResourceType::IRQ
                 && resource
                     .irq_metadata
-                    .map_or(resource.start, |metadata| metadata.irq_number as usize)
+                    .map_or(resource.start, |metadata| u64::from(metadata.irq_number))
                     == SC7180_DWC3_SPI
         })
         .ok_or("qcom-dwc3: missing DWC3 SPI 133")?;
@@ -311,12 +302,11 @@ fn core_probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             "qcom-dwc3: failed to resolve DWC3 SPI 133",
         )
     })?;
-    early_println!(
+    println!(
         "[qcom-dwc3] core stage 6/8: SPI {} resolved to IRQ {}",
-        SC7180_DWC3_SPI,
-        interrupt
+        SC7180_DWC3_SPI, interrupt
     );
-    early_println!(
+    println!(
         "[qcom-dwc3] core stage 7/8: resolving DMA context for SID {:#x}",
         SC7180_USB_SID
     );
@@ -325,25 +315,22 @@ fn core_probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             device,
             IommuDomainConfig {
                 domain_type: IommuDomainType::Dma,
-                iova_base: XHCI_IOVA_BASE,
+                iova_base: Iova::new(XHCI_IOVA_BASE),
                 iova_size: XHCI_IOVA_SIZE,
             },
         )
         .map_err(|error| log_stage_error("SID 0x540 DMA context", error))?;
-    early_println!("[qcom-dwc3] core stage 7/8: DMA context attached");
+    println!("[qcom-dwc3] core stage 7/8: DMA context attached");
 
-    early_println!("[qcom-dwc3] core stage 8/8: binding xHCI host");
+    println!("[qcom-dwc3] core stage 8/8: binding xHCI host");
     bind_xhci_mmio(base, Some(interrupt), dma_context)
         .map_err(|error| log_stage_error("xHCI bind", error))?;
     CONTROLLERS.lock().push(controller);
 
     let (major, minor) = core.read_revision();
-    early_println!(
+    println!(
         "[qcom-dwc3] SC7180 host ready: revision={}.{} SID={:#x} SPI={}",
-        major,
-        minor,
-        SC7180_USB_SID,
-        SC7180_DWC3_SPI
+        major, minor, SC7180_USB_SID, SC7180_DWC3_SPI
     );
     Ok(())
 }
@@ -357,7 +344,7 @@ fn initialize_core(
     qscratch_base: usize,
 ) -> Result<(), &'static str> {
     let (major, minor) = core.read_revision();
-    early_println!(
+    println!(
         "[qcom-dwc3] DWC3 revision {}.{} usb3-capable={}",
         major,
         minor,
@@ -385,19 +372,19 @@ fn initialize_core(
     }
     core.write32(DWC3_GUSB2PHYCFG, usb2);
 
-    early_println!("[qcom-dwc3] DWC3 init: powering usb2-phy");
+    println!("[qcom-dwc3] DWC3 init: powering usb2-phy");
     usb2_phy
         .power_on()
         .map_err(|error| log_stage_error("usb2-phy power-on", phy_error_to_str(error)))?;
-    early_println!("[qcom-dwc3] DWC3 init: usb2-phy powered");
-    early_println!("[qcom-dwc3] DWC3 init: powering usb3-phy");
+    println!("[qcom-dwc3] DWC3 init: usb2-phy powered");
+    println!("[qcom-dwc3] DWC3 init: powering usb3-phy");
     let high_speed_only = match usb3_phy.power_on() {
         Ok(()) => {
-            early_println!("[qcom-dwc3] DWC3 init: usb3-phy powered");
+            println!("[qcom-dwc3] DWC3 init: usb3-phy powered");
             false
         }
         Err(PhyError::Timeout) => {
-            early_println!(
+            println!(
                 "[qcom-dwc3] DWC3 init: usb3-phy power-on timed out; falling back to USB2 high-speed host"
             );
             // A failed power_on does not acquire a PhyHandle power reference,
@@ -406,7 +393,7 @@ fn initialize_core(
             // Keep the provider rolled back and configure the DWC3 to run its
             // USB3 clock domain from the USB2 clock below.
             usb3_phy.power_off();
-            early_println!(
+            println!(
                 "[qcom-dwc3] DWC3 init: SuperSpeed PHY remains off; continuing with USB2 high-speed only"
             );
             true
@@ -457,7 +444,7 @@ fn initialize_core(
         usb2_phy.power_off();
         return Err(log_stage_error("DWC3 global reset", error));
     }
-    early_println!("[qcom-dwc3] DWC3 init: global reset released");
+    println!("[qcom-dwc3] DWC3 init: global reset released");
 
     // GUCTL1 is part of the live core configuration, not the PHY-reset
     // handshake. Linux programs it after its core-reset step. Program and
@@ -482,7 +469,7 @@ fn initialize_core(
             "qcom-dwc3: GCTL host mode did not latch",
         ));
     }
-    early_println!(
+    println!(
         "[qcom-dwc3] DWC3 init: fixed host mode latched GCTL={:#010x}",
         programmed_gctl
     );
@@ -502,7 +489,7 @@ fn initialize_core(
                 "qcom-dwc3: SuperSpeed PIPE suspend did not latch",
             ));
         }
-        early_println!(
+        println!(
             "[qcom-dwc3] USB2 fallback: SuperSpeed PIPE quiesced after core initialization GUSB3PIPECTL={:#010x}",
             programmed_pipe
         );
@@ -527,10 +514,9 @@ fn initialize_core(
 fn verify_high_speed_phy_state(core: &Dwc3Core) -> Result<(), &'static str> {
     let programmed_usb2 = core.read32(DWC3_GUSB2PHYCFG);
     let programmed_pipe = core.read32(DWC3_GUSB3PIPECTL);
-    early_println!(
+    println!(
         "[qcom-dwc3] USB2 fallback PHY readback before core-reset release: GUSB2PHYCFG={:#010x} GUSB3PIPECTL={:#010x}",
-        programmed_usb2,
-        programmed_pipe
+        programmed_usb2, programmed_pipe
     );
     if programmed_usb2 & (GUSB2PHYCFG_PHYSOFTRST | GUSB2PHYCFG_SUSPHY) != 0 {
         return Err(log_stage_error(
@@ -544,10 +530,9 @@ fn verify_high_speed_phy_state(core: &Dwc3Core) -> Result<(), &'static str> {
             "qcom-dwc3: USB3 PIPE reset or suspend remained asserted",
         ));
     }
-    early_println!(
+    println!(
         "[qcom-dwc3] USB2 fallback: GUSB2PHYCFG={:#010x} reset/SUSPHY clear GUSB3PIPECTL={:#010x} reset/SUSPHY clear",
-        programmed_usb2,
-        programmed_pipe
+        programmed_usb2, programmed_pipe
     );
     Ok(())
 }
@@ -561,10 +546,9 @@ fn configure_high_speed_clock(core: &Dwc3Core) -> Result<(), &'static str> {
     let requested = core.read32(DWC3_GUCTL1) | GUCTL1_DEV_FORCE_20_CLK_FOR_30_CLK;
     core.write32(DWC3_GUCTL1, requested);
     let programmed = core.read32(DWC3_GUCTL1);
-    early_println!(
+    println!(
         "[qcom-dwc3] USB2 fallback core-clock readback after reset release: GUCTL1={:#010x} requested={:#010x}",
-        programmed,
-        requested
+        programmed, requested
     );
     if programmed & GUCTL1_DEV_FORCE_20_CLK_FOR_30_CLK == 0 {
         return Err(log_stage_error(
@@ -614,7 +598,7 @@ fn select_utmi_as_pipe_clock(
             "qcom-dwc3: QSCRATCH UTMI PIPE clock did not enable",
         ));
     }
-    early_println!(
+    println!(
         "[qcom-dwc3] USB2 fallback: QSCRATCH_GENERAL_CFG={:#010x} PIPE clock=UTMI PHYSTATUS=software",
         enabled
     );
@@ -672,7 +656,7 @@ fn resolve_host_phy(
     let phy = match manager.resolve_phy(device, name) {
         Ok(phy) => phy,
         Err(error) if is_probe_defer(error) => {
-            early_println!(
+            println!(
                 "[qcom-dwc3] {} provider disappeared after pre-probe; deferring",
                 name
             );
@@ -687,14 +671,14 @@ fn resolve_host_phy(
 
 fn log_core_dependency_preflight() {
     let Some(fdt) = FdtManager::get_manager().get_fdt() else {
-        early_println!("[qcom-dwc3] core preflight unavailable: FDT is not initialized");
+        println!("[qcom-dwc3] core preflight unavailable: FDT is not initialized");
         return;
     };
     let Some(core_node) = fdt.all_nodes().find(|node| {
         node.compatible()
             .is_some_and(|compatible| compatible.all().any(|entry| entry == "snps,dwc3"))
     }) else {
-        early_println!("[qcom-dwc3] core preflight failed: no snps,dwc3 child in FDT");
+        println!("[qcom-dwc3] core preflight failed: no snps,dwc3 child in FDT");
         return;
     };
 
@@ -708,7 +692,7 @@ fn log_core_dependency_preflight() {
     let usb2_phandle = phy_cells.as_ref().and_then(|cells| cells.first()).copied();
     let usb3_phandle = phy_cells.as_ref().and_then(|cells| cells.get(1)).copied();
 
-    early_println!(
+    println!(
         "[qcom-dwc3] core preflight: driver=Standard iommu={:?}/ready={} usb2={:?}/ready={} usb3={:?}/ready={}",
         iommu_phandle,
         iommu_phandle
@@ -721,7 +705,7 @@ fn log_core_dependency_preflight() {
     if iommu_phandle
         .is_some_and(|phandle| manager.get_iommu_controller_by_phandle(phandle).is_none())
     {
-        early_println!(
+        println!(
             "[qcom-dwc3] core will defer before driver probe: apps SMMU provider for SID {:#x} is not registered",
             SC7180_USB_SID
         );
@@ -746,7 +730,7 @@ fn be_cells(bytes: &[u8]) -> Option<Vec<u32>> {
 }
 
 fn log_stage_error(stage: &str, error: &'static str) -> &'static str {
-    early_println!("[qcom-dwc3] {} failed: {}", stage, error);
+    println!("[qcom-dwc3] {} failed: {}", stage, error);
     error
 }
 
@@ -821,7 +805,7 @@ fn register_core_driver_once() {
         // DT traversal order or a same-phase deferred retry.
         DriverPriority::Standard,
     );
-    early_println!(
+    println!(
         "[qcom-dwc3] registered nested snps,dwc3 driver at Standard priority; generic pre-probe checks IOMMU before PHYs"
     );
 }

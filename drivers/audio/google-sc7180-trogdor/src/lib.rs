@@ -18,7 +18,7 @@ use scarlet::{
         manager::{DeviceManager, DriverPriority, PROBE_DEFER},
         platform::{PlatformDeviceDriver, PlatformDeviceInfo},
     },
-    early_println,
+    println,
 };
 
 const SECONDARY_MI2S: u32 = 1;
@@ -90,7 +90,7 @@ fn probe(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .get_audio_codec_by_phandle(codec_phandle)
         .ok_or(PROBE_DEFER)?;
     provider.attach_playback_codec_tdm(&spec, codec, 1)?;
-    early_println!(
+    println!(
         "[google-sc7180-audio] routed secondary MI2S provider={:#x} codec={:#x}",
         cpu_phandle,
         codec_phandle,

@@ -73,15 +73,21 @@ dependencies = [
 
 [[package]]
 name = "scarlet"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#a55d11a0843148c5438d4938e07a221e14da3546"
+version = "1.0.1"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
 dependencies = [
  "fdt",
  "font8x8",
  "hashbrown",
  "lock_api",
+ "scarlet-abi",
  "talc",
 ]
+
+[[package]]
+name = "scarlet-abi"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
 
 [[package]]
 name = "scarlet-driver-qcom-adreno-a618"

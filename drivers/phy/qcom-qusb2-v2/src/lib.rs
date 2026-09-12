@@ -599,10 +599,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| matches!(resource.res_type, PlatformDeviceResourceType::MEM))
         .ok_or("qcom-qusb2-v2: no memory resource")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
-        .ok_or("qcom-qusb2-v2: invalid memory resource")?;
+        .size()
+        .map_err(|_| "qcom-qusb2-v2: invalid memory resource")?;
     if size < 0x400 {
         return Err("qcom-qusb2-v2: PHY resource is smaller than 0x400 bytes");
     }

@@ -23,6 +23,7 @@ mod hfi;
 mod hfi_abi;
 mod memory;
 mod opp;
+mod pending;
 mod registers;
 mod submit;
 

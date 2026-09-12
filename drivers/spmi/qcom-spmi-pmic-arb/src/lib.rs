@@ -22,7 +22,7 @@ use scarlet::{
             PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
         },
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time, vm,
 };
@@ -147,13 +147,13 @@ fn be_u32_property(device: &PlatformDeviceInfo, name: &str) -> Option<u32> {
     Some(u32::from_be_bytes(bytes))
 }
 
-fn memory_resources(device: &PlatformDeviceInfo) -> Vec<(usize, usize)> {
+fn memory_resources(device: &PlatformDeviceInfo) -> Vec<(u64, usize)> {
     device
         .get_resources()
         .iter()
         .filter(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .filter_map(|resource| {
-            let size = resource.end.checked_sub(resource.start)?.checked_add(1)?;
+            let size = resource.size().ok()?;
             Some((resource.start, size))
         })
         .collect()
@@ -228,12 +228,9 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     });
     *CONTROLLER.lock() = Some(controller);
 
-    early_println!(
+    println!(
         "[qcom-spmi-pmic-arb] registered v{:#x} EE={} APIDs={} paddr={:#x}",
-        version,
-        ee,
-        apid_count,
-        core_paddr
+        version, ee, apid_count, core_paddr
     );
     Ok(())
 }

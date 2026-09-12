@@ -36,7 +36,7 @@ use scarlet::{
         },
         manager::DeviceManager,
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
 };
 #[cfg(target_os = "none")]
@@ -232,7 +232,7 @@ mod runtime {
                 Ok(Some(state)) => self.accept_state(state),
                 Ok(None) => {}
                 Err(_) => {
-                    early_println!("[chrome-ec-mkbp-button] discarded malformed button event")
+                    println!("[chrome-ec-mkbp-button] discarded malformed button event")
                 }
             }
             true
@@ -243,18 +243,18 @@ mod runtime {
 
     fn initialize() {
         let Some(ec) = get_primary_cros_ec_spi() else {
-            early_println!("[chrome-ec-mkbp-button] primary Chrome EC unavailable");
+            println!("[chrome-ec-mkbp-button] primary Chrome EC unavailable");
             return;
         };
         let supported = match query_supported_buttons(ec.as_ref()) {
             Ok(supported) => known_supported_buttons(supported),
             Err(_) => {
-                early_println!("[chrome-ec-mkbp-button] failed to query button support");
+                println!("[chrome-ec-mkbp-button] failed to query button support");
                 return;
             }
         };
         if supported == 0 {
-            early_println!("[chrome-ec-mkbp-button] no known EC buttons supported");
+            println!("[chrome-ec-mkbp-button] no known EC buttons supported");
             return;
         }
 
@@ -276,7 +276,7 @@ mod runtime {
         let name = event.get_name().into();
         let registered: Arc<dyn Device> = event;
         DeviceManager::get_manager().register_device_with_name(name, registered);
-        early_println!(
+        println!(
             "[chrome-ec-mkbp-button] registered keyboard buttons supported={:#x} source=EC-MKBP-IRQ",
             supported,
         );

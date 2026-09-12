@@ -28,7 +28,7 @@ use scarlet::{
         power::PowerManager,
         reset::ResetController,
     },
-    early_println, time, vm,
+    println, time, vm,
 };
 
 // The highest register used by this subset is USB3_PRIM_CLKREF_CBCR.
@@ -344,7 +344,7 @@ fn prepare_display_clocks(registers: RegisterWindow) -> Result<(), &'static str>
     enable_branch(registers, GCC_DISP_HF_AXI_BRANCH, true)
         .map_err(|_| "qcom-sc7180-gcc: display HF-AXI clock failed to start")?;
 
-    early_println!(
+    println!(
         "[qcom-sc7180-gcc] handoff inherited: vote={:#010x} disp-ahb={:#010x} hf-axi={:#010x} xo={:#010x} gpu-cfg-ahb={:#010x}",
         inherited_vote,
         inherited_ahb,
@@ -352,12 +352,12 @@ fn prepare_display_clocks(registers: RegisterWindow) -> Result<(), &'static str>
         inherited_xo,
         inherited_gpu_cfg_ahb,
     );
-    early_println!(
+    println!(
         "[qcom-sc7180-gcc] GPU MISC ready: {:#010x}->{:#010x}",
         inherited_gpu_misc,
         registers.read(GCC_GPU_MISC),
     );
-    early_println!(
+    println!(
         "[qcom-sc7180-gcc] GPU CFG AHB ready: {:#010x}->{:#010x}",
         inherited_gpu_cfg_ahb,
         registers.read(GCC_GPU_CFG_AHB_BRANCH),
@@ -485,7 +485,7 @@ impl Clk for Sc7180UsbClock {
             // AUX and COM_AUX share gcc_usb3_prim_phy_aux_clk_src. Linux's
             // only SC7180 table entry selects BI_TCXO with HID /1.
             configure_rcg(self.registers, GCC_USB3_PRIM_PHY_AUX_CMD_RCGR, 0, 1)?;
-            early_println!(
+            println!(
                 "[qcom-sc7180-gcc] USB3 PHY AUX source: cmd={:#010x} cfg={:#010x}",
                 self.registers.read(GCC_USB3_PRIM_PHY_AUX_CMD_RCGR),
                 self.registers
@@ -534,7 +534,7 @@ impl Clk for Sc7180UsbClock {
                 // Parent selector 1 and HID encoding 5 match F(..., 3, ...).
                 configure_rcg(self.registers, GCC_USB30_PRIM_MASTER_CMD_RCGR, 1, 5)?;
                 self.master_rate.store(USB_MASTER_RATE, Ordering::Relaxed);
-                early_println!(
+                println!(
                     "[qcom-sc7180-gcc] USB master source: requested={} actual={} cmd={:#010x} cfg={:#010x}",
                     rate,
                     USB_MASTER_RATE,
@@ -872,7 +872,7 @@ impl Clk for Sc7180GccSimpleClock {
         // gates access to GPU_CC itself, so dropping a deferred GPU SMMU probe
         // must release only the logical reference, not the hardware branch.
         if self.descriptor.always_on {
-            early_println!(
+            println!(
                 "[qcom-sc7180-gcc] retaining always-on clock '{}'",
                 self.descriptor.name,
             );
@@ -929,7 +929,7 @@ impl Clk for Sc7180QupSerialClock {
             BRANCH_TIMEOUT_US,
         )
         .map_err(|_| ClkError::HardwareError)?;
-        early_println!(
+        println!(
             "[qcom-sc7180-gcc] QUPv3 {} ready: rate={} cmd={:#010x} vote={:#010x} halt={:#010x}",
             self.descriptor.log_name,
             QUP_SERIAL_RATE,
@@ -1108,7 +1108,7 @@ fn require_parent_power_domain(device: &PlatformDeviceInfo) -> Result<(), &'stat
             .map_err(|_| "qcom-sc7180-gcc: malformed parent domain id")?,
     );
     if !PowerManager::has_provider(phandle) {
-        early_println!(
+        println!(
             "[qcom-sc7180-gcc] waiting for parent power provider phandle={:#x}",
             phandle,
         );
@@ -1117,13 +1117,13 @@ fn require_parent_power_domain(device: &PlatformDeviceInfo) -> Result<(), &'stat
 
     let domain = PowerManager::resolve_domain(phandle, &[domain_id])?;
     if !domain.is_enabled() {
-        early_println!(
+        println!(
             "[qcom-sc7180-gcc] waiting for parent domain '{}' vote",
             domain.label(),
         );
         return probe_defer();
     }
-    early_println!(
+    println!(
         "[qcom-sc7180-gcc] parent domain '{}' is active",
         domain.label(),
     );
@@ -1148,7 +1148,7 @@ pub fn enable_usb30_prim_gdsc() -> Result<(), &'static str> {
     }
     let registers = RegisterWindow::new(base);
     enable_usb_gdsc(registers)?;
-    early_println!(
+    println!(
         "[qcom-sc7180-gcc] USB30_PRIM_GDSC enabled: gdscr={:#010x} pipe={:#010x}",
         registers.read(GCC_USB30_PRIM_GDSCR),
         registers.read(0x0f058),
@@ -1167,10 +1167,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| matches!(resource.res_type, PlatformDeviceResourceType::MEM))
         .ok_or("qcom-sc7180-gcc: missing GCC memory resource")?;
     let resource_size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
-        .ok_or("qcom-sc7180-gcc: invalid GCC memory resource")?;
+        .size()
+        .map_err(|_| "qcom-sc7180-gcc: invalid GCC memory resource")?;
     if resource_size < REGISTER_WINDOW_SIZE {
         return Err("qcom-sc7180-gcc: GCC register resource is too small");
     }
@@ -1186,7 +1184,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     manager.register_reset_controller(phandle, Arc::new(Sc7180GccResetController { registers }));
     GCC_BASE.store(base, Ordering::Release);
 
-    early_println!(
+    println!(
         "[qcom-sc7180-gcc] registered display/USB/SDCC1/QUP clocks and USB resets for phandle {:#x}",
         phandle
     );

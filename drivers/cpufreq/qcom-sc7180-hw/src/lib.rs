@@ -33,7 +33,7 @@ use scarlet::{
             PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
         },
     },
-    early_println,
+    println,
     environment::MAX_NUM_CPUS,
     sync::IrqSpinLock,
     vm,
@@ -101,7 +101,7 @@ struct QcomCpuFreqDomain {
     valid: bool,
     provider_index: u32,
     domain_id: u32,
-    paddr: usize,
+    paddr: u64,
     registers: RegisterWindow,
     per_core_dcvs: bool,
     cpu_count: usize,
@@ -292,8 +292,8 @@ fn required_clock_rate(device: &PlatformDeviceInfo, name: &str) -> Result<u64, &
 
 fn memory_resources(
     device: &PlatformDeviceInfo,
-) -> Result<[(usize, usize); DOMAIN_COUNT], &'static str> {
-    let mut resources = [(0usize, 0usize); DOMAIN_COUNT];
+) -> Result<[(u64, usize); DOMAIN_COUNT], &'static str> {
+    let mut resources = [(0u64, 0usize); DOMAIN_COUNT];
     let mut count = 0usize;
 
     for resource in device
@@ -305,10 +305,8 @@ fn memory_resources(
             return Err("qcom-sc7180-cpufreq-hw: unexpected extra MMIO domain");
         }
         let size = resource
-            .end
-            .checked_sub(resource.start)
-            .and_then(|value| value.checked_add(1))
-            .ok_or("qcom-sc7180-cpufreq-hw: invalid MMIO resource")?;
+            .size()
+            .map_err(|_| "qcom-sc7180-cpufreq-hw: invalid MMIO resource")?;
         if size < MIN_REGISTER_WINDOW_SIZE {
             return Err("qcom-sc7180-cpufreq-hw: MMIO resource is too small");
         }
@@ -425,7 +423,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             .or_else(|| domain.max_frequency())
             .ok_or("qcom-sc7180-cpufreq-hw: no boot frequency")?;
         set_domain_target_frequency(domain.domain_id, boot_frequency)?;
-        early_println!(
+        println!(
             "[qcom-sc7180-cpufreq-hw] domain={} id={:#x} cpus={:#x} paddr={:#x} opps={} current={} kHz range={}..={} kHz voltage={}..={} uV per-core={}",
             domain.provider_index,
             domain.domain_id,
@@ -442,7 +440,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     }
 
     PROBED.store(true, Ordering::Release);
-    early_println!(
+    println!(
         "[qcom-sc7180-cpufreq-hw] registered xo={} Hz alternate={} Hz",
         xo_rate_hz,
         alternate_rate_hz,
@@ -460,7 +458,7 @@ fn register_driver() {
         snapshot: cpu_frequency_info,
         set_pstate: Some(set_domain_pstate),
     }) {
-        early_println!(
+        println!(
             "[qcom-sc7180-cpufreq-hw] failed to register backend: {}",
             error,
         );

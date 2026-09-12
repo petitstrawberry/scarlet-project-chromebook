@@ -213,17 +213,15 @@ fn device_phandle(device: &PlatformDeviceInfo) -> Result<u32, &'static str> {
         .ok_or("qcom-sc7180-qfprom: missing phandle")
 }
 
-fn corrected_resource(device: &PlatformDeviceInfo) -> Result<(usize, usize), &'static str> {
+fn corrected_resource(device: &PlatformDeviceInfo) -> Result<(u64, usize), &'static str> {
     let resource = device
         .get_resources()
         .iter()
         .find(|resource| matches!(resource.res_type, PlatformDeviceResourceType::MEM))
         .ok_or("qcom-sc7180-qfprom: corrected fuse resource missing")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
-        .ok_or("qcom-sc7180-qfprom: invalid corrected fuse resource")?;
+        .size()
+        .map_err(|_| "qcom-sc7180-qfprom: invalid corrected fuse resource")?;
     Ok((resource.start, size))
 }
 

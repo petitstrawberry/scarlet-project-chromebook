@@ -734,10 +734,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let mut tiles = [0usize; 3];
     for (index, resource) in resources.iter().take(3).enumerate() {
         let size = resource
-            .end
-            .checked_sub(resource.start)
-            .and_then(|value| value.checked_add(1))
-            .ok_or("qcom-sc7180-tlmm: invalid memory resource")?;
+            .size()
+            .map_err(|_| "qcom-sc7180-tlmm: invalid memory resource")?;
         tiles[index] =
             vm::ioremap(resource.start, size).map_err(|_| "qcom-sc7180-tlmm: ioremap failed")?;
     }

@@ -25,7 +25,7 @@ use scarlet::{
         manager::{DeviceManager, DriverPriority, probe_defer},
         platform::{PlatformDeviceDriver, PlatformDeviceInfo},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time,
 };
@@ -968,7 +968,7 @@ fn resolve_i2c_bus(device: &PlatformDeviceInfo) -> Result<(u32, Arc<dyn I2cBus>)
     match DeviceManager::get_manager().get_i2c_bus(bus_phandle) {
         Some(bus) => Ok((bus_phandle, bus)),
         None => {
-            early_println!(
+            println!(
                 "[ti-sn65dsi86] I2C bus phandle {:#x} is not ready, deferring",
                 bus_phandle
             );
@@ -994,7 +994,7 @@ fn enable_bridge_gpio(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let controller = DeviceManager::get_manager()
         .get_gpio_controller(controller_phandle)
         .ok_or_else(|| {
-            early_println!(
+            println!(
                 "[ti-sn65dsi86] GPIO controller {:#x} is not ready, deferring",
                 controller_phandle
             );
@@ -1014,7 +1014,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let bridge = Arc::new(Sn65dsi86::new(bus, address, phandle, bus_phandle));
 
     if let Err(error) = bridge.verify_device_id() {
-        early_println!(
+        println!(
             "[ti-sn65dsi86] device-ID read failed: bus={:#x} addr={:#x} error={:?}",
             bus_phandle,
             address.raw(),
@@ -1024,7 +1024,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     }
 
     let snapshot = bridge.diagnostic_snapshot().map_err(|error| {
-        early_println!(
+        println!(
             "[ti-sn65dsi86] diagnostic read failed: bus={:#x} addr={:#x} error={:?}",
             bus_phandle,
             address.raw(),
@@ -1033,7 +1033,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         "ti-sn65dsi86: failed to read bridge state"
     })?;
 
-    early_println!(
+    println!(
         "[ti-sn65dsi86] registered {} phandle={:#x} bus={:#x} addr={:#x} rev={:#x} pll={} stream={} hpd={} hpd-disabled={} dsi-lanes={:#x} dsi-clock={:#x} dp-lanes={:#x} dp-rate={:#x} link={:#x}",
         device.name(),
         phandle,
@@ -1053,13 +1053,11 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     let mut dpcd = [0; 3];
     match bridge.read_dpcd(0, &mut dpcd) {
-        Ok(()) => early_println!(
+        Ok(()) => println!(
             "[ti-sn65dsi86] sink DPCD revision={:#x} max-rate={:#x} max-lanes={:#x}",
-            dpcd[0],
-            dpcd[1],
-            dpcd[2],
+            dpcd[0], dpcd[1], dpcd[2],
         ),
-        Err(error) => early_println!("[ti-sn65dsi86] sink DPCD probe unavailable: {:?}", error),
+        Err(error) => println!("[ti-sn65dsi86] sink DPCD probe unavailable: {:?}", error),
     }
 
     BRIDGES.lock().push(bridge);

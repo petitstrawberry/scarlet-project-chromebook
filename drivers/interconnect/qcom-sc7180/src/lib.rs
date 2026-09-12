@@ -23,7 +23,7 @@ use scarlet::{
         manager::{DeviceManager, DriverPriority, probe_defer},
         platform::{PlatformDeviceDriver, PlatformDeviceInfo},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
 };
 
@@ -135,7 +135,7 @@ impl GpuMemoryPath {
         self.voter.rsc.write_active_batch(&commands)?;
         self.last_peak_kbps.store(peak_kbps, Ordering::Release);
 
-        early_println!(
+        println!(
             "[qcom-sc7180-icc] gfx-mem peak={} kB/s votes={}",
             peak_kbps,
             VoteSummary(&prepared),
@@ -177,7 +177,7 @@ impl BcmPath {
         let commands: Vec<_> = prepared.iter().map(|entry| entry.command).collect();
         self.voter.rsc.write_active_batch(&commands)?;
         self.last_peak_kbps.store(peak_kbps, Ordering::Release);
-        early_println!(
+        println!(
             "[qcom-sc7180-icc] {} peak={} kB/s votes={}",
             self.label,
             peak_kbps,
@@ -362,7 +362,7 @@ fn probe_voter(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         }
     };
     drop(replaced);
-    early_println!(
+    println!(
         "[qcom-sc7180-icc] registered BCM voter phandle={:#x} parent={:#x}",
         phandle,
         parent,
@@ -448,7 +448,7 @@ fn probe_noc_provider(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     } else {
         providers.push(provider);
     }
-    early_println!(
+    println!(
         "[qcom-sc7180-icc] registered {:?} provider={:#x} voter={:#x}",
         provider.kind,
         provider.phandle,

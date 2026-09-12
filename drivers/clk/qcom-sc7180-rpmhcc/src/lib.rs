@@ -22,7 +22,7 @@ use scarlet::{
         manager::{DeviceManager, DriverPriority, probe_defer},
         platform::{PlatformDeviceDriver, PlatformDeviceInfo},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
 };
 
@@ -58,7 +58,7 @@ impl CxoResource {
         }
 
         let level = if aggregate_after { XO_ENABLE_LEVEL } else { 0 };
-        early_println!(
+        println!(
             "[qcom-sc7180-rpmhcc] voting {} address={:#x} level={}",
             XO_RESOURCE_NAME,
             self.address,
@@ -68,7 +68,7 @@ impl CxoResource {
             enabled[index] = !enable;
             return Err(error);
         }
-        early_println!(
+        println!(
             "[qcom-sc7180-rpmhcc] {} active level={}",
             XO_RESOURCE_NAME,
             level,
@@ -113,7 +113,7 @@ impl Clk for RpmhCxoClock {
 
     fn disable(&self) {
         if let Err(error) = self.resource.set_enabled(self.index(), false) {
-            early_println!(
+            println!(
                 "[qcom-sc7180-rpmhcc] failed to release {}: {}",
                 self.name(),
                 error,
@@ -216,7 +216,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     });
     DeviceManager::get_manager()
         .register_clk_provider(phandle, Arc::new(Sc7180RpmhClockProvider::new(&resource)));
-    early_println!(
+    println!(
         "[qcom-sc7180-rpmhcc] registered phandle={:#x} parent={:#x} xo-address={:#x}",
         phandle,
         parent_phandle,

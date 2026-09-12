@@ -8,11 +8,11 @@ use scarlet::{
     arch,
     device::{
         clk::ClkHandle,
-        iommu::{DmaContext, IommuDomainConfig, IommuDomainType},
+        iommu::{DmaContext, IommuDomainConfig, IommuDomainType, Iova},
         manager::{DeviceManager, probe_defer},
         platform::{PlatformDeviceInfo, resource::PlatformDeviceResourceType},
     },
-    early_println,
+    println,
     sync::{IrqSpinLock, Mutex},
     time, vm,
 };
@@ -58,7 +58,7 @@ impl Drop for EnabledClocks {
 }
 
 impl MmioMapping {
-    fn new(paddr: usize, size: usize, error: &'static str) -> Result<Self, &'static str> {
+    fn new(paddr: u64, size: usize, error: &'static str) -> Result<Self, &'static str> {
         Ok(Self {
             base: vm::ioremap(paddr, size).map_err(|_| error)?,
         })
@@ -170,7 +170,7 @@ impl A618Gmu {
             .gx_levels
             .last()
             .ok_or("qcom-adreno-a618: GPU OPP table is empty")?;
-        early_println!(
+        println!(
             "[qcom-adreno-a618] OPP table gpu-levels={} range={}..{} kHz gmu-levels={} initial-index={} dt-peak={} kB/s",
             power.gx_levels.len(),
             minimum.frequency_khz,
@@ -191,7 +191,7 @@ impl A618Gmu {
         if self.active {
             return Err("qcom-adreno-a618: GMU is not quiesced after a prior failure");
         }
-        early_println!("[qcom-adreno-a618] GMU bring-up begin");
+        println!("[qcom-adreno-a618] GMU bring-up begin");
         self.wake_rsc()?;
         self.dma_context
             .restore_iommu()
@@ -205,7 +205,7 @@ impl A618Gmu {
             .gx_levels
             .get(power.initial_gpu_index)
             .ok_or("qcom-adreno-a618: initial GPU OPP index is invalid")?;
-        early_println!(
+        println!(
             "[qcom-adreno-a618] GMU inputs firmware={} gpu-levels={} gmu-levels={} initial={} kHz vote={:#x}",
             firmware.len(),
             power.gx_levels.len(),
@@ -238,19 +238,19 @@ impl A618Gmu {
             );
             self.configure_power();
             self.start_cm3()?;
-            early_println!(
+            println!(
                 "[qcom-adreno-a618] GMU CM3 ready init={:#010x}",
                 self.registers.read(GMU_CM3_FW_INIT_RESULT),
             );
             self.enable_gfx_rail(initial.vote)?;
-            early_println!("[qcom-adreno-a618] GMU GX rail acknowledged");
+            println!("[qcom-adreno-a618] GMU GX rail acknowledged");
             self.enable_sptprac()?;
-            early_println!(
+            println!(
                 "[qcom-adreno-a618] GMU SPTPRAC ready status={:#010x}",
                 self.registers.read(GMU_SPTPRAC_PWR_CLK_STATUS),
             );
             self.start_hfi_transport()?;
-            early_println!(
+            println!(
                 "[qcom-adreno-a618] GMU HFI transport ready status={:#010x}",
                 self.registers.read(GMU_HFI_CTRL_STATUS),
             );
@@ -270,13 +270,13 @@ impl A618Gmu {
             Ok::<(), &'static str>(())
         })();
         if let Err(error) = boot {
-            early_println!("[a618] {}", error);
-            early_println!(
+            println!("[a618] {}", error);
+            println!(
                 "[a618] GMU state init={:#010x} hfi={:#010x}",
                 self.registers.read(GMU_CM3_FW_INIT_RESULT),
                 self.registers.read(GMU_HFI_CTRL_STATUS),
             );
-            early_println!(
+            println!(
                 "[a618] GMU intr={:#010x} sptprac={:#010x}",
                 self.registers.read(GMU_GMU2HOST_INTR_INFO),
                 self.registers.read(GMU_SPTPRAC_PWR_CLK_STATUS),
@@ -292,7 +292,7 @@ impl A618Gmu {
             .and_then(|index| self.power.as_ref()?.gx_levels.get(index))
             .map(|level| level.frequency_khz)
             .unwrap_or(0);
-        early_println!(
+        println!(
             "[qcom-adreno-a618] GMU ready hfi={:#x} debug={:#x} log={:#x} gpu={} kHz",
             self.hfi.dma_addr(),
             self.debug.dma_addr(),
@@ -505,7 +505,7 @@ impl A618Gmu {
         arch::io_wmb();
         result?;
         self.rsc_asleep = false;
-        early_println!("[qcom-adreno-a618] GMU RSC wake complete");
+        println!("[qcom-adreno-a618] GMU RSC wake complete");
         Ok(())
     }
 
@@ -623,9 +623,7 @@ impl Drop for A618Gmu {
         // This runs before the owned HFI/debug/log allocations, MMIO mappings,
         // and clocks are dropped.
         if self.force_shutdown().is_err() {
-            early_println!(
-                "[qcom-adreno-a618] refusing unsafe GMU DMA/MMIO teardown after timeout"
-            );
+            println!("[qcom-adreno-a618] refusing unsafe GMU DMA/MMIO teardown after timeout");
             loop {
                 time::udelay(1_000_000);
             }
@@ -836,9 +834,10 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
                 .checked_sub(resource.start)
                 .and_then(|size| size.checked_add(1))
         };
-    if resource_size(gmu_resource).is_none_or(|size| size < GMU_RESOURCE_SIZE)
-        || resource_size(pdc_resource).is_none_or(|size| size < PDC_RESOURCE_SIZE)
-        || resource_size(pdc_sequence_resource).is_none_or(|size| size < PDC_SEQ_RESOURCE_SIZE)
+    if resource_size(gmu_resource).is_none_or(|size| size < GMU_RESOURCE_SIZE as u64)
+        || resource_size(pdc_resource).is_none_or(|size| size < PDC_RESOURCE_SIZE as u64)
+        || resource_size(pdc_sequence_resource)
+            .is_none_or(|size| size < PDC_SEQ_RESOURCE_SIZE as u64)
     {
         return Err("qcom-adreno-a618: GMU register resource is too small");
     }
@@ -861,7 +860,7 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         device,
         IommuDomainConfig {
             domain_type: IommuDomainType::Dma,
-            iova_base: GMU_IOVA_BASE,
+            iova_base: Iova::new(GMU_IOVA_BASE),
             iova_size: GMU_IOVA_SIZE,
         },
     )?;
@@ -876,10 +875,9 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         phandle,
     )?;
     GMUS.lock().push(Arc::new(Mutex::new(gmu)));
-    early_println!(
+    println!(
         "[qcom-adreno-a618] registered legacy GMU phandle={:#x} paddr={:#x}",
-        phandle,
-        gmu_resource.start,
+        phandle, gmu_resource.start,
     );
     Ok(())
 }

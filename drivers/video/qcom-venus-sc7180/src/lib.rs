@@ -34,6 +34,7 @@ use scarlet::{
         video::{VideoDecodeBackend, register_video_backend, register_video_decode_device},
     },
     interrupt::{InterruptError, InterruptManager, InterruptSource},
+    mem::address::{DmaAddr, Iova, PhysAddr},
     println, vm,
 };
 
@@ -88,10 +89,8 @@ fn resolve_firmware_region(device: &PlatformDeviceInfo) -> Result<FirmwareRegion
     let region = manager.resolve_platform_memory_region(device, "memory-region", 0)?;
     let paddr = region.start;
     let size = region
-        .end
-        .checked_sub(region.start)
-        .and_then(|span| span.checked_add(1))
-        .ok_or("qcom-venus-sc7180: firmware reserved-memory range overflows")?;
+        .size()
+        .map_err(|_| "qcom-venus-sc7180: firmware reserved-memory range overflows")?;
     if paddr == 0 || size == 0 || paddr % 4096 != 0 || size % 4096 != 0 {
         return Err("qcom-venus-sc7180: invalid firmware reserved-memory range");
     }
@@ -101,7 +100,7 @@ fn resolve_firmware_region(device: &PlatformDeviceInfo) -> Result<FirmwareRegion
         "video-firmware",
         IommuDomainConfig {
             domain_type: IommuDomainType::Dma,
-            iova_base: 0,
+            iova_base: Iova::ZERO,
             iova_size: FIRMWARE_IOVA_SIZE,
         },
     )?;
@@ -110,8 +109,8 @@ fn resolve_firmware_region(device: &PlatformDeviceInfo) -> Result<FirmwareRegion
     }
     let mapping = dma
         .map_phys_at_owned(
-            0,
-            paddr,
+            DmaAddr::ZERO,
+            PhysAddr::new(paddr),
             size,
             IommuMapFlags::READ
                 | IommuMapFlags::WRITE
@@ -143,10 +142,8 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .ok_or("qcom-venus-sc7180: missing MMIO resource")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|span| span.checked_add(1))
-        .ok_or("qcom-venus-sc7180: invalid MMIO resource")?;
+        .size()
+        .map_err(|_| "qcom-venus-sc7180: invalid MMIO resource")?;
     if size < VENUS_REGISTER_SIZE {
         return Err("qcom-venus-sc7180: MMIO resource is too small");
     }
@@ -160,7 +157,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         device,
         IommuDomainConfig {
             domain_type: IommuDomainType::Dma,
-            iova_base: MAIN_IOVA_BASE,
+            iova_base: Iova::new(MAIN_IOVA_BASE),
             iova_size: MAIN_IOVA_SIZE,
         },
     )?;
