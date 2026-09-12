@@ -59,15 +59,12 @@ byte-granular CPU upload path. Programmable pipelines, bind groups, compute,
 explicit barriers and new buffer-copy IR are rejected before any upload or draw
 is accepted.
 
-The standalone userspace lock selects SGFX `30da20a6` and Scarlet runtime
-`c0f334b7`. The driver lock selects the compatible Scarlet 0.16 kernel
-`f7adec9` as its base, which contains owned async submission and its command-limit
-fix. The final driver also requires the companion `begin_image_cpu_access`
-kernel hook on that compatible branch. Until that companion source is published
-and the production pin advances, use the integration script below with the
-coordinated Scarlet checkout; the base lock alone does not supply the hook.
-These use the same fixed-width GPU ABI; updating this driver to later kernel
-platform/address APIs is separate from async execution.
+Use the checked-in lockfiles as a compatible source set. The standalone
+userspace locks select SGFX `96e85caa` and Scarlet runtime `d8a19981`.
+The driver uses the current Scarlet kernel's typed physical/DMA address APIs
+and requires its `begin_image_cpu_access` guard and synchronous backing
+retention. The driver lock also selects `d8a19981`; older kernels without
+those hooks do not provide the required lifetime and ordering guarantees.
 
 ## Validation
 
@@ -85,7 +82,7 @@ Use the Scarlet toolchain for the backend target checks:
 ```sh
 cargo check --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target aarch64-unknown-scarlet
 cargo check --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target riscv64gc-unknown-scarlet
-scripts/check-a618-kernel-integration.sh /path/to/compatible-Scarlet-checkout
+scripts/check-a618-kernel-integration.sh /path/to/Scarlet-checkout
 ```
 
 The driver [hardware validation checklist](../../drivers/gpu/qcom-adreno-a618/README.md)

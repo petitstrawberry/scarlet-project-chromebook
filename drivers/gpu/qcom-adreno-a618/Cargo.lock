@@ -154,8 +154,8 @@ dependencies = [
 
 [[package]]
 name = "sgfx-core"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/sgfx#0e7b2b47856c3889648cdccb60b3c30d2082e4a2"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/sgfx#96e85caaa0e2c6fce8b698bb362ba467c761a4a8"
 
 [[package]]
 name = "talc"
