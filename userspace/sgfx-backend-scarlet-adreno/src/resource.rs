@@ -1,7 +1,10 @@
 //! Context-local GPU resources and immutable image layouts.
 
-use alloc::{rc::Rc, vec::Vec};
-use core::ptr;
+use alloc::{rc::Rc, sync::Arc, vec::Vec};
+use core::{
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use adreno_a6xx_layout::{
     DEPTH32_LAYER_ALIGNMENT, IMAGE_MODIFIER_TILE6_3_DEPTH, is_depth32_tile6_3_layout,
@@ -27,11 +30,13 @@ pub(crate) struct RawImage {
     pub(crate) layout: GpuImageLayout,
     pub(crate) logical_format: ir::TextureFormat,
     context_id: i32,
+    context: Arc<ContextInner>,
+    attached: AtomicBool,
 }
 
 impl RawImage {
     pub(crate) fn create_present(
-        context: &Rc<ContextInner>,
+        context: &Arc<ContextInner>,
         width: u32,
         height: u32,
     ) -> HandleResult<Self> {
@@ -52,7 +57,7 @@ impl RawImage {
     }
 
     fn create_logical(
-        context: &Rc<ContextInner>,
+        context: &Arc<ContextInner>,
         descriptor: ir::TextureDesc,
     ) -> HandleResult<Self> {
         let width = descriptor.extent().width();
@@ -66,7 +71,7 @@ impl RawImage {
     }
 
     fn import_sampled(
-        context: &Rc<ContextInner>,
+        context: &Arc<ContextInner>,
         handle: Handle,
         descriptor: ir::TextureDesc,
     ) -> HandleResult<Self> {
@@ -91,7 +96,7 @@ impl RawImage {
     }
 
     fn finish_create(
-        context: &Rc<ContextInner>,
+        context: &Arc<ContextInner>,
         raw: GpuImage,
         logical_format: ir::TextureFormat,
         width: u32,
@@ -109,6 +114,8 @@ impl RawImage {
             layout,
             logical_format,
             context_id: context.raw.as_handle().as_raw(),
+            context: Arc::clone(context),
+            attached: AtomicBool::new(true),
         })
     }
 
@@ -119,18 +126,36 @@ impl RawImage {
     pub(crate) fn belongs_to(&self, context: &ContextInner) -> bool {
         self.context_id == context.raw.as_handle().as_raw()
     }
+
+    fn detach(&self) -> HandleResult<()> {
+        if self.attached.swap(false, Ordering::AcqRel) {
+            if let Err(error) = self.context.raw.detach_image(&self.raw) {
+                self.attached.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RawImage {
+    fn drop(&mut self) {
+        let _ = self.detach();
+    }
 }
 
 pub(crate) struct RawBuffer {
     pub(crate) raw: GpuBuffer,
     pub(crate) attachment_token: u64,
     pub(crate) logical_size: u64,
+    context: Arc<ContextInner>,
+    attached: AtomicBool,
     mapping_address: usize,
     mapping_len: usize,
 }
 
 impl RawBuffer {
-    fn create(context: &Rc<ContextInner>, logical_size: u64) -> HandleResult<Self> {
+    pub(crate) fn create(context: &Arc<ContextInner>, logical_size: u64) -> HandleResult<Self> {
         if logical_size == 0 {
             return Err(HandleError::InvalidParameter);
         }
@@ -167,6 +192,8 @@ impl RawBuffer {
             raw,
             attachment_token,
             logical_size,
+            context: Arc::clone(context),
+            attached: AtomicBool::new(true),
             mapping_address,
             mapping_len,
         })
@@ -218,10 +245,21 @@ impl RawBuffer {
         };
         Ok(value)
     }
+
+    fn detach(&self) -> HandleResult<()> {
+        if self.attached.swap(false, Ordering::AcqRel) {
+            if let Err(error) = self.context.raw.detach_buffer(&self.raw) {
+                self.attached.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RawBuffer {
     fn drop(&mut self) {
+        let _ = self.detach();
         // The mapping must be retired before the capability-backed allocation
         // is dropped. Teardown cannot report an error, and the kernel still
         // revokes the address space when the process exits.
@@ -233,16 +271,17 @@ impl Drop for RawBuffer {
 
 pub(crate) struct ContextResources {
     pub(crate) resources: Rc<ir::ResourceTable>,
-    context: Rc<ContextInner>,
-    images: Vec<Option<Rc<RawImage>>>,
-    buffers: Vec<Option<RawBuffer>>,
+    pub(crate) context: Arc<ContextInner>,
+    pub(crate) images: Vec<Option<Arc<RawImage>>>,
+    pub(crate) buffers: Vec<Option<Arc<RawBuffer>>>,
     scratch: Option<RawBuffer>,
+    pub(crate) async_arenas: Vec<Arc<crate::asynchronous::UploadArena>>,
 }
 
 impl ContextResources {
     pub(crate) fn new(
         resources: Rc<ir::ResourceTable>,
-        context: Rc<ContextInner>,
+        context: Arc<ContextInner>,
     ) -> Result<Self, IrSubmitError> {
         Ok(Self {
             resources,
@@ -250,13 +289,14 @@ impl ContextResources {
             images: empty_slots(ir::MAX_TEXTURES)?,
             buffers: empty_slots(ir::MAX_BUFFERS)?,
             scratch: None,
+            async_arenas: Vec::new(),
         })
     }
 
     pub(crate) fn map_present_image(
         &mut self,
         texture: ir::TextureId,
-        image: Rc<Image>,
+        image: Arc<Image>,
     ) -> Result<(), IrSubmitError> {
         let reference = self.resources.texture_ref(texture)?;
         self.validate_present_image(reference, &image)?;
@@ -273,11 +313,11 @@ impl ContextResources {
             .images
             .iter()
             .flatten()
-            .any(|candidate| Rc::ptr_eq(candidate, &image.raw))
+            .any(|candidate| Arc::ptr_eq(candidate, &image.raw))
         {
             return Err(IrSubmitError::ImageAlreadyMapped);
         }
-        self.images[slot] = Some(Rc::clone(&image.raw));
+        self.images[slot] = Some(Arc::clone(&image.raw));
         Ok(())
     }
 
@@ -319,14 +359,14 @@ impl ContextResources {
         {
             return Err(IrSubmitError::TextureAlreadyMapped);
         }
-        let image = Rc::new(RawImage::import_sampled(&self.context, handle, descriptor)?);
+        let image = Arc::new(RawImage::import_sampled(&self.context, handle, descriptor)?);
         if self
             .images
             .iter()
             .flatten()
             .any(|candidate| candidate.attachment_token == image.attachment_token)
         {
-            let _ = self.context.raw.detach_image(&image.raw);
+            let _ = image.detach();
             return Err(IrSubmitError::ImageAlreadyMapped);
         }
         self.images[slot] = Some(image);
@@ -337,6 +377,7 @@ impl ContextResources {
         &mut self,
         texture: ir::TextureId,
     ) -> Result<(), IrSubmitError> {
+        self.drain_async()?;
         let reference = self.resources.texture_ref(texture)?;
         let descriptor = self.resources.texture(reference)?;
         if descriptor.usage().contains(ir::TextureUsage::PRESENT) {
@@ -351,7 +392,7 @@ impl ContextResources {
             .ok_or(IrSubmitError::ResourceTableMismatch)?
             .take()
             .ok_or(IrSubmitError::ImageNotMapped)?;
-        if let Err(error) = self.context.raw.detach_image(&image.raw) {
+        if let Err(error) = image.detach() {
             self.images[slot] = Some(image);
             return Err(error.into());
         }
@@ -361,24 +402,24 @@ impl ContextResources {
     pub(crate) fn texture(
         &mut self,
         reference: ir::TextureRef<'_>,
-    ) -> Result<Rc<RawImage>, IrSubmitError> {
+    ) -> Result<Arc<RawImage>, IrSubmitError> {
         if !reference.belongs_to(&self.resources) {
             return Err(IrSubmitError::ResourceTableMismatch);
         }
         let slot = reference.slot();
         if let Some(image) = self.images.get(slot).and_then(Option::as_ref) {
-            return Ok(Rc::clone(image));
+            return Ok(Arc::clone(image));
         }
         let descriptor = self.resources.texture(reference)?;
         if descriptor.usage().contains(ir::TextureUsage::PRESENT) {
             return Err(IrSubmitError::ImageNotMapped);
         }
-        let image = Rc::new(RawImage::create_logical(&self.context, descriptor)?);
+        let image = Arc::new(RawImage::create_logical(&self.context, descriptor)?);
         let entry = self
             .images
             .get_mut(slot)
             .ok_or(IrSubmitError::ResourceTableMismatch)?;
-        *entry = Some(Rc::clone(&image));
+        *entry = Some(Arc::clone(&image));
         Ok(image)
     }
 
@@ -392,10 +433,13 @@ impl ContextResources {
         }
         if self.buffers[slot].is_none() {
             let descriptor = self.resources.buffer(reference)?;
-            self.buffers[slot] = Some(RawBuffer::create(&self.context, descriptor.size())?);
+            self.buffers[slot] = Some(Arc::new(RawBuffer::create(
+                &self.context,
+                descriptor.size(),
+            )?));
         }
         self.buffers[slot]
-            .as_ref()
+            .as_deref()
             .ok_or(IrSubmitError::ResourceTableMismatch)
     }
 
@@ -420,11 +464,11 @@ impl ContextResources {
                 .ok_or(IrSubmitError::OutOfMemory)?;
             let replacement = RawBuffer::create(&self.context, allocation)?;
             if let Some(previous) = self.scratch.take() {
-                if let Err(error) = self.context.raw.detach_buffer(&previous.raw) {
+                if let Err(error) = previous.detach() {
                     // Preserve the already-live scratch on failure and discard the
                     // newly attached replacement. The original detachment failure
                     // remains authoritative if cleanup also fails.
-                    let _ = self.context.raw.detach_buffer(&replacement.raw);
+                    let _ = replacement.detach();
                     self.scratch = Some(previous);
                     return Err(error.into());
                 }
@@ -443,30 +487,6 @@ impl ContextResources {
 
     pub(crate) fn context_id(&self) -> i32 {
         self.context.raw.as_handle().as_raw()
-    }
-}
-
-impl Drop for ContextResources {
-    fn drop(&mut self) {
-        for index in 0..self.images.len() {
-            let Some(image) = self.images[index].as_ref() else {
-                continue;
-            };
-            if self.images[..index]
-                .iter()
-                .flatten()
-                .any(|earlier| Rc::ptr_eq(earlier, image))
-            {
-                continue;
-            }
-            let _ = self.context.raw.detach_image(&image.raw);
-        }
-        for buffer in self.buffers.iter().flatten() {
-            let _ = self.context.raw.detach_buffer(&buffer.raw);
-        }
-        if let Some(scratch) = self.scratch.as_ref() {
-            let _ = self.context.raw.detach_buffer(&scratch.raw);
-        }
     }
 }
 

@@ -1,0 +1,11 @@
+[package]
+name = "a618-async-preparation-tests"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+publish = false
+
+[dependencies]
+adreno-a6xx-submit-wire = { path = "../../shared/adreno-a6xx-submit-wire" }
+sgfx-codegen-adreno-a6xx = { path = "../../userspace/sgfx-codegen-adreno-a6xx" }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", default-features = false }

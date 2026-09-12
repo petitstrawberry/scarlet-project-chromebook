@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "a618-async-preparation-tests"
+version = "0.1.0"
+dependencies = [
+ "adreno-a6xx-submit-wire",
+ "sgfx-codegen-adreno-a6xx",
+ "sgfx-core",
+]
+
+[[package]]
 name = "adreno-a6xx-layout"
 version = "0.1.0"
 
@@ -13,6 +22,13 @@ version = "0.1.0"
 [[package]]
 name = "adreno-a6xx-shader-pack"
 version = "0.1.0"
+
+[[package]]
+name = "adreno-a6xx-submit-wire"
+version = "0.1.0"
+dependencies = [
+ "adreno-a6xx-shader-pack",
+]
 
 [[package]]
 name = "sgfx-codegen-adreno-a6xx"
