@@ -74,7 +74,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=85f0cead4cb4c9add021360f1b469f08bf0d23a9#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
 dependencies = [
  "fdt",
  "font8x8",
@@ -87,7 +87,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=85f0cead4cb4c9add021360f1b469f08bf0d23a9#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
 
 [[package]]
 name = "scarlet-driver-qcom-adreno-a618"
@@ -155,7 +155,7 @@ dependencies = [
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx#96e85caaa0e2c6fce8b698bb362ba467c761a4a8"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=0b4cf0984d9b17bd0646612428c44bf1505393a8#0b4cf0984d9b17bd0646612428c44bf1505393a8"
 
 [[package]]
 name = "talc"

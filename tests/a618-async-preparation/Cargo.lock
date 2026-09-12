@@ -43,4 +43,4 @@ dependencies = [
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx#96e85caaa0e2c6fce8b698bb362ba467c761a4a8"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=0b4cf0984d9b17bd0646612428c44bf1505393a8#0b4cf0984d9b17bd0646612428c44bf1505393a8"

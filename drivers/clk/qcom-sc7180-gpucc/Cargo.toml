@@ -8,4 +8,4 @@ license = "GPL-2.0-only"
 path = "src/lib.rs"
 
 [dependencies]
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "85f0cead4cb4c9add021360f1b469f08bf0d23a9", package = "scarlet", default-features = false }
