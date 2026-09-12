@@ -182,8 +182,9 @@ From the Nix development shell:
 
 The normal Scarlet bundles build userspace with their checked-in Cargo locks.
 SGFX, Adreno and ScarletUI are selected by published commit revisions. Update
-those references with `cargo update --precise <commit>` before building a new
-source set. The image build does not inject local source patches or rebuild
+those references with `cargo update -p <package> --precise <commit>` and review
+all affected Git revisions in `Cargo.lock` before building a new source set.
+The image build does not inject local source patches or rebuild
 the graphics stack through a separate rootfs hook.
 
 The release images are written under:
