@@ -725,7 +725,8 @@ fn append_image_resource(
     metadata: &mut Vec<codegen::ResourceMeta>,
     bindings: &mut Vec<BoundObject>,
 ) -> Result<(), IrSubmitError> {
-    if image.logical_format != descriptor.format()
+    if descriptor.mip_level_count() != 1
+        || image.logical_format != descriptor.format()
         || metadata.iter().any(|resource| resource.id == id)
         || bindings
             .iter()

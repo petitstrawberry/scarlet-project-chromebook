@@ -75,6 +75,9 @@ impl RawImage {
         handle: Handle,
         descriptor: ir::TextureDesc,
     ) -> HandleResult<Self> {
+        if descriptor.mip_level_count() != 1 {
+            return Err(HandleError::Unsupported);
+        }
         if descriptor.format() != ir::TextureFormat::Bgra8Unorm
             || !descriptor.usage().contains(ir::TextureUsage::SAMPLED)
             || descriptor.usage().contains(ir::TextureUsage::PRESENT)
@@ -491,6 +494,9 @@ impl ContextResources {
 }
 
 fn image_create_parameters(descriptor: ir::TextureDesc) -> HandleResult<(u32, u32)> {
+    if descriptor.mip_level_count() != 1 {
+        return Err(HandleError::Unsupported);
+    }
     let mut usage = 0;
     if descriptor.format() == ir::TextureFormat::Depth32Float {
         if !descriptor
