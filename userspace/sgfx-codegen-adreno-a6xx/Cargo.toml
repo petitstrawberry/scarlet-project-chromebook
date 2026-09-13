@@ -11,4 +11,4 @@ path = "src/lib.rs"
 adreno-a6xx-layout = { path = "../../shared/adreno-a6xx-layout" }
 adreno-a6xx-pm4 = { path = "../../shared/adreno-a6xx-pm4" }
 adreno-a6xx-shader-pack = { path = "../../shared/adreno-a6xx-shader-pack" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "517529778de9412989f317550dff85dac9eb0598", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "a18b5a585616f05cf5df0fa5be1977752ceca1ea", default-features = false }
