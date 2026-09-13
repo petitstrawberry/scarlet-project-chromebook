@@ -147,7 +147,7 @@ dependencies = [
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx?rev=0b4cf0984d9b17bd0646612428c44bf1505393a8#0b4cf0984d9b17bd0646612428c44bf1505393a8"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=c0dd1621a1fb43d94dd4d4b2af2d7f7af8824c3c#c0dd1621a1fb43d94dd4d4b2af2d7f7af8824c3c"
 
 [[package]]
 name = "spin"
