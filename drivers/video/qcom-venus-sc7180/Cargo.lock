@@ -54,15 +54,21 @@ dependencies = [
 
 [[package]]
 name = "scarlet"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#db38e75d25480ab86e79861f3c22d5e6f230574e"
+version = "1.0.1"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
 dependencies = [
  "fdt",
  "font8x8",
  "hashbrown",
  "lock_api",
+ "scarlet-abi",
  "talc",
 ]
+
+[[package]]
+name = "scarlet-abi"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
 
 [[package]]
 name = "scarlet-driver-qcom-cmd-db"

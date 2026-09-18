@@ -22,7 +22,7 @@ use scarlet::{
         manager::{DeviceManager, DriverPriority, PROBE_DEFER},
         platform::{PlatformDeviceDriver, PlatformDeviceInfo},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time,
 };
@@ -152,7 +152,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         }),
     });
     DeviceManager::get_manager().register_audio_codec(phandle, codec);
-    early_println!(
+    println!(
         "[max98360a] registered phandle={:#x} sdmode_gpio={} active_low={} delay_ms={}",
         phandle,
         pin,

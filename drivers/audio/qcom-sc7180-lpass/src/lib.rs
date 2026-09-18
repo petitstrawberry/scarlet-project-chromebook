@@ -23,13 +23,16 @@ use scarlet::{
             AudioPcmCapabilities, AudioPcmParams, AudioPcmPeriod, AudioPlaybackDevice,
             AudioVolumeCurve, register_playback_device_with_info,
         },
-        iommu::{DmaContext, DmaMapping, IommuDomainConfig, IommuDomainType, IommuMapFlags},
+        iommu::{
+            DmaContext, DmaMapping, IommuDomainConfig, IommuDomainType, IommuMapFlags, Iova,
+            PhysAddr,
+        },
         manager::{DeviceManager, DriverPriority, probe_defer},
         platform::{
             PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
         },
     },
-    early_println,
+    println,
     interrupt::{
         InterruptClaim, InterruptError, InterruptId, InterruptManager, InterruptResult,
         InterruptSource,
@@ -324,7 +327,7 @@ impl Sc7180Lpass {
         arch::io_wmb();
         self.fault_completions
             .store(forced_completions, Ordering::Release);
-        early_println!(
+        println!(
             "[qcom-sc7180-lpass] playback fault status={:#x} current={:#010x}",
             status,
             self.registers.read(RDMA_CURRENT),
@@ -393,9 +396,13 @@ impl AudioPlaybackDevice for Sc7180Lpass {
 
         let dma_mapping = self
             .dma
-            .map_phys_owned(buffer.paddr, buffer.mapped_bytes, IommuMapFlags::READ)
+            .map_phys_owned(
+                PhysAddr::new(buffer.paddr),
+                buffer.mapped_bytes,
+                IommuMapFlags::READ,
+            )
             .map_err(|_| "qcom-sc7180-lpass: failed to map PCM ring for DMA")?;
-        let dma_addr = u32::try_from(dma_mapping.dma_addr())
+        let dma_addr = u32::try_from(dma_mapping.dma_addr().as_u64())
             .map_err(|_| "qcom-sc7180-lpass: PCM IOVA exceeds 32 bits")?;
         self.configure_registers(dma_addr, buffer_bytes, period_bytes)?;
 
@@ -411,7 +418,7 @@ impl AudioPlaybackDevice for Sc7180Lpass {
         state.queued_periods = 0;
         state.running = false;
         self.fault_completions.store(0, Ordering::Release);
-        early_println!(
+        println!(
             "[qcom-sc7180-lpass] configured secondary MI2S dma={:#010x} buffer={} period={} bclk={}",
             dma_addr,
             buffer_bytes,
@@ -572,7 +579,7 @@ impl AudioPlaybackDevice for Sc7180Lpass {
             self.registers.write(IRQ_ENABLE, 0);
             self.registers.update(I2S_CONTROL, I2S_SPK_ENABLE, 0);
             arch::io_wmb();
-            early_println!(
+            println!(
                 "[qcom-sc7180-lpass] playback underrun completed={} queued={} current={:#010x} base={:#010x} buffer={}",
                 completed,
                 queued_before,
@@ -623,7 +630,7 @@ impl AudioDaiProvider for Sc7180Lpass {
             return Err("qcom-sc7180-lpass: empty playback slot mask");
         }
         *self.route.lock() = Some(PlaybackRoute { codec, tx_mask });
-        early_println!(
+        println!(
             "[qcom-sc7180-lpass] attached playback codec dai={} tx_mask={:#x}",
             SECONDARY_MI2S,
             tx_mask,
@@ -687,10 +694,8 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .nth(1)
         .ok_or("qcom-sc7180-lpass: missing LPAIF MMIO resource")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|span| span.checked_add(1))
-        .ok_or("qcom-sc7180-lpass: invalid LPAIF MMIO resource")?;
+        .size()
+        .map_err(|_| "qcom-sc7180-lpass: invalid LPAIF MMIO resource")?;
     if size < LPAIF_WINDOW_SIZE {
         return Err("qcom-sc7180-lpass: LPAIF MMIO resource is too small");
     }
@@ -709,7 +714,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         device,
         IommuDomainConfig {
             domain_type: IommuDomainType::Dma,
-            iova_base: LPAIF_IOVA_BASE,
+            iova_base: Iova::new(LPAIF_IOVA_BASE),
             iova_size: LPAIF_IOVA_SIZE,
         },
     )?;
@@ -756,7 +761,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             "CoachZ Internal Speakers",
         ),
     );
-    early_println!(
+    println!(
         "[qcom-sc7180-lpass] registered device={} phandle={:#x} lpaif={:#x} irq={} bclk={}",
         device_name,
         phandle,

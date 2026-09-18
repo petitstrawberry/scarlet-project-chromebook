@@ -613,10 +613,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| matches!(resource.res_type, PlatformDeviceResourceType::MEM))
         .ok_or("qcom-geni-spi: no memory resource")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|value| value.checked_add(1))
-        .ok_or("qcom-geni-spi: invalid memory resource")?;
+        .size()
+        .map_err(|_| "qcom-geni-spi: invalid memory resource")?;
     let base = vm::ioremap(resource.start, size).map_err(|_| "qcom-geni-spi: ioremap failed")?;
 
     let serial_clock = match DeviceManager::get_manager().resolve_clk(device, "se") {

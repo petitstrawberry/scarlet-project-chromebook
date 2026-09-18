@@ -9,7 +9,7 @@ use scarlet::{
     arch,
     device::iommu::{DmaContext, DmaMapping, IommuMapFlags},
     environment::PAGE_SIZE,
-    mem::page::ContiguousPages,
+    mem::{address::PhysAddr, page::ContiguousPages},
     vm::vmem::MemoryAttribute,
 };
 
@@ -58,16 +58,17 @@ impl DmaAllocation {
             .retag_memory_attribute(memory_attribute)
             .map_err(|_| "qcom-venus-sc7180: failed to retag DMA allocation")?;
         let mapping = context
-            .map_phys_owned(pages.as_paddr(), allocation_size, flags)
+            .map_phys_owned(PhysAddr::new(pages.as_paddr()), allocation_size, flags)
             .map_err(|_| "qcom-venus-sc7180: DMA mapping failed")?;
-        if mapping.dma_addr() > u32::MAX as u64 {
+        if u32::try_from(mapping.dma_addr().as_u64()).is_err() {
             return Err("qcom-venus-sc7180: firmware requires a 32-bit DMA address");
         }
         Ok(Self { mapping, pages })
     }
 
     pub(crate) fn dma_addr(&self) -> u32 {
-        self.mapping.dma_addr() as u32
+        u32::try_from(self.mapping.dma_addr().as_u64())
+            .expect("Venus DMA address was checked during allocation")
     }
 
     pub(crate) fn vaddr(&self) -> usize {
@@ -156,7 +157,7 @@ impl DmaPagedAllocation {
                 .checked_mul(PAGE_SIZE)
                 .ok_or("qcom-venus-sc7180: paged DMA length overflows")?;
             arch::clean_dcache_to_poc_range(chunk.as_vaddr(), chunk_len);
-            segments.push((chunk.as_paddr(), chunk_len));
+            segments.push((PhysAddr::new(chunk.as_paddr()), chunk_len));
             remaining_pages -= chunk.len();
             chunks.push(chunk);
         }
@@ -165,7 +166,7 @@ impl DmaPagedAllocation {
         let mapping = context
             .map_phys_segments_owned(&segments, flags)
             .map_err(|_| "qcom-venus-sc7180: paged DMA mapping failed")?;
-        if mapping.dma_addr() > u32::MAX as u64 {
+        if u32::try_from(mapping.dma_addr().as_u64()).is_err() {
             return Err("qcom-venus-sc7180: firmware requires a 32-bit DMA address");
         }
 
@@ -177,7 +178,8 @@ impl DmaPagedAllocation {
     }
 
     pub(crate) fn dma_addr(&self) -> u32 {
-        self.mapping.dma_addr() as u32
+        u32::try_from(self.mapping.dma_addr().as_u64())
+            .expect("Venus DMA address was checked during allocation")
     }
 
     pub(crate) fn requested_size(&self) -> usize {

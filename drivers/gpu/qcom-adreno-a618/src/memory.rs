@@ -6,7 +6,7 @@ use core::ptr;
 
 use scarlet::{
     arch,
-    device::iommu::{DmaContext, DmaMapping, IommuMapFlags},
+    device::iommu::{DmaContext, DmaMapping, IommuMapFlags, PhysAddr},
     environment::PAGE_SIZE,
     mem::page::ContiguousPages,
 };
@@ -43,7 +43,7 @@ impl DmaAllocation {
         unsafe { ptr::write_bytes(pages.as_vaddr() as *mut u8, 0, allocation_size) };
         arch::clean_dcache_to_poc_range(pages.as_vaddr(), allocation_size);
         let mapping = context
-            .map_phys_owned(pages.as_paddr(), allocation_size, flags)
+            .map_phys_owned(PhysAddr::new(pages.as_paddr()), allocation_size, flags)
             .map_err(|_| "qcom-adreno-a618: IOMMU mapping failed")?;
         Ok(Self {
             mapping,
@@ -53,10 +53,10 @@ impl DmaAllocation {
     }
 
     pub(crate) fn dma_addr(&self) -> u64 {
-        self.mapping.dma_addr()
+        self.mapping.dma_addr().as_u64()
     }
 
-    pub(crate) fn paddr(&self) -> usize {
+    pub(crate) fn paddr(&self) -> u64 {
         self.pages.as_paddr()
     }
 

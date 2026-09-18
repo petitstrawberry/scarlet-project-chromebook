@@ -21,7 +21,7 @@ use scarlet::{
             PlatformDeviceDriver, PlatformDeviceInfo, resource::PlatformDeviceResourceType,
         },
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     vm,
 };
@@ -226,10 +226,8 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .ok_or("qcom-cmd-db: missing reserved-memory resource")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|value| value.checked_add(1))
-        .ok_or("qcom-cmd-db: invalid reserved-memory resource")?;
+        .size()
+        .map_err(|_| "qcom-cmd-db: invalid reserved-memory resource")?;
     if size < COMMAND_DB_HEADER_SIZE {
         return Err("qcom-cmd-db: reserved-memory resource is too small");
     }
@@ -243,7 +241,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         core::mem::replace(&mut *guard, Some(database))
     };
     drop(previous);
-    early_println!(
+    println!(
         "[qcom-cmd-db] registered read-only database paddr={:#x} size={:#x}",
         resource.start,
         size,

@@ -34,7 +34,7 @@ use scarlet::{
         core::EmmcBlockDevice,
         sdhci::{SdhciHost, SdhciHostConfig},
     },
-    early_println, println, vm,
+    println, vm,
 };
 
 const DRIVER_NAME: &str = "qcom-sdhci-sc7180";
@@ -69,7 +69,7 @@ struct Sc7180SdhciHost {
 
 impl Sc7180SdhciHost {
     fn log_cmd8_state(&self, phase: &str) {
-        early_println!(
+        println!(
             "[qcom-sdhci-sc7180] CMD8 {}: fifo={:#010x} mci_status={:#010x} debug={:#010x} data_count={:#010x} host={:#04x}(inherited {:#04x}) host2={:#06x}(inherited {:#06x})",
             phase,
             read32(self.mmio_base, CORE_MCI_FIFO_CNT),
@@ -84,7 +84,7 @@ impl Sc7180SdhciHost {
     }
 
     fn log_failure(&self, operation: &str) {
-        early_println!(
+        println!(
             "[qcom-sdhci-sc7180] {} failed: reset={:#04x} clock={:#06x} host={:#04x}/{:#04x} host2={:#06x}/{:#06x} block={:#010x} arg={:#010x} xfer_cmd={:#010x} present={:#010x} irq={:#010x} sdhci_pwr={:#04x} pwr_irq={} pwr={:#x}/{:#x}/{:#x} cqhci={:#x}/{:#x}/{:#x} func4={:#x}",
             operation,
             read8(self.mmio_base, SDHCI_SOFTWARE_RESET),
@@ -134,7 +134,7 @@ impl MmcHost for Sc7180SdhciHost {
             || power_requests != self.handoff_power_requests
         {
             self.log_failure("firmware power handoff verification");
-            early_println!(
+            println!(
                 "[qcom-sdhci-sc7180] power handoff changed: SDHCI {:#04x}->{:#04x}, request {:#x}->{:#x}",
                 self.handoff_power_control,
                 power_control,
@@ -180,7 +180,7 @@ impl MmcHost for Sc7180SdhciHost {
         if command_index == 8 {
             self.log_cmd8_state("post");
             if let Ok(response) = &result {
-                early_println!(
+                println!(
                     "[qcom-sdhci-sc7180] CMD8 response={:#010x}/{:#010x}/{:#010x}/{:#010x}",
                     response.word(0),
                     response.word(1),
@@ -191,7 +191,7 @@ impl MmcHost for Sc7180SdhciHost {
         }
         if let Err(error) = &result {
             self.log_failure("command");
-            early_println!(
+            println!(
                 "[qcom-sdhci-sc7180] command index={} argument={:#010x} error={}",
                 command_index,
                 command_argument,
@@ -284,10 +284,7 @@ fn resolve_named_memory<'a>(
 }
 
 fn resource_size(resource: &PlatformDeviceResource) -> Option<usize> {
-    resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
+    resource.size().ok()
 }
 
 fn resolve_and_enable_clocks(
@@ -479,7 +476,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         HandoffPowerAction::None => {}
         HandoffPowerAction::AcknowledgeBusOn => {
             if let Err(error) = service_satisfied_bus_on(mmio_base) {
-                early_println!(
+                println!(
                     "[qcom-sdhci-sc7180] BUS_ON handoff service failed: {} pwr={:#x}/{:#x}/{:#x}",
                     error,
                     read32(mmio_base, CORE_PWRCTL_STATUS),
@@ -495,7 +492,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             );
         }
         HandoffPowerAction::Reject => {
-            early_println!(
+            println!(
                 "[qcom-sdhci-sc7180] unsafe power handoff rejected: SDHCI={:#04x} request={:#x} mask={:#x} ctl={:#x}",
                 handoff_power_control,
                 pending_power_requests,
@@ -581,7 +578,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let block_device =
         EmmcBlockDevice::probe_with_bus_width(DEVICE_NAME, Box::new(host), MmcBusWidth::Eight)
             .map_err(|error| {
-                early_println!(
+                println!(
                     "[qcom-sdhci-sc7180] failed to identify {}: {}",
                     DEVICE_NAME,
                     error.as_str()

@@ -34,6 +34,7 @@ use scarlet::{
     interrupt::{
         InterruptClaim, InterruptId, InterruptResult, InterruptSource, MaskableInterruptSource,
     },
+    mem::address::PhysAddr,
     println,
     sync::{IrqGuard, IrqSpinLock, Mutex, Waker},
     time,
@@ -106,7 +107,7 @@ fn log_sequence_packet(words: &[u32]) {
 
 /// Reserved firmware RAM and the dedicated firmware context-bank mapping.
 pub(crate) struct FirmwareRegion {
-    pub(crate) paddr: usize,
+    pub(crate) paddr: u64,
     pub(crate) vaddr: usize,
     pub(crate) size: usize,
     pub(crate) dma: DmaContext,
@@ -386,8 +387,8 @@ struct InternalBuffer {
 }
 
 struct FrontendMappings {
-    input_paddr: usize,
-    output_paddr: usize,
+    input_paddr: u64,
+    output_paddr: u64,
     input_len: usize,
     output_len: usize,
     input: DmaMapping,
@@ -407,21 +408,23 @@ impl FrontendMappings {
         }
         let expected_output_paddr = request
             .input_paddr
-            .checked_add(input_len)
+            .checked_add(request.output_offset)
             .ok_or("qcom-venus-sc7180: frontend buffer range overflows")?;
         if request.output_paddr != expected_output_paddr {
             return Err("qcom-venus-sc7180: frontend buffers are not contiguous");
         }
         let input = dma
-            .map_phys_owned(request.input_paddr, input_len, rw_flags())
+            .map_phys_owned(PhysAddr::new(request.input_paddr), input_len, rw_flags())
             .map_err(|_| "qcom-venus-sc7180: failed to map frontend input")?;
         let output = dma
-            .map_phys_owned(request.output_paddr, output_len, rw_flags())
+            .map_phys_owned(PhysAddr::new(request.output_paddr), output_len, rw_flags())
             .map_err(|_| "qcom-venus-sc7180: failed to map frontend output")?;
-        if input.dma_addr() > u32::MAX as u64 || output.dma_addr() > u32::MAX as u64 {
+        if u32::try_from(input.dma_addr().as_u64()).is_err()
+            || u32::try_from(output.dma_addr().as_u64()).is_err()
+        {
             return Err("qcom-venus-sc7180: frontend DMA address exceeds HFI 32-bit range");
         }
-        if input.dma_addr() & 0xfff != 0 || output.dma_addr() & 0xfff != 0 {
+        if !input.dma_addr().is_aligned(4096) || !output.dma_addr().is_aligned(4096) {
             return Err("qcom-venus-sc7180: frontend DMA buffers are not page aligned");
         }
         Ok(Self {
@@ -446,11 +449,13 @@ impl FrontendMappings {
     }
 
     fn input_dma(&self) -> u32 {
-        self.input.dma_addr() as u32
+        u32::try_from(self.input.dma_addr().as_u64())
+            .expect("Venus frontend DMA address was checked during mapping")
     }
 
     fn output_dma(&self) -> u32 {
-        self.output.dma_addr() as u32
+        u32::try_from(self.output.dma_addr().as_u64())
+            .expect("Venus frontend DMA address was checked during mapping")
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! This crate owns the GPU connection, exact backend/dialect negotiation,
 //! context-local resource attachments, physical image layouts, command lowering,
-//! A6xx submit-wire encoding, and synchronous queue submission. The pure A6xx
+//! A6xx submit-wire encoding, and synchronous or tracked queue submission. The pure A6xx
 //! code generator remains transport-independent.
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -11,7 +11,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 extern crate scarlet_std as std;
 
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{rc::Rc, sync::Arc, vec::Vec};
 
 use gpu_raw::{
     GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
@@ -26,9 +26,16 @@ pub use std::handle::{Handle, HandleError, HandleResult};
 
 pub use sgfx_core::ir;
 
+mod asynchronous;
+mod completion;
+mod dispatch;
 mod execute;
+mod preparation;
 mod resource;
+mod scheduler;
 mod wire;
+
+pub use completion::Submission;
 
 use resource::{ContextResources, RawImage};
 
@@ -120,7 +127,7 @@ struct DeviceInner {
 
 /// An owning connection to a compatible Scarlet Adreno GPU device.
 pub struct Device {
-    inner: Rc<DeviceInner>,
+    inner: Arc<DeviceInner>,
 }
 
 impl Device {
@@ -185,7 +192,7 @@ impl Device {
         let codegen_capabilities =
             sgfx_codegen_adreno_a6xx::Capabilities::a618(512 * 1024, max_pm4_words);
         Ok(Self {
-            inner: Rc::new(DeviceInner {
+            inner: Arc::new(DeviceInner {
                 gpu,
                 dialect,
                 capabilities,
@@ -223,22 +230,24 @@ impl Device {
             return Err(HandleError::Unsupported);
         }
         Ok(Context {
-            inner: Rc::new(ContextInner {
-                device: Rc::clone(&self.inner),
+            inner: Arc::new(ContextInner {
+                device: Arc::clone(&self.inner),
                 raw,
+                dispatcher: dispatch::NativeScheduler::new()?,
             }),
         })
     }
 }
 
 struct ContextInner {
-    device: Rc<DeviceInner>,
+    device: Arc<DeviceInner>,
     raw: gpu_raw::GpuContext,
+    dispatcher: dispatch::NativeScheduler,
 }
 
 /// An owning Adreno execution context.
 pub struct Context {
-    inner: Rc<ContextInner>,
+    inner: Arc<ContextInner>,
 }
 
 impl Context {
@@ -260,8 +269,8 @@ impl Context {
         resources: Rc<ir::ResourceTable>,
         targets: &[ir::TextureId],
     ) -> Result<MappedTargetSession, IrSubmitError> {
-        let queue = self.inner.raw.create_queue()?;
-        let mut cache = ContextResources::new(Rc::clone(&resources), Rc::clone(&self.inner))?;
+        let queue = Arc::new(self.inner.raw.create_queue()?);
+        let mut cache = ContextResources::new(Rc::clone(&resources), Arc::clone(&self.inner))?;
         let mut images = Vec::new();
         images
             .try_reserve_exact(targets.len())
@@ -270,7 +279,7 @@ impl Context {
         for &target in targets {
             if images
                 .iter()
-                .any(|(candidate, _): &(ir::TextureId, Rc<Image>)| *candidate == target)
+                .any(|(candidate, _): &(ir::TextureId, Arc<Image>)| *candidate == target)
             {
                 return Err(IrSubmitError::TextureAlreadyMapped);
             }
@@ -285,11 +294,11 @@ impl Context {
                 ));
             }
             let image =
-                Rc::new(self.create_shared_image(
+                Arc::new(self.create_shared_image(
                     descriptor.extent().width(),
                     descriptor.extent().height(),
                 )?);
-            cache.map_present_image(target, Rc::clone(&image))?;
+            cache.map_present_image(target, Arc::clone(&image))?;
             images.push((target, image));
         }
 
@@ -298,7 +307,7 @@ impl Context {
             resources: cache,
             queue,
             context: Context {
-                inner: Rc::clone(&self.inner),
+                inner: Arc::clone(&self.inner),
             },
         })
     }
@@ -316,7 +325,7 @@ impl Context {
     pub fn create_shared_image(&self, width: u32, height: u32) -> HandleResult<Image> {
         let raw = RawImage::create_present(&self.inner, width, height)?;
         Ok(Image {
-            raw: Rc::new(raw),
+            raw: Arc::new(raw),
             width,
             height,
         })
@@ -341,6 +350,9 @@ impl Context {
         destination_stride: u32,
         rect: ir::PixelRect,
     ) -> HandleResult<()> {
+        // A direct Context readback must also cover logical chunks which have
+        // not yet reached the kernel FIFO. All sessions share this dispatcher.
+        self.inner.dispatcher.wait_idle()?;
         if !image.raw.belongs_to(&self.inner)
             || !self.inner.device.capabilities.supports_image_readback()
         {
@@ -445,6 +457,14 @@ pub enum IrSubmitError {
     Codegen(sgfx_codegen_adreno_a6xx::CompileError),
     /// The canonical A6xx submit-wire encoder rejected its input.
     SubmitWire(adreno_a6xx_submit_wire::Error),
+    /// The negotiated kernel queue does not implement asynchronous admission.
+    AsyncUnsupported,
+    /// A logical submission exceeds the bounded staging or command capacity.
+    SubmissionTooLarge,
+    /// Native completion or acceptance cannot be observed authoritatively.
+    CompletionUnavailable,
+    /// The kernel reported a terminal GPU completion failure.
+    CompletionFailed(u32),
 }
 
 impl From<ir::Error> for IrSubmitError {
@@ -482,14 +502,16 @@ pub enum UnsupportedIrFeature {
     TextureUpload,
     /// A command references an unsupported resource state.
     ResourceState,
+    /// Programmable pipelines, compute, or barriers need an extended backend.
+    ProgrammableExecution,
 }
 
 /// Session owning mapped presentation images and all execution state.
 pub struct MappedTargetSession {
     // These owners must drop before the queue/context that authorized them.
-    images: Vec<(ir::TextureId, Rc<Image>)>,
+    images: Vec<(ir::TextureId, Arc<Image>)>,
     resources: ContextResources,
-    queue: gpu_raw::GpuQueue,
+    queue: Arc<gpu_raw::GpuQueue>,
     context: Context,
 }
 
@@ -539,6 +561,7 @@ impl MappedTargetSession {
         destination_stride: u32,
         rect: ir::PixelRect,
     ) -> Result<(), IrSubmitError> {
+        self.resources.drain_async()?;
         let image = self.image(target)?;
         self.context
             .readback_image_bgra(image, destination, destination_stride, rect)?;
@@ -563,7 +586,7 @@ pub type ImageRef<'a> = &'a Image;
 
 /// Renderable image that can be presented through a Scarlet display surface.
 pub struct Image {
-    raw: Rc<RawImage>,
+    raw: Arc<RawImage>,
     width: u32,
     height: u32,
 }
@@ -587,7 +610,7 @@ impl Image {
 
 /// Command executor bound to one context, queue, and persistent resource cache.
 pub struct Executor<'a> {
-    queue: &'a gpu_raw::GpuQueue,
+    queue: &'a Arc<gpu_raw::GpuQueue>,
     context: &'a Context,
     resources: &'a mut ContextResources,
 }
@@ -606,6 +629,27 @@ impl sgfx_core::backend::CommandExecutor for Executor<'_> {
             std::println!("[a618-userspace] command execution failed: {:?}", error);
         }
         result
+    }
+}
+
+impl sgfx_core::backend::CommandSubmitter for Executor<'_> {
+    type Submission = Submission;
+
+    /// Submit owned GPU work without waiting for its completion or capacity.
+    ///
+    /// The first tracked call creates four persistent upload arenas; first-use
+    /// logical resources can also synchronize while their SMMU mappings are
+    /// installed. Subsequent calls reuse arenas only after successful native
+    /// completion. Upload bytes and generated objects occupy disjoint retained
+    /// storage, and kernel ownership survives session or receipt destruction.
+    /// Buffer upload offsets and lengths must be multiples of four for native
+    /// CP_MEMCPY; unsupported alignment is rejected before logical admission.
+    fn submit<'r, 'data>(
+        &mut self,
+        commands: &ir::CommandBuffer<'r, 'data>,
+    ) -> Result<Submission, sgfx_core::backend::SubmitError<IrSubmitError, Submission>> {
+        self.resources
+            .submit_async(&self.context.inner, self.queue, commands)
     }
 }
 

@@ -27,7 +27,7 @@ use scarlet::{
             SENSOR_EVENT_FLAG_WAKEUP, SensorDevice, SensorInfo, SensorLocation, SensorType,
         },
     },
-    early_println,
+    println,
     sync::{IrqSpinLock, Mutex},
     time,
 };
@@ -447,10 +447,9 @@ mod runtime {
         fn note_error(&self, reason: &'static str) {
             let count = self.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
             if count.is_power_of_two() {
-                early_println!(
+                println!(
                     "[chrome-ec-motion-sense] FIFO error count={} reason={}",
-                    count,
-                    reason
+                    count, reason
                 );
             }
         }
@@ -620,31 +619,31 @@ mod runtime {
 
     fn initialize() {
         let Some(ec) = get_primary_cros_ec_spi() else {
-            early_println!("[chrome-ec-motion-sense] primary Chrome EC unavailable");
+            println!("[chrome-ec-motion-sense] primary Chrome EC unavailable");
             return;
         };
         let features = match ec.features() {
             Ok(features) if features.supports_motion_sense() => features,
             Ok(_) => {
-                early_println!("[chrome-ec-motion-sense] EC has no motion-sense feature");
+                println!("[chrome-ec-motion-sense] EC has no motion-sense feature");
                 return;
             }
             Err(_) => {
-                early_println!("[chrome-ec-motion-sense] GET_FEATURES failed");
+                println!("[chrome-ec-motion-sense] GET_FEATURES failed");
                 return;
             }
         };
         let summary = match ec.motion_sensor_summary() {
             Ok(summary) if summary.sensor_count <= MAX_SENSOR_COUNT => summary,
             Ok(summary) => {
-                early_println!(
+                println!(
                     "[chrome-ec-motion-sense] invalid sensor count {}",
                     summary.sensor_count
                 );
                 return;
             }
             Err(_) => {
-                early_println!("[chrome-ec-motion-sense] motion DUMP failed");
+                println!("[chrome-ec-motion-sense] motion DUMP failed");
                 return;
             }
         };
@@ -657,7 +656,7 @@ mod runtime {
             let info = match ec.motion_sensor_info(sensor_num) {
                 Ok(info) => info,
                 Err(_) => {
-                    early_println!(
+                    println!(
                         "[chrome-ec-motion-sense] sensor {} INFO failed; skipped",
                         sensor_num
                     );
@@ -671,7 +670,7 @@ mod runtime {
             let range = match range_result {
                 Ok(range) if range > 0 => range as u32,
                 _ => {
-                    early_println!(
+                    println!(
                         "[chrome-ec-motion-sense] sensor {} RANGE failed; skipped",
                         sensor_num
                     );
@@ -681,7 +680,7 @@ mod runtime {
             let odr = match odr_result {
                 Ok(odr) if odr >= 0 => odr as u32,
                 _ => {
-                    early_println!(
+                    println!(
                         "[chrome-ec-motion-sense] sensor {} ODR failed; skipped",
                         sensor_num
                     );
@@ -689,10 +688,9 @@ mod runtime {
                 }
             };
             let Some(sensor_type) = map_sensor_type(info.sensor_type) else {
-                early_println!(
+                println!(
                     "[chrome-ec-motion-sense] sensor {} type {} unsupported; skipped",
-                    sensor_num,
-                    info.sensor_type
+                    sensor_num, info.sensor_type
                 );
                 continue;
             };
@@ -714,10 +712,9 @@ mod runtime {
             ) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    early_println!(
+                    println!(
                         "[chrome-ec-motion-sense] sensor {} metadata invalid: {}; skipped",
-                        sensor_num,
-                        error
+                        sensor_num, error
                     );
                     continue;
                 }
@@ -725,10 +722,9 @@ mod runtime {
             let device = match SensorDevice::new(metadata) {
                 Ok(device) => Arc::new(device),
                 Err(error) => {
-                    early_println!(
+                    println!(
                         "[chrome-ec-motion-sense] sensor {} device failed: {}; skipped",
-                        sensor_num,
-                        error
+                        sensor_num, error
                     );
                     continue;
                 }
@@ -736,7 +732,7 @@ mod runtime {
             let name = device.get_name().into();
             let registered: Arc<dyn Device> = device.clone();
             DeviceManager::get_manager().register_device_with_name(name, registered);
-            early_println!(
+            println!(
                 "[chrome-ec-motion-sense] registered {} ec_sensor={} type={:?} location={:?} odr={}mHz fifo={}",
                 device.get_name(),
                 sensor_num,
@@ -769,7 +765,7 @@ mod runtime {
             let listener: Arc<dyn CrosEcEventListener> = hub.clone();
             let _listener_id = ec.register_event_listener(Arc::downgrade(&listener));
             match ec.set_motion_fifo_interrupt_enabled(true) {
-                Ok(true) => early_println!(
+                Ok(true) => println!(
                     "[chrome-ec-motion-sense] FIFO IRQ enabled sensors={} tight_timestamps={}",
                     summary.sensor_count,
                     features.supports_motion_sense_tight_timestamps()
@@ -778,7 +774,7 @@ mod runtime {
                 Err(_) => hub.note_error("FIFO interrupt enable command failed"),
             }
         } else {
-            early_println!(
+            println!(
                 "[chrome-ec-motion-sense] FIFO unsupported; taking one direct sample, no polling"
             );
             let now_ns = time::current_time_ns();

@@ -73,16 +73,6 @@ kind = "copy"
 source = "firmware/rootfs"
 to = "/system/scarlet"
 
-# The project-local PID 1 patches the resolved Scarlet init with rootwait
-# semantics while retaining its root transition and non-rootwait fallback.
-[[images.initramfs.layers]]
-kind = "cargo"
-source = { path = "rootwait-init" }
-package = "scarlet-rootwait-init"
-bin = "init"
-replace = true
-to = "/system/scarlet/bin/init"
-
 [images.rootfs]
 format = "ext2"
 output = ".scarlet/images/rootfs-aarch64-coachz-full.ext2"
@@ -95,15 +85,6 @@ path = "../../../Scarlet/bundles/full/bundle.toml"
 kind = "copy"
 source = "firmware/rootfs"
 to = "/system/scarlet"
-
-# The generic Scarlet bundle is intentionally backend-neutral and keeps its
-# Adreno crates pinned to a published git revision.  During CoachZ driver
-# development, rebuild the binaries that actually submit A6xx commands against
-# this checkout so userspace and the in-tree kernel validator cannot drift.
-[[images.rootfs.layers]]
-kind = "script"
-source = "tools/build-coachz-sgfx-userspace.sh"
-to = "/system/scarlet/bin"
 
 [images.boot]
 format = "limine-uefi"

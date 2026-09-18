@@ -25,7 +25,7 @@ use scarlet::{
         },
         power::{PowerDomain, PowerDomainProvider, PowerManager},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time, vm,
 };
@@ -315,7 +315,7 @@ impl Sc7180VideoCc {
     }
 
     fn log_state(&self, reason: &str) {
-        early_println!(
+        println!(
             "[qcom-sc7180-videocc] state={} pll={:#010x}/{:#010x}/{:#010x} l={:#x} frac={:#x} root={:#010x}/{:#010x} branches={:#010x},{:#010x},{:#010x},{:#010x},{:#010x},{:#010x} gdsc={:#010x},{:#010x}",
             reason,
             self.registers.read(PLL0_BASE + PLL_MODE),
@@ -737,10 +737,8 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .ok_or("qcom-sc7180-videocc: missing register resource")?;
     let resource_size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
-        .ok_or("qcom-sc7180-videocc: invalid register resource")?;
+        .size()
+        .map_err(|_| "qcom-sc7180-videocc: invalid register resource")?;
     if resource_size < REGISTER_WINDOW_SIZE {
         return Err("qcom-sc7180-videocc: register resource is too small");
     }
@@ -762,7 +760,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         }),
     );
     CONTROLLERS.lock().push(Arc::clone(&controller));
-    early_println!(
+    println!(
         "[qcom-sc7180-videocc] registered phandle={:#x} paddr={:#x} pll={:#010x}",
         phandle,
         resource.start,

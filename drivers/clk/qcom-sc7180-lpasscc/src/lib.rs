@@ -24,7 +24,7 @@ use scarlet::{
         },
         power::{PowerDomain, PowerDomainProvider, PowerManager},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time, vm,
 };
@@ -835,7 +835,7 @@ fn require_parent_power_domain(device: &PlatformDeviceInfo) -> Result<(), &'stat
             .map_err(|_| "qcom-sc7180-lpasscc: malformed parent domain id")?,
     );
     if !PowerManager::has_provider(phandle) {
-        early_println!(
+        println!(
             "[qcom-sc7180-lpasscc] waiting for parent power provider phandle={:#x}",
             phandle,
         );
@@ -843,7 +843,7 @@ fn require_parent_power_domain(device: &PlatformDeviceInfo) -> Result<(), &'stat
     }
     let domain = PowerManager::resolve_domain(phandle, &[domain_id])?;
     if !domain.is_enabled() {
-        early_println!(
+        println!(
             "[qcom-sc7180-lpasscc] waiting for parent domain '{}' vote",
             domain.label(),
         );
@@ -875,7 +875,7 @@ fn map_resource(
     device: &PlatformDeviceInfo,
     index: usize,
     minimum_size: usize,
-) -> Result<(MmioMapping, usize), &'static str> {
+) -> Result<(MmioMapping, u64), &'static str> {
     let resource = device
         .get_resources()
         .iter()
@@ -883,10 +883,8 @@ fn map_resource(
         .nth(index)
         .ok_or("qcom-sc7180-lpasscc: missing MMIO resource")?;
     let size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|span| span.checked_add(1))
-        .ok_or("qcom-sc7180-lpasscc: invalid MMIO resource")?;
+        .size()
+        .map_err(|_| "qcom-sc7180-lpasscc: invalid MMIO resource")?;
     if size < minimum_size {
         return Err("qcom-sc7180-lpasscc: MMIO resource is too small");
     }
@@ -914,7 +912,7 @@ fn probe_lpass_hm(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             controller: Arc::clone(&controller),
         }),
     );
-    early_println!(
+    println!(
         "[qcom-sc7180-lpasscc] LPASS_HM registered phandle={:#x} paddr={:#x} gdscr={:#010x}",
         phandle,
         paddr,
@@ -956,7 +954,7 @@ fn probe_lpass_cc(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             controller: Arc::clone(&controller),
         }),
     );
-    early_println!(
+    println!(
         "[qcom-sc7180-lpasscc] LPASS_CORE_CC registered phandle={:#x} core={:#x} audio={:#x} pll={:#010x}/{:#010x}",
         phandle,
         core_paddr,

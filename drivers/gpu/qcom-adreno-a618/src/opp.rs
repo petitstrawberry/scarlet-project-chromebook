@@ -12,7 +12,7 @@ use alloc::{vec, vec::Vec};
 use fdt::node::FdtNode;
 use scarlet::{
     device::{fdt::FdtManager, manager::DeviceManager, platform::PlatformDeviceInfo},
-    early_println,
+    println,
 };
 
 use crate::hfi_abi::{MAX_GMU_LEVELS, MAX_GPU_LEVELS};
@@ -180,13 +180,12 @@ fn read_gpu_supported_hardware(device: &PlatformDeviceInfo) -> Result<u32, &'sta
     let fuse = u32::from_le_bytes(bytes);
     let (supported_hardware, known) = supported_hardware_from_fuse(fuse);
     if known {
-        early_println!(
+        println!(
             "[qcom-adreno-a618] speed-bin fuse={} supported-hw={:#x}",
-            fuse,
-            supported_hardware,
+            fuse, supported_hardware,
         );
     } else {
-        early_println!(
+        println!(
             "[qcom-adreno-a618] unknown speed-bin fuse={}; using safe bin 0",
             fuse,
         );

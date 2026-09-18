@@ -59,8 +59,8 @@ use scarlet::{
         manager::{DeviceManager, DriverPriority, PROBE_DEFER},
         platform::{PlatformDeviceDriver, PlatformDeviceInfo},
     },
-    early_println,
     interrupt::{InterruptId, InterruptResult},
+    println,
     sync::IrqSpinLock,
     time,
 };
@@ -185,11 +185,9 @@ impl GoodixGt7375p {
     fn log_report_error(&self, prefix: &str, error: I2cError) {
         let count = REPORT_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_power_of_two() {
-            early_println!(
+            println!(
                 "[goodix-gt7375p] {} report read failed: {:?} (count={})",
-                prefix,
-                error,
-                count
+                prefix, error, count
             );
         }
     }
@@ -254,7 +252,7 @@ fn resolve_i2c_bus(device: &PlatformDeviceInfo) -> Result<Arc<dyn I2cBus>, &'sta
     DeviceManager::get_manager()
         .get_i2c_bus(phandle)
         .ok_or_else(|| {
-            early_println!(
+            println!(
                 "[goodix-gt7375p] I2C bus phandle {:#x} is not ready, deferring",
                 phandle
             );
@@ -269,10 +267,9 @@ fn resolve_gpio(property: &[u8], label: &'static str) -> Result<GpioLine, &'stat
     let controller = DeviceManager::get_manager()
         .get_gpio_controller(phandle)
         .ok_or_else(|| {
-            early_println!(
+            println!(
                 "[goodix-gt7375p] {} GPIO controller {:#x} is not ready, deferring",
-                label,
-                phandle
+                label, phandle
             );
             PROBE_DEFER
         })?;
@@ -298,7 +295,7 @@ fn resolve_interrupt_gpio(device: &PlatformDeviceInfo) -> Result<GpioLine, &'sta
         .get_gpio_controller(phandle)
         .ok_or(PROBE_DEFER)?;
     if trigger != 8 {
-        early_println!(
+        println!(
             "[goodix-gt7375p] warning: expected active-low level IRQ, DT flags={:#x}",
             trigger
         );
@@ -326,7 +323,7 @@ fn reset_controller(reset: &GpioLine, irq: &GpioLine) {
     // drive INT for legacy GT9xx address selection.
     time::udelay(180_000);
     irq.controller.set_direction_input(irq.pin);
-    early_println!(
+    println!(
         "[goodix-gt7375p] I2C-HID reset: reset-high {}->{} irq-high {}->{} addr=0x{:02x}",
         reset_high_before,
         reset.controller.get_value(reset.pin),
@@ -419,7 +416,7 @@ fn read_identity(bus: Arc<dyn I2cBus>, irq: GpioLine) -> Result<Arc<GoodixGt7375
         ),
     ];
     bus.transfer(&mut descriptor_messages).map_err(|error| {
-        early_println!(
+        println!(
             "[goodix-gt7375p] I2C-HID descriptor read failed: {:?}",
             error
         );
@@ -437,10 +434,9 @@ fn read_identity(bus: Arc<dyn I2cBus>, irq: GpioLine) -> Result<Arc<GoodixGt7375
     let vendor_id = word(20).ok_or("goodix: missing HID vendor ID")?;
     let product_id = word(22).ok_or("goodix: missing HID product ID")?;
     if vendor_id != GOODIX_HID_VENDOR_ID || !COACHZ_GT7375P_PRODUCT_IDS.contains(&product_id) {
-        early_println!(
+        println!(
             "[goodix-gt7375p] rejected I2C-HID identity vendor={:#06x} product={:#06x}",
-            vendor_id,
-            product_id,
+            vendor_id, product_id,
         );
         return Err("goodix-gt7375p: unsupported I2C-HID identity");
     }
@@ -456,7 +452,7 @@ fn read_identity(bus: Arc<dyn I2cBus>, irq: GpioLine) -> Result<Arc<GoodixGt7375
         return Err("goodix-gt7375p: invalid I2C-HID buffer lengths");
     }
     initialize_i2c_hid(&bus, &irq, command_register, max_input_length).map_err(|error| {
-        early_println!(
+        println!(
             "[goodix-gt7375p] I2C-HID power/reset initialization failed: {:?}",
             error,
         );
@@ -475,7 +471,7 @@ fn read_identity(bus: Arc<dyn I2cBus>, irq: GpioLine) -> Result<Arc<GoodixGt7375
         ),
     ];
     bus.transfer(&mut report_messages).map_err(|error| {
-        early_println!(
+        println!(
             "[goodix-gt7375p] HID report descriptor read failed: {:?}",
             error
         );
@@ -521,7 +517,7 @@ fn read_identity(bus: Arc<dyn I2cBus>, irq: GpioLine) -> Result<Arc<GoodixGt7375
         device_id: IrqSpinLock::new(None),
     };
 
-    early_println!(
+    println!(
         "[goodix-gt7375p] I2C-HID vendor={:#06x} product={:#06x} version={:#06x} report={} input={} touch-report={} x-range={}..{} y-range={}..{} contacts={} ABI=type-b-multitouch",
         vendor_id,
         product_id,
@@ -635,11 +631,9 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             "17 ms GPIO polling fallback"
         };
 
-    early_println!(
+    println!(
         "[goodix-gt7375p] registered {} at 0x{:02x}; {}",
-        event_name,
-        GOODIX_ADDRESS,
-        interrupt_mode,
+        event_name, GOODIX_ADDRESS, interrupt_mode,
     );
     Ok(())
 }

@@ -37,8 +37,8 @@ use scarlet::{
         manager::{DeviceManager, DriverPriority, probe_defer},
         platform::{PlatformDeviceDriver, PlatformDeviceInfo},
     },
-    early_println,
     interrupt::{InterruptId, InterruptResult},
+    println,
     sync::IrqSpinLock,
     time,
 };
@@ -135,10 +135,9 @@ impl ElanEkth3000 {
 
         let reset_ack = self.read_raw::<2>()?;
         if reset_ack != [0, 0] {
-            early_println!(
+            println!(
                 "[elan-ekth3000] unexpected reset acknowledgement {:02x} {:02x}",
-                reset_ack[0],
-                reset_ack[1]
+                reset_ack[0], reset_ack[1]
             );
         }
 
@@ -179,7 +178,7 @@ impl ElanEkth3000 {
             return;
         };
         if report_id != ETP_REPORT_ID && report_id != ETP_REPORT_ID_HIGH_PRECISION {
-            early_println!("[elan-ekth3000] ignoring report id {:#x}", report_id);
+            println!("[elan-ekth3000] ignoring report id {:#x}", report_id);
             return;
         }
 
@@ -245,7 +244,7 @@ impl ElanEkth3000 {
             return false;
         }
         if let Err(error) = self.read_and_process_report() {
-            early_println!("[elan-ekth3000] deferred report failed: {}", error);
+            println!("[elan-ekth3000] deferred report failed: {}", error);
         }
         true
     }
@@ -287,7 +286,7 @@ fn resolve_bus(device: &PlatformDeviceInfo) -> Result<Arc<dyn I2cBus>, &'static 
     DeviceManager::get_manager()
         .get_i2c_bus(phandle)
         .ok_or_else(|| {
-            early_println!(
+            println!(
                 "[elan-ekth3000] I2C bus phandle {:#x} is not ready, deferring",
                 phandle
             );
@@ -318,7 +317,7 @@ fn resolve_irq(
     let controller = DeviceManager::get_manager()
         .get_gpio_controller(controller_phandle)
         .ok_or_else(|| {
-            early_println!(
+            println!(
                 "[elan-ekth3000] GPIO controller {:#x} is not ready, deferring",
                 controller_phandle
             );
@@ -383,7 +382,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     irq_gpio.set_direction_input(irq_pin);
     if !irq_gpio.request_irq(irq_pin, irq_trigger, trackpad.clone()) {
-        early_println!(
+        println!(
             "[elan-ekth3000] GPIO{} IRQ registration unavailable, deferring",
             irq_pin
         );
@@ -395,7 +394,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     DeviceManager::get_manager()
         .register_device_with_name(event_device.get_name().into(), event_device.clone());
-    early_println!(
+    println!(
         "[elan-ekth3000] registered {} addr={:#x} GPIO{} {:?} report={} max={}x{} vcc=firmware-handoff",
         event_device.get_name(),
         address.raw(),

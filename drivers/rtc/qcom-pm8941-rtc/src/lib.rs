@@ -17,7 +17,7 @@
 
 extern crate alloc;
 
-use scarlet::{device::fdt::FdtManager, early_println, time};
+use scarlet::{device::fdt::FdtManager, println, time};
 use scarlet_driver_cros_ec_spi::get_primary_cros_ec_spi;
 use scarlet_driver_qcom_spmi_pmic_arb::{QcomSpmiPmicArb, get_controller};
 
@@ -112,15 +112,14 @@ fn initialize_from_sample(
 
     match time::initialize_wall_clock_from_rtc_sample(epoch_ns, mono_before, mono_after) {
         Ok(()) => {
-            early_println!(
+            println!(
                 "[coachz-rtc] seeded wall clock from {}: epoch={}",
-                source,
-                seconds
+                source, seconds
             );
             Ok(())
         }
         Err("wall clock already initialized") => {
-            early_println!("[coachz-rtc] wall clock already initialized");
+            println!("[coachz-rtc] wall clock already initialized");
             Ok(())
         }
         Err(error) => Err(error),
@@ -165,19 +164,18 @@ fn seed_from_pm6150() -> Result<(), &'static str> {
     let seconds = read_raw_seconds(&controller, sid, rtc_base)?;
     let mono_after = time::current_time_ns();
     validate_epoch(seconds).map_err(|_| "PM6150 RTC is uninitialized or implausible")?;
-    early_println!(
+    println!(
         "[coachz-rtc] using PM6150 fallback: sid={} base={:#x}",
-        sid,
-        rtc_base
+        sid, rtc_base
     );
     initialize_from_sample("PM6150", seconds, mono_before, mono_after)
 }
 
 fn initialize_wall_clock() {
     if let Err(ec_error) = seed_from_cros_ec() {
-        early_println!("[coachz-rtc] Chrome EC unavailable: {}", ec_error);
+        println!("[coachz-rtc] Chrome EC unavailable: {}", ec_error);
         if let Err(error) = seed_from_pm6150() {
-            early_println!("[coachz-rtc] no usable wall-clock source: {}", error);
+            println!("[coachz-rtc] no usable wall-clock source: {}", error);
         }
     }
 }

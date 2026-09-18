@@ -50,11 +50,18 @@ jobs:
         run: |
           cargo-fmt fmt --manifest-path userspace/sgfx-codegen-adreno-a6xx/Cargo.toml --check
           cargo-fmt fmt --manifest-path tests/a618-submit-validation/Cargo.toml --check
+          cargo-fmt fmt --manifest-path tests/a618-async-queue/Cargo.toml --check
+          cargo-fmt fmt --manifest-path tests/a618-async-preparation/Cargo.toml --check
+          cargo-fmt fmt --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --check
       - name: Test portable code generation
         run: cargo test --locked --manifest-path userspace/sgfx-codegen-adreno-a6xx/Cargo.toml
       - name: Test the userspace-to-kernel submit boundary
         # Compiles the driver's real validator on the host; no GPU required.
         run: cargo test --locked --manifest-path tests/a618-submit-validation/Cargo.toml
+      - name: Test portable asynchronous ownership and preparation
+        run: |
+          cargo test --locked --manifest-path tests/a618-async-queue/Cargo.toml
+          cargo test --locked --manifest-path tests/a618-async-preparation/Cargo.toml
 
   scarlet:
     runs-on: ubuntu-latest
@@ -73,7 +80,11 @@ jobs:
             accept-flake-config = true
             extra-substituters = https://scarlet-rust-toolchain.cachix.org
             extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
+      - name: Install the pinned Scarlet Rust toolchain
+        run: |
+          scarlet_toolchain_path="$(nix build "${SCARLET_TOOLCHAIN}^out" --no-link --print-out-paths)"
+          echo "$scarlet_toolchain_path/bin" >> "$GITHUB_PATH"
       - name: Check SGFX core source identity
-        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo tree --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target '${{ matrix.target }}' --invert sgfx-core
+        run: cargo tree --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target '${{ matrix.target }}' --invert sgfx-core
       - name: Check the std-enabled Adreno backend
-        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo check --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target '${{ matrix.target }}'
+        run: cargo check --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std --target '${{ matrix.target }}'

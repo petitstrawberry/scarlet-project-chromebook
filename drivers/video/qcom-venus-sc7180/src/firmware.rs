@@ -145,7 +145,7 @@ fn program_headers(bytes: &[u8]) -> Result<Vec<ProgramHeader>, &'static str> {
 /// Number of bytes spanned by loadable firmware segments.
 pub(crate) fn load_into_reserved_region(
     region_vaddr: usize,
-    region_paddr: usize,
+    region_paddr: u64,
     region_size: usize,
 ) -> Result<usize, &'static str> {
     let bytes = load_file(VENUS_FIRMWARE_PATH, region_size)?;
@@ -167,8 +167,7 @@ pub(crate) fn load_into_reserved_region(
         return Err("qcom-venus-sc7180: firmware has no loadable segments");
     }
     let relocation_base = if relocatable {
-        usize::try_from(minimum)
-            .map_err(|_| "qcom-venus-sc7180: relocation base is out of range")?
+        u64::from(minimum)
     } else {
         region_paddr
     };
@@ -186,11 +185,12 @@ pub(crate) fn load_into_reserved_region(
         if header.file_size > header.mem_size {
             return Err("qcom-venus-sc7180: firmware segment file size exceeds memory size");
         }
-        let paddr = usize::try_from(header.paddr)
-            .map_err(|_| "qcom-venus-sc7180: firmware segment address is out of range")?;
+        let paddr = u64::from(header.paddr);
         let destination_offset = paddr
             .checked_sub(relocation_base)
             .ok_or("qcom-venus-sc7180: firmware segment precedes relocation base")?;
+        let destination_offset = usize::try_from(destination_offset)
+            .map_err(|_| "qcom-venus-sc7180: firmware segment offset is out of range")?;
         let mem_size = usize::try_from(header.mem_size)
             .map_err(|_| "qcom-venus-sc7180: firmware segment size is out of range")?;
         let file_size = usize::try_from(header.file_size)

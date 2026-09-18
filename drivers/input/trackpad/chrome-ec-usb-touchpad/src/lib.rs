@@ -37,7 +37,7 @@ use scarlet::{
             UsbInterruptInHandler,
         },
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
 };
 
@@ -186,7 +186,7 @@ impl UsbInterruptInDriver for ChromeEcUsbTouchpadDriver {
             .iter()
             .find(|existing| existing.location == location)
         {
-            early_println!(
+            println!(
                 "[chrome-ec-usb-touchpad] reusing {} at host={} root-port={} route={:#x}",
                 existing.device.event_device.get_name(),
                 location.host_id,
@@ -206,7 +206,7 @@ impl UsbInterruptInDriver for ChromeEcUsbTouchpadDriver {
             location,
             device: touchpad.clone(),
         });
-        early_println!(
+        println!(
             "[chrome-ec-usb-touchpad] registered {} at host={} root-port={} route={:#x}",
             touchpad.event_device.get_name(),
             location.host_id,

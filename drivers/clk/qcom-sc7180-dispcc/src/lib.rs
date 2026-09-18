@@ -27,7 +27,7 @@ use scarlet::{
         },
         power::{PowerDomain, PowerManager},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time, vm,
 };
@@ -180,7 +180,7 @@ impl Sc7180DispCc {
         let inherited_control = self.registers.read(GDSC_CONTROL);
         let inherited_status = self.registers.read(GDSC_STATUS);
         let inherited_on = self.gdsc_is_on();
-        early_println!(
+        println!(
             "[qcom-sc7180-dispcc] MDSS GDSC handoff: control={:#010x} status={:#010x} on={}",
             inherited_control,
             inherited_status,
@@ -199,7 +199,7 @@ impl Sc7180DispCc {
             time::udelay(1);
         }
 
-        early_println!(
+        println!(
             "[qcom-sc7180-dispcc] MDSS GDSC ready: control={:#010x} status={:#010x}",
             self.registers.read(GDSC_CONTROL),
             self.registers.read(GDSC_STATUS),
@@ -244,7 +244,7 @@ impl Sc7180DispCc {
     fn preserve_or_enable_branch(&self, branch: usize) -> Result<(), &'static str> {
         let inherited = self.registers.read(branch);
         if self.branch_is_running(branch) {
-            early_println!(
+            println!(
                 "[qcom-sc7180-dispcc] preserving live clock branch {:#x} value={:#010x}",
                 branch,
                 inherited,
@@ -291,7 +291,7 @@ impl Sc7180DispCc {
         self.preserve_or_start_branch(MDP_ROOT, MDP_BRANCH, SOURCE_GPLL0, 2)?;
         self.preserve_or_start_branch(VSYNC_ROOT, VSYNC_BRANCH, SOURCE_XO, 1)?;
 
-        early_println!(
+        println!(
             "[qcom-sc7180-dispcc] foundational clocks ready: ahb={:#010x} mdp={:#010x} vsync={:#010x}",
             self.registers.read(AHB_BRANCH),
             self.registers.read(MDP_BRANCH),
@@ -387,10 +387,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|resource| matches!(resource.res_type, PlatformDeviceResourceType::MEM))
         .ok_or("qcom-sc7180-dispcc: missing register resource")?;
     let resource_size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
-        .ok_or("qcom-sc7180-dispcc: invalid register resource")?;
+        .size()
+        .map_err(|_| "qcom-sc7180-dispcc: invalid register resource")?;
     if resource_size < REGISTER_WINDOW_SIZE {
         return Err("qcom-sc7180-dispcc: register resource is too small");
     }
@@ -402,7 +400,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     PowerManager::register_domain(phandle, Arc::clone(&controller) as Arc<dyn PowerDomain>);
     CONTROLLERS.lock().push(Arc::clone(&controller));
 
-    early_println!(
+    println!(
         "[qcom-sc7180-dispcc] registered phandle={:#x} paddr={:#x}",
         phandle,
         resource.start,

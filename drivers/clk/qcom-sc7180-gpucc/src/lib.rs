@@ -21,7 +21,7 @@ use scarlet::{
         },
         power::{PowerDomain, PowerDomainProvider, PowerManager},
     },
-    early_println,
+    println,
     sync::IrqSpinLock,
     time, vm,
 };
@@ -142,38 +142,38 @@ impl Sc7180GpuCc {
 
     fn configure_pll1(&self) {
         let base = PLL1_BASE;
-        early_println!("[qcom-sc7180-gpucc] PLL1 write L");
+        println!("[qcom-sc7180-gpucc] PLL1 write L");
         self.registers.write(base + PLL_L_VAL, 0x12);
-        early_println!("[qcom-sc7180-gpucc] PLL1 write FRAC");
+        println!("[qcom-sc7180-gpucc] PLL1 write FRAC");
         self.registers.write(base + PLL_FRAC, 0xc000);
-        early_println!("[qcom-sc7180-gpucc] PLL1 write CONFIG");
+        println!("[qcom-sc7180-gpucc] PLL1 write CONFIG");
         self.registers.write(base + PLL_CONFIG_CTL, 0x2048_5699);
-        early_println!("[qcom-sc7180-gpucc] PLL1 write CONFIG_U");
+        println!("[qcom-sc7180-gpucc] PLL1 write CONFIG_U");
         self.registers.write(base + PLL_CONFIG_CTL_U, 0x0000_2067);
-        early_println!("[qcom-sc7180-gpucc] PLL1 write USER");
+        println!("[qcom-sc7180-gpucc] PLL1 write USER");
         self.registers.write(base + PLL_USER_CTL, 0x0000_0001);
-        early_println!("[qcom-sc7180-gpucc] PLL1 write USER_U");
+        println!("[qcom-sc7180-gpucc] PLL1 write USER_U");
         self.registers.write(base + PLL_USER_CTL_U, 0x0000_4805);
-        early_println!("[qcom-sc7180-gpucc] PLL1 write TEST_U");
+        println!("[qcom-sc7180-gpucc] PLL1 write TEST_U");
         self.registers.write(base + PLL_TEST_CTL_U, 0x4000_0000);
         arch::io_wmb();
 
         // Fabia requires these as two distinct read/modify/write operations.
         // Keeping the reads visible in the log also distinguishes an
         // inaccessible PLL sub-block from a later programming failure.
-        early_println!("[qcom-sc7180-gpucc] PLL1 read MODE for UPDATE_BYPASS");
+        println!("[qcom-sc7180-gpucc] PLL1 read MODE for UPDATE_BYPASS");
         let mode = self.registers.read(base + PLL_MODE);
-        early_println!("[qcom-sc7180-gpucc] PLL1 MODE={:#010x}", mode);
+        println!("[qcom-sc7180-gpucc] PLL1 MODE={:#010x}", mode);
         self.registers
             .write(base + PLL_MODE, mode | PLL_UPDATE_BYPASS);
         arch::io_wmb();
 
-        early_println!("[qcom-sc7180-gpucc] PLL1 read MODE for RESET_N");
+        println!("[qcom-sc7180-gpucc] PLL1 read MODE for RESET_N");
         let mode = self.registers.read(base + PLL_MODE);
-        early_println!("[qcom-sc7180-gpucc] PLL1 MODE={:#010x}", mode);
+        println!("[qcom-sc7180-gpucc] PLL1 MODE={:#010x}", mode);
         self.registers.write(base + PLL_MODE, mode | PLL_RESET_N);
         arch::io_wmb();
-        early_println!("[qcom-sc7180-gpucc] PLL1 configured");
+        println!("[qcom-sc7180-gpucc] PLL1 configured");
     }
 
     fn configure_gmu_root(&self) -> Result<(), &'static str> {
@@ -617,18 +617,16 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let parents = resolve_parent_clocks(manager, device)?;
     let enabled_bi_tcxo = EnabledClock::prepare(parents.bi_tcxo.clone())
         .map_err(|_| "qcom-sc7180-gpucc: failed to enable bi_tcxo parent")?;
-    early_println!("[qcom-sc7180-gpucc] bi_tcxo parent enabled");
-    early_println!("[qcom-sc7180-gpucc] GPLL0 parent votes deferred until GMU enable");
+    println!("[qcom-sc7180-gpucc] bi_tcxo parent enabled");
+    println!("[qcom-sc7180-gpucc] GPLL0 parent votes deferred until GMU enable");
     let resource = device
         .get_resources()
         .iter()
         .find(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .ok_or("qcom-sc7180-gpucc: missing register resource")?;
     let resource_size = resource
-        .end
-        .checked_sub(resource.start)
-        .and_then(|size| size.checked_add(1))
-        .ok_or("qcom-sc7180-gpucc: invalid register resource")?;
+        .size()
+        .map_err(|_| "qcom-sc7180-gpucc: invalid register resource")?;
     if resource_size < REGISTER_WINDOW_SIZE {
         return Err("qcom-sc7180-gpucc: register resource is too small");
     }
@@ -637,23 +635,23 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             .map_err(|_| "qcom-sc7180-gpucc: ioremap failed")?,
     };
     let controller = Arc::new(Sc7180GpuCc::new(mapping, phandle, parents, enabled_bi_tcxo));
-    early_println!("[qcom-sc7180-gpucc] preflight read CX_GDSCR");
+    println!("[qcom-sc7180-gpucc] preflight read CX_GDSCR");
     let cx_gdscr = controller.registers.read(CX_GDSCR);
-    early_println!("[qcom-sc7180-gpucc] preflight CX_GDSCR={:#010x}", cx_gdscr,);
-    early_println!("[qcom-sc7180-gpucc] preflight read PLL1 MODE");
+    println!("[qcom-sc7180-gpucc] preflight CX_GDSCR={:#010x}", cx_gdscr,);
+    println!("[qcom-sc7180-gpucc] preflight read PLL1 MODE");
     let pll1_mode = controller.registers.read(PLL1_BASE + PLL_MODE);
-    early_println!(
+    println!(
         "[qcom-sc7180-gpucc] preflight PLL1 MODE={:#010x}",
         pll1_mode,
     );
-    early_println!("[qcom-sc7180-gpucc] configuring PLL1");
+    println!("[qcom-sc7180-gpucc] configuring PLL1");
     controller.configure_pll1();
     controller.registers.update(
         CX_GMU_BRANCH,
         CX_GMU_WAKE_SLEEP_MASK,
         CX_GMU_WAKE_SLEEP_VALUE,
     );
-    early_println!("[qcom-sc7180-gpucc] GMU wake/sleep policy configured");
+    println!("[qcom-sc7180-gpucc] GMU wake/sleep policy configured");
 
     manager.register_clk_provider(phandle, Arc::new(GpuClockProvider::new(&controller)));
     PowerManager::register_provider(
@@ -663,7 +661,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         }),
     );
     CONTROLLERS.lock().push(Arc::clone(&controller));
-    early_println!(
+    println!(
         "[qcom-sc7180-gpucc] registered phandle={:#x} paddr={:#x} cx={:#010x} gx={:#010x}",
         phandle,
         resource.start,
