@@ -16,7 +16,7 @@ gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "834007893
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "8340078937951f6096e6f3273b547665368f70f4", package = "scarlet-os", default-features = false, features = ["std"], optional = true }
 scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "8340078937951f6096e6f3273b547665368f70f4", package = "scarlet-std", optional = true }
 sgfx-codegen-adreno-a6xx = { path = "../sgfx-codegen-adreno-a6xx" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "a18b5a585616f05cf5df0fa5be1977752ceca1ea", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "0213c76bdc9777ddb2a3a25e30b54ac8c5e01912", default-features = false }
 
 [lib]
 name = "sgfx_backend_scarlet_adreno"
