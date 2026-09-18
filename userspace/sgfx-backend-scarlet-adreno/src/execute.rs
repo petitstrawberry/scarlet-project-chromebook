@@ -771,8 +771,7 @@ fn append_image_resource(
                 ir::TextureFormat::Bgra8Unorm
                 | ir::TextureFormat::Rgba8Unorm
                 | ir::TextureFormat::R8Unorm => ir::TextureFormat::Bgra8Unorm,
-                ir::TextureFormat::Bgra8UnormSrgb
-                | ir::TextureFormat::Rgba8UnormSrgb => {
+                ir::TextureFormat::Bgra8UnormSrgb | ir::TextureFormat::Rgba8UnormSrgb => {
                     return Err(IrSubmitError::Unsupported(
                         UnsupportedIrFeature::ResourceState,
                     ));
