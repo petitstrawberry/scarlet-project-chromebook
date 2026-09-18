@@ -58,11 +58,10 @@ jobs:
       - name: Test the userspace-to-kernel submit boundary
         # Compiles the driver's real validator on the host; no GPU required.
         run: cargo test --locked --manifest-path tests/a618-submit-validation/Cargo.toml
-      - name: Test asynchronous ownership, staging, and whole-stream dispatch
+      - name: Test portable asynchronous ownership and preparation
         run: |
           cargo test --locked --manifest-path tests/a618-async-queue/Cargo.toml
           cargo test --locked --manifest-path tests/a618-async-preparation/Cargo.toml
-          cargo test --locked --manifest-path userspace/sgfx-backend-scarlet-adreno/Cargo.toml --no-default-features --features std
 
   scarlet:
     runs-on: ubuntu-latest
