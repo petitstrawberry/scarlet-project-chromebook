@@ -635,6 +635,12 @@ impl sgfx_core::backend::CommandExecutor for Executor<'_> {
 impl sgfx_core::backend::CommandSubmitter for Executor<'_> {
     type Submission = Submission;
 
+    fn supports_async_submission(&self) -> bool {
+        self.queue.query_async().is_ok_and(|info| {
+            info.result == GPU_RESULT_SUCCESS && info.max_pending_submissions != 0
+        })
+    }
+
     /// Submit owned GPU work without waiting for its completion or capacity.
     ///
     /// The first tracked call creates four persistent upload arenas; first-use
