@@ -640,7 +640,7 @@ fn prepare_bgra_upload<'data>(
     let area = write.destination();
     let destination_stride = area
         .width()
-        .checked_mul(ir::TextureFormat::Bgra8Unorm.bytes_per_pixel())
+        .checked_mul(ir::TextureFormat::Bgra8Unorm.bytes_per_pixel().unwrap())
         .ok_or(IrSubmitError::InvalidIr(ir::Error::Overflow))?;
     let destination_len = usize::try_from(
         u64::from(destination_stride)
@@ -650,7 +650,9 @@ fn prepare_bgra_upload<'data>(
     .map_err(|_| IrSubmitError::OutOfMemory)?;
     let logical_row_bytes = area
         .width()
-        .checked_mul(format.bytes_per_pixel())
+        .checked_mul(format.bytes_per_pixel().ok_or(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::ImageLayout,
+        ))?)
         .ok_or(IrSubmitError::InvalidIr(ir::Error::Overflow))?;
     let mut pixels = Vec::new();
     pixels
@@ -771,7 +773,9 @@ fn append_image_resource(
                 ir::TextureFormat::Bgra8Unorm
                 | ir::TextureFormat::Rgba8Unorm
                 | ir::TextureFormat::R8Unorm => ir::TextureFormat::Bgra8Unorm,
-                ir::TextureFormat::Bgra8UnormSrgb | ir::TextureFormat::Rgba8UnormSrgb => {
+                ir::TextureFormat::Nv12
+                | ir::TextureFormat::Bgra8UnormSrgb
+                | ir::TextureFormat::Rgba8UnormSrgb => {
                     return Err(IrSubmitError::Unsupported(
                         UnsupportedIrFeature::ResourceState,
                     ));
@@ -816,7 +820,8 @@ fn require_texture_upload_format(format: ir::TextureFormat) -> Result<(), IrSubm
         ir::TextureFormat::Bgra8Unorm
         | ir::TextureFormat::Rgba8Unorm
         | ir::TextureFormat::R8Unorm => Ok(()),
-        ir::TextureFormat::Bgra8UnormSrgb
+        ir::TextureFormat::Nv12
+        | ir::TextureFormat::Bgra8UnormSrgb
         | ir::TextureFormat::Rgba8UnormSrgb
         | ir::TextureFormat::Depth32Float => Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::TextureUpload,

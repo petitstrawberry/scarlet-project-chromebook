@@ -1055,6 +1055,7 @@ impl VenusSession {
             SCARLET_VIDEO_FRAME_HEADER_LEN + payload_len,
         );
         Ok(VideoBackendDecodedFrame {
+            image: None,
             stream_id: self.id,
             frame: ScarletVideoDequeuedFrame {
                 width: layout.display_width,

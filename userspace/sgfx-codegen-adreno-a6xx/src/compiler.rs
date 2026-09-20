@@ -378,7 +378,12 @@ fn validate_image_layout(
     let row_bytes = image
         .extent
         .width()
-        .checked_mul(image.storage_format.bytes_per_pixel())
+        .checked_mul(
+            image
+                .storage_format
+                .bytes_per_pixel()
+                .ok_or(CompileError::UnsupportedFeature)?,
+        )
         .ok_or(CompileError::Overflow)?;
     let required = match image.modifier {
         ImageModifier::Linear => {
@@ -847,7 +852,12 @@ fn emit_texture_upload(
     };
     let logical_row_size = area
         .width()
-        .checked_mul(image.format.bytes_per_pixel())
+        .checked_mul(
+            image
+                .format
+                .bytes_per_pixel()
+                .ok_or(CompileError::UnsupportedFeature)?,
+        )
         .ok_or(CompileError::Overflow)?;
     if bytes_per_row < logical_row_size {
         return Err(CompileError::OutOfBounds);
@@ -883,7 +893,7 @@ fn emit_texture_upload(
             )
             .and_then(|offset| {
                 offset.checked_add(
-                    u64::from(area.x()) * u64::from(image.storage_format.bytes_per_pixel()),
+                    u64::from(area.x()) * u64::from(image.storage_format.bytes_per_pixel()?),
                 )
             })
             .ok_or(CompileError::Overflow)?;
@@ -925,7 +935,8 @@ fn convert_upload_row(
             }
             Ok(converted)
         }
-        TextureFormat::Bgra8UnormSrgb
+        TextureFormat::Nv12
+        | TextureFormat::Bgra8UnormSrgb
         | TextureFormat::Rgba8UnormSrgb
         | TextureFormat::Depth32Float => Err(CompileError::UnsupportedFeature),
     }
