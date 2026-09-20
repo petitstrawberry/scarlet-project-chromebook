@@ -20,4 +20,4 @@ adreno-a6xx-submit-wire = { path = "../../shared/adreno-a6xx-submit-wire" }
 
 [dev-dependencies]
 sgfx-codegen-adreno-a6xx = { path = "../../userspace/sgfx-codegen-adreno-a6xx" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "34a47c701fa0d4761f63f3d841c7d312cea45236", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "5ea41a0dfd6992bb1c0fce06c8e65425dc978140", default-features = false }
