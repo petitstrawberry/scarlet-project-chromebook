@@ -107,7 +107,6 @@ cargo_with_source_config build \
     --release \
     -p userprogram \
     --bin sgfx-probe \
-    --bin taskbar \
     --bin terminal \
     --bin ui-demo \
     --bin ui-benchmark \
@@ -141,9 +140,9 @@ cargo_with_source_config build \
     --release \
     -p scarlet-std-bin \
     --bin sws \
+    --bin scarlet-shell \
     --bin clock \
     --bin files \
-    --bin launcher \
     --bin notepad \
     --bin task-manager \
     --bin ui-sgfx-showcase \
@@ -182,8 +181,8 @@ else
 fi
 
 for binary in \
-    sgfx-probe taskbar terminal ui-demo ui-benchmark settings video-player \
-    sws clock files launcher notepad task-manager ui-sgfx-showcase \
+    sgfx-probe terminal ui-demo ui-benchmark settings video-player \
+    sws scarlet-shell clock files notepad task-manager ui-sgfx-showcase \
     sgfx-cube sgfx-texture sgfx-showcase
 do
     source_path="$target_bins/$binary"
