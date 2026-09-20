@@ -36,3 +36,5 @@ __pycache__/
 !**/Cargo.lock
 
 .omo
+/kernel
+/scripts/.evidence/

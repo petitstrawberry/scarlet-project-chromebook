@@ -1,0 +1,93 @@
+仕様まで追うと、coreboot/DepthchargeはMMUを引き継ぐ方針ではない。
+
+corebootは2018年から明示的に、
+
+  ARM64 payloadはMMU無効状態で呼ばれることを期待する
+
+と定義している。
+
+coreboot change 27878:
+https://review.coreboot.org/c/coreboot/+/27878
+
+問題は次の二段階目にある。
+
+  coreboot
+    → MMU offでDepthchargeを起動
+  Depthcharge/libpayload
+    → 自分用MMUを構築して再度有効化
+  Depthcharge altfw
+    → MMUを無効化せずselfboot(entry)
+  U-Boot
+    → MMU off前提なので破綻
+
+Depthchargeの通常のChromeOS kernel起動経路は、Linux arm64 boot
+protocolに合わせて正しくMMUを無効化している。しかしaltfw経路は、
+
+  cache_sync_instructions();
+  selfboot(entry);
+
+だけである。
+
+したがって責任の所在は次のようになる。
+
+  - MMUを有効なままaltfwへ渡す問題:
+    Depthcharge/libpayloadのARM64 handoffバグ
+
+  - Trogdor U-Bootパッチ:
+    壊れたhandoffを考慮しておらず、対応不足
+
+根本修正はDepthcharge側で、altfwへ飛ぶ直前にlibpayloadの
+mmu_disable()を呼ぶことである。これはD-cacheのclean/invalidateと
+MMU停止をまとめて行う。
+
+ただしCoachZ搭載済みDepthchargeを直すには、GoogleによるChromeOS
+firmware更新か、自前firmwareの書き込みが必要になる。そのため既存実機で
+運用するには、U-Bootの最初期entry shimでも同じ正規化を行う互換回避策が
+必要になる。
+
+現在のU-Boot修正 c4392884685 はenable_caches()でMMUを停止しているため、
+実機を動かす修正としては有効だが、処理位置が遅い。既にrelocationまで
+Depthchargeのページテーブル上で実行している。最終的にはARM64 coreboot
+payloadの入口へ移すべきである。
+
+
+CMD-DBについて
+===============
+
+Qualcomm AOP Command DBは共有されたread-only領域であり、XPUによって
+write-protectされている。この領域をwrite-back cacheableとしてマップすると、
+clean cache-line evictionが物理的なwriteとしてXPUに検出され、secure
+interrupt、TrustZone内の停止、またはdevice crashを起こす可能性がある。
+
+Linuxでは2024年にMEMREMAP_WBからMEMREMAP_WCへ修正済みである。
+
+Linux commit f9bb896eab221618927ae6a2f1d566567999839d:
+https://github.com/torvalds/linux/commit/f9bb896eab221618927ae6a2f1d566567999839d
+
+corebootでもAOP CMD-DBをuncachedでマップする修正が2025年12月17日に
+mainへマージ済みである。
+
+coreboot change 90464:
+https://review.coreboot.org/c/coreboot/+/90464
+
+merged commit:
+a4cc17848609bdcc11c6112fd225bb74f84ba0c1
+
+しかしCoachZに搭載済みの古いChromeOS firmwareには、このcoreboot修正は
+入っていない。またU-Bootは最終的に自前のページテーブルを構築するため、
+coreboot側が修正済みでも、U-Boot自身がCMD-DBをnon-cacheableとして
+マップする必要がある。
+
+U-Boot側では、既存mmu_map_region()のAPIと挙動を維持したまま、属性指定版
+mmu_map_region_attrs()を追加し、Qualcomm CMD-DBだけを
+MT_NORMAL_NC | PTE_BLOCK_INNER_SHAREでマップする。
+
+関連コミット:
+
+  ff24fd41152  arm: add attribute-aware dynamic MMU mappings
+  d46011b54c9  soc: qcom: cmd-db: map shared memory as non-cacheable
+
+なお、実機で最初にmmu_map_region()内で停止した直接原因は、CMD-DBの
+cache属性ではなく、Depthchargeから継承したMMU/TTBR状態とU-Bootの前提の
+不一致だった。CMD-DBのWBマッピングは、それとは独立した潜在的かつ
+非決定的なクラッシュ要因である。
