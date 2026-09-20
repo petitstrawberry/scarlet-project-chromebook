@@ -564,6 +564,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             SdhciHostConfig {
                 single_power_write: true,
                 preserve_power_control: true,
+                ..SdhciHostConfig::default()
             },
         ),
         mmio_base,
