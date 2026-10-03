@@ -935,10 +935,9 @@ fn convert_upload_row(
             }
             Ok(converted)
         }
-        TextureFormat::Nv12
-        | TextureFormat::Bgra8UnormSrgb
-        | TextureFormat::Rgba8UnormSrgb
-        | TextureFormat::Depth32Float => Err(CompileError::UnsupportedFeature),
+        // Only the formats lowered above are supported. Fail closed when
+        // a consumer shares a newer SGFX IR with additional formats.
+        _ => Err(CompileError::UnsupportedFeature),
     }
 }
 
