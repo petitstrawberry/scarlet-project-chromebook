@@ -935,7 +935,8 @@ fn convert_upload_row(
             }
             Ok(converted)
         }
-        TextureFormat::Nv12
+        TextureFormat::Rg8Unorm
+        | TextureFormat::Nv12
         | TextureFormat::Bgra8UnormSrgb
         | TextureFormat::Rgba8UnormSrgb
         | TextureFormat::Depth32Float => Err(CompileError::UnsupportedFeature),

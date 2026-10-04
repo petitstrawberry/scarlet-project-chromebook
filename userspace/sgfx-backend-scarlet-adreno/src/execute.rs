@@ -773,7 +773,8 @@ fn append_image_resource(
                 ir::TextureFormat::Bgra8Unorm
                 | ir::TextureFormat::Rgba8Unorm
                 | ir::TextureFormat::R8Unorm => ir::TextureFormat::Bgra8Unorm,
-                ir::TextureFormat::Nv12
+                ir::TextureFormat::Rg8Unorm
+                | ir::TextureFormat::Nv12
                 | ir::TextureFormat::Bgra8UnormSrgb
                 | ir::TextureFormat::Rgba8UnormSrgb => {
                     return Err(IrSubmitError::Unsupported(
@@ -820,7 +821,8 @@ fn require_texture_upload_format(format: ir::TextureFormat) -> Result<(), IrSubm
         ir::TextureFormat::Bgra8Unorm
         | ir::TextureFormat::Rgba8Unorm
         | ir::TextureFormat::R8Unorm => Ok(()),
-        ir::TextureFormat::Nv12
+        ir::TextureFormat::Rg8Unorm
+        | ir::TextureFormat::Nv12
         | ir::TextureFormat::Bgra8UnormSrgb
         | ir::TextureFormat::Rgba8UnormSrgb
         | ir::TextureFormat::Depth32Float => Err(IrSubmitError::Unsupported(
