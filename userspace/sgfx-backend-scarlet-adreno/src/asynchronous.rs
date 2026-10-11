@@ -5,9 +5,8 @@ use gpu_raw::{GPU_ABI_VERSION, GPU_RESULT_SUCCESS, GpuQueue};
 use sgfx_codegen_adreno_a6xx as codegen;
 use sgfx_core::backend::SubmitError;
 
-use crate::completion::monotonic_time_ns;
 use crate::dispatch::Chunk;
-use crate::execute::{submit_trace_enabled, validate_fixed_command_subset};
+use crate::execute::validate_fixed_command_subset;
 use crate::preparation::{
     PreparedChunk, UPLOAD_ARENA_BYTES, prepare_chunk, split_async_operations,
     split_submission_operations,
@@ -91,8 +90,6 @@ impl ContextResources {
         queue: &Arc<GpuQueue>,
         commands: &ir::CommandBuffer<'r, 'data>,
     ) -> Result<Submission, SubmitError<IrSubmitError, Submission>> {
-        let trace = submit_trace_enabled();
-        let started = if trace { monotonic_time_ns() } else { 0 };
         validate_fixed_command_subset(commands).map_err(SubmitError::Rejected)?;
         if context.raw.as_handle().as_raw() != self.context_id() {
             return Err(SubmitError::Rejected(IrSubmitError::ContextMismatch));
@@ -117,7 +114,6 @@ impl ContextResources {
         let (prepared, external_bindings) = self
             .prepare_async(context, commands, limits.max_opaque_command_size as usize)
             .map_err(SubmitError::Rejected)?;
-        let prepared_at = if trace { monotonic_time_ns() } else { 0 };
         self.prepare_upload_arenas(&prepared)
             .map_err(SubmitError::Rejected)?;
         let mut chunks = Vec::new();
@@ -183,30 +179,6 @@ impl ContextResources {
                 _buffers: buffers,
             }),
         });
-        if trace {
-            use core::sync::atomic::{AtomicU64, Ordering};
-            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-            if sequence <= 8 || sequence % 64 == 0 {
-                std::println!(
-                    "[a618-async-prepare] seq={} ops={} chunks={} upload_bytes={} wire_bytes={} prepare_us={} encode_us={}",
-                    sequence,
-                    commands.commands().len(),
-                    chunks.len(),
-                    chunks
-                        .iter()
-                        .flat_map(|chunk| &chunk.uploads)
-                        .map(|(_, bytes)| bytes.len())
-                        .sum::<usize>(),
-                    chunks
-                        .iter()
-                        .map(|chunk| chunk.commands.len())
-                        .sum::<usize>(),
-                    prepared_at.saturating_sub(started) / 1_000,
-                    monotonic_time_ns().saturating_sub(prepared_at) / 1_000
-                );
-            }
-        }
         let dispatcher = &self.context.dispatcher;
         match dispatcher.enqueue(owner, chunks) {
             Ok(signal) => Ok(Submission::new(signal)),

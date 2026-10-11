@@ -1,7 +1,6 @@
 //! Full SGFX command normalization and A6xx queue submission.
 
 use alloc::{borrow::Cow, vec::Vec};
-use core::sync::atomic::{AtomicU8, Ordering};
 
 use gpu_raw::GpuImageBgraRect;
 use sgfx_codegen_adreno_a6xx as codegen;
@@ -24,49 +23,6 @@ const PIPELINE_OBJECT_BASE: u32 = 1 << 24;
 // negotiated ABI limit.
 #[cfg(test)]
 const MAX_DRAWS_PER_SUBMIT: usize = 512;
-
-pub(crate) fn submit_trace_enabled() -> bool {
-    static TRACE_CACHE: AtomicU8 = AtomicU8::new(u8::MAX);
-    let cached = TRACE_CACHE.load(Ordering::Relaxed);
-    if cached != u8::MAX {
-        return cached != 0;
-    }
-    #[cfg(feature = "std")]
-    let value = std::env::var("SGFX_ADRENO_TRACE").ok();
-    #[cfg(not(feature = "std"))]
-    let value = std::env::var("SGFX_ADRENO_TRACE");
-    let enabled = value.as_deref().is_some_and(|value| {
-        matches!(
-            value,
-            "1" | "true" | "TRUE" | "debug" | "DEBUG" | "trace" | "TRACE"
-        )
-    });
-    // A cdylib can own a private std environment map that was never populated
-    // by the executable CRT. This explicit per-device diagnostic switch also
-    // works for dynamically loaded drivers; it is read only once per process.
-    #[cfg(feature = "std")]
-    let enabled = enabled
-        || std::fs::read_to_string("/etc/sgfx-adreno-trace").is_ok_and(|value| value.trim() == "1");
-    TRACE_CACHE.store(enabled as u8, Ordering::Relaxed);
-    enabled
-}
-
-#[cfg(feature = "std")]
-fn monotonic_time_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u128::from(u64::MAX)) as u64
-}
-
-#[cfg(not(feature = "std"))]
-fn monotonic_time_ns() -> u64 {
-    // SAFETY: This fixed clock query has no arguments or userspace memory effects.
-    (unsafe { std::syscall::syscall0(std::syscall::Syscall::MonotonicTime) }) as u64
-}
 
 #[derive(Clone, Copy)]
 struct GeneratedProgress {
@@ -402,50 +358,20 @@ impl ContextResources {
         operations: &[codegen::Operation<'data>],
         external_bindings: &[BoundObject],
     ) -> Result<(), IrSubmitError> {
-        let trace = submit_trace_enabled();
-        let started = if trace { monotonic_time_ns() } else { 0 };
         let compiled = codegen::compile(codegen::CompileInput {
             capabilities: context.device.codegen_capabilities,
             resources,
             pipelines,
             operations,
         })?;
-        let compiled_at = if trace { monotonic_time_ns() } else { 0 };
         let mut bindings = Vec::new();
         bindings
             .try_reserve_exact(external_bindings.len())
             .map_err(|_| IrSubmitError::OutOfMemory)?;
         bindings.extend_from_slice(external_bindings);
         let progress = self.materialize_generated(&compiled, &mut bindings)?;
-        let materialized_at = if trace { monotonic_time_ns() } else { 0 };
         let payload = wire::encode(&compiled, &bindings)?;
-        let encoded_at = if trace { monotonic_time_ns() } else { 0 };
         let result = queue.submit(&payload);
-        let submitted_at = if trace { monotonic_time_ns() } else { 0 };
-        if trace {
-            let draws = operations
-                .iter()
-                .filter(|operation| {
-                    matches!(
-                        operation,
-                        codegen::Operation::Draw { .. } | codegen::Operation::DrawIndexed { .. }
-                    )
-                })
-                .count();
-            std::println!(
-                "[a618-userspace-path] ops={} draws={} wire={} words={} resources={} relocs={} compile_us={} materialize_us={} encode_us={} queue_us={}",
-                operations.len(),
-                draws,
-                payload.len(),
-                compiled.words.len(),
-                compiled.accesses.len(),
-                compiled.fixups.len(),
-                compiled_at.saturating_sub(started) / 1_000,
-                materialized_at.saturating_sub(compiled_at) / 1_000,
-                encoded_at.saturating_sub(materialized_at) / 1_000,
-                submitted_at.saturating_sub(encoded_at) / 1_000,
-            );
-        }
         if let Err(error) = result {
             if let Some(progress) = progress {
                 match self.read_scratch_u32(progress.offset) {

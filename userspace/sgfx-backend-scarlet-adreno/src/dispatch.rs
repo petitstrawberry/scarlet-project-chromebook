@@ -135,7 +135,6 @@ impl Event {
 pub(crate) struct Signal {
     result: Mutex<Option<Result<(), Failure>>>,
     event: Event,
-    trace_start: Option<(u64, u64)>,
 }
 
 impl Signal {
@@ -143,12 +142,6 @@ impl Signal {
         Ok(Self {
             result: Mutex::new(None),
             event: Event::new()?,
-            trace_start: if crate::execute::submit_trace_enabled() {
-                use core::sync::atomic::AtomicU64;
-                static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-                let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-                (sequence <= 8 || sequence % 64 == 0).then(|| (sequence, monotonic_time_ns()))
-            } else { None },
         })
     }
 
@@ -188,10 +181,10 @@ impl Signal {
     }
 
     fn complete(&self, result: Result<(), Failure>) {
-        if let Some((sequence, start)) = self.trace_start {
-            std::println!("[a618-async-retire] seq={} dispatch_retire_us={} result={:?}",
-                sequence, monotonic_time_ns().saturating_sub(start) / 1_000, result);
-        }
+        // The worker calls this while holding the scheduler lock. Publish the
+        // result and wake waiters without formatting or writing to a stream:
+        // stdout can block on a terminal, pipe or filesystem and would delay
+        // both completion observation and admission of the next frame.
         *lock(&self.result) = Some(result);
         self.event.notify();
     }
