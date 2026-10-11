@@ -1703,29 +1703,8 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
         && load_count(CP_LOAD_STATE6_FRAG, 12, 0) == 1
         && load_count(CP_LOAD_STATE6_FRAG, 4, 1) == usize::from(fixed.uses_sampler)
         && load_count(CP_LOAD_STATE6_FRAG, 4, 0) == usize::from(fixed.uses_sampler)
-        && if fixed.uses_sampler {
-            packets.iter().copied().any(|p| {
-                matches!(
-                    p.header,
-                    Header::Type7 {
-                        opcode: CP_MEM_WRITE,
-                        ..
-                    }
-                ) && p.payload.len() == 22
-                    && supported_sampler(&p.payload[18..], (p.payload[2] >> 16) & 15)
-            })
-        } else {
-            !packets.iter().copied().any(|p| {
-                matches!(
-                    p.header,
-                    Header::Type7 {
-                        opcode: CP_MEM_WRITE,
-                        ..
-                    }
-                ) && p.payload.len() == 22
-                    && supported_texture_descriptor(p.payload[2])
-            })
-        }
+        && (!fixed.uses_sampler
+            || (reg(SP_PS_SAMPLER_BASE).is_some() && reg(SP_PS_TEXMEMOBJ_BASE).is_some()))
 }
 
 /// Reject impossible pipeline candidates using state that the full matcher
@@ -2077,49 +2056,96 @@ fn validate_3d_sequences(
                 },
             )?;
         }
-        if let Some((descriptor_packet, descriptor)) =
-            segment.packets.iter().copied().find_map(|packet| {
-                matches!(
-                    packet.header,
-                    Header::Type7 {
-                        opcode: CP_MEM_WRITE,
-                        ..
-                    }
-                )
-                .then_some(packet)
-                .filter(|packet| {
-                    packet.payload.len() == 22 && supported_texture_descriptor(packet.payload[2])
-                })
-                .map(|packet| (packet.word_offset, packet.payload))
-            })
-        {
-            let width = descriptor[3] & 0x7fff;
-            let height = (descriptor[3] >> 15) & 0x7fff;
-            let row_pitch = (descriptor[4] >> 7) & 0x3f_ffff;
-            set_image_expectation(
-                addresses,
-                descriptor_packet + 7,
-                ImageExpectation {
-                    mip_levels: ((descriptor[2] >> 16) & 0xf) + 1,
-                    format: LinearImageFormat::Bgra8Unorm,
-                    modifier: if descriptor[2] & 3 == 3 {
-                        ImageModifier::Tile6_3Color
-                    } else {
-                        ImageModifier::Linear
-                    },
-                    row_pitch,
-                    width,
-                    height,
-                    exact_extent: true,
-                    pitch_align: Some(descriptor[4] & 0xf),
-                    array_pitch: Some(ArrayPitchExpectation {
-                        bytes: u64::from(descriptor[5] & 0x7f_ffff) << 12,
-                        alignment: 4096,
-                    }),
-                },
-            )?;
-        }
         segment_start = packet_index + 1;
+    }
+    Ok(())
+}
+
+/// Descriptor initialization can precede all render passes. Validate every
+/// descriptor's image extent and require each SP/indirect lookup to refer to
+/// a state range initialized earlier in this submit, not an arbitrary buffer.
+fn validate_texture_initialization(
+    decoded: DecodedSubmit<'_>,
+    packets: &[Packet<'_>],
+    addresses: &mut [AddressField],
+    relocations: &[Relocation],
+) -> Result<(), &'static str> {
+    let location = |word: u32, field_offset: u64| -> Result<(u64, u64), &'static str> {
+        let index = relocations.partition_point(|r| r.pm4_word_offset < word);
+        let relocation = relocations
+            .get(index)
+            .filter(|r| r.pm4_word_offset == word)
+            .ok_or("qcom-adreno-a618: texture state lacks relocation")?;
+        let RelocationSource::Attachment(index) = relocation.source else {
+            return Err("qcom-adreno-a618: texture state is not an attachment");
+        };
+        let resource = decoded
+            .resource(index as usize)
+            .ok_or("qcom-adreno-a618: texture state attachment is missing")?;
+        let offset = resource
+            .range_offset
+            .checked_add(relocation.resource_offset)
+            .and_then(|offset| offset.checked_sub(field_offset))
+            .ok_or("qcom-adreno-a618: invalid texture state offset")?;
+        Ok((resource.attachment_token, offset))
+    };
+    let mut initialized = alloc::collections::BTreeSet::new();
+    for packet in packets {
+        let lookup = match packet.header {
+            Header::Type7 {
+                opcode: CP_MEM_WRITE,
+                ..
+            } => {
+                let descriptor = packet.payload;
+                let width = descriptor[3] & 0x7fff;
+                let height = (descriptor[3] >> 15) & 0x7fff;
+                set_image_expectation(
+                    addresses,
+                    packet.word_offset + 7,
+                    ImageExpectation {
+                        mip_levels: ((descriptor[2] >> 16) & 0xf) + 1,
+                        format: LinearImageFormat::Bgra8Unorm,
+                        modifier: if descriptor[2] & 3 == 3 {
+                            ImageModifier::Tile6_3Color
+                        } else {
+                            ImageModifier::Linear
+                        },
+                        row_pitch: (descriptor[4] >> 7) & 0x3f_ffff,
+                        width,
+                        height,
+                        exact_extent: true,
+                        pitch_align: Some(descriptor[4] & 0xf),
+                        array_pitch: Some(ArrayPitchExpectation {
+                            bytes: u64::from(descriptor[5] & 0x7f_ffff) << 12,
+                            alignment: 4096,
+                        }),
+                    },
+                )?;
+                initialized.insert(location(packet.word_offset + 1, 0)?);
+                None
+            }
+            Header::Type4 {
+                register: SP_PS_TEXMEMOBJ_BASE,
+                ..
+            } => Some((packet.word_offset + 1, 0)),
+            Header::Type4 {
+                register: SP_PS_SAMPLER_BASE,
+                ..
+            } => Some((packet.word_offset + 1, 64)),
+            Header::Type7 {
+                opcode: CP_LOAD_STATE6_FRAG,
+                ..
+            } if packet.payload.len() == 3 && (packet.payload[0] >> 18) & 0xf == 4 => {
+                let sampler = (packet.payload[0] >> 14) & 3 == 0;
+                Some((packet.word_offset + 2, if sampler { 64 } else { 0 }))
+            }
+            _ => None,
+        };
+        if let Some((word, offset)) = lookup {
+            if !initialized.contains(&location(word, offset)?) {
+                return Err("qcom-adreno-a618: texture state lookup precedes initialization");
+            }
+        }
     }
     Ok(())
 }
@@ -2210,6 +2236,7 @@ fn validate_pm4(
     validate_ccu_transitions(&packets)?;
     validate_render_retirement(&packets)?;
     validate_a2d_sequences(&packets, &mut addresses)?;
+    validate_texture_initialization(decoded, &packets, &mut addresses, relocations)?;
     validate_3d_sequences(
         &packets,
         &mut addresses,
@@ -4398,7 +4425,7 @@ mod tests {
                 matches!(
                     p.header,
                     Header::Type7 {
-                        opcode: CP_MEM_WRITE,
+                        opcode: super::CP_MEM_WRITE,
                         ..
                     }
                 ) && p.payload.len() == 22
@@ -4494,10 +4521,182 @@ mod tests {
         // frame on CoachZ: quad upload, target clear, one sampled draw, and
         // CCU retirement. The trusted kernel ring appends the only general
         // cache-clean event. Atomic VS/FS program-layout bursts keep the
-        // validated userspace IB at 533 dwords, including the indirect sampler
+        // validated userspace IB at 532 dwords, including the indirect sampler
         // and texture-descriptor state backing required by A618.
-        assert_eq!(artifact.words.len(), 533);
+        assert_eq!(artifact.words.len(), 532);
         assert!(accept_codegen(&artifact).is_ok());
+    }
+
+    #[test]
+    fn alternating_texture_prologue_is_validated_before_state_lookup() {
+        const PIPELINE: PipelineId = PipelineId::new(11);
+        let resources = [
+            image(TARGET, TextureUsage::RENDER_ATTACHMENT),
+            image(SOURCE, TextureUsage::SAMPLED),
+            image(ALPHA, TextureUsage::SAMPLED),
+            ResourceMeta {
+                id: BUFFER,
+                size: 144,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                },
+            },
+        ];
+        let pipeline = PipelineMeta {
+            id: PIPELINE,
+            descriptor: RenderPipelineDesc::new(
+                TextureFormat::Bgra8Unorm,
+                PrimitiveTopology::TriangleList,
+                VertexBufferLayout::new(
+                    24,
+                    std::vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x2, 16),
+                    ],
+                )
+                .unwrap(),
+                FragmentProgram::Texture(TextureSampleMode::Rgba),
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        };
+        let vertices = [0_u8; 144];
+        let mut operations = std::vec![
+            Operation::WriteBuffer {
+                destination: BUFFER,
+                offset: 0,
+                data: &vertices,
+            },
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: PixelRect::new(0, 0, 16, 16).unwrap(),
+                load: LoadOp::Clear(Color::rgba(0.05, 0.1, 0.2, 1.0).unwrap()),
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            },
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetTexture(SOURCE),
+            Operation::SetSampler(SamplerDesc::new(
+                FilterMode::Linear,
+                FilterMode::Linear,
+                AddressMode::ClampToEdge,
+                AddressMode::ClampToEdge,
+            )),
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::SetScissor(None),
+            Operation::Draw {
+                vertex_count: 6,
+                first_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        operations.pop(); // EndRenderPass
+        for index in 0..32 {
+            operations.push(Operation::SetTexture(if index % 2 == 0 {
+                ALPHA
+            } else {
+                SOURCE
+            }));
+            operations.push(Operation::Draw {
+                vertex_count: 6,
+                first_vertex: 0,
+            });
+        }
+        operations.push(Operation::EndRenderPass);
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 64 * 1024),
+            resources: &resources,
+            pipelines: core::slice::from_ref(&pipeline),
+            operations: &operations,
+        })
+        .unwrap();
+
+        accept_codegen(&artifact).unwrap();
+        // Production packs generated states into one upload arena: distinct
+        // resource records may share a token but have different range offsets.
+        let bytes = wire_from_codegen(&artifact);
+        let decoded = adreno_a6xx_submit_wire::decode(&bytes).unwrap();
+        let resources: std::vec::Vec<_> = (0..decoded.resource_len()).map(|i| {
+            let mut resource = decoded.resource(i).unwrap();
+            if resource.attachment_token >= 0x1000 {
+                resource.range_offset += (resource.attachment_token - 0x1000) * 256;
+                resource.attachment_token = 0x1000;
+            }
+            resource
+        }).collect();
+        let relocations: std::vec::Vec<_> = (0..decoded.relocation_len())
+            .map(|i| decoded.relocation(i).unwrap()).collect();
+        let submit = Submit { pm4: &artifact.words, resources: &resources, relocations: &relocations };
+        let mut shared_arena = std::vec![0; encoded_len(submit).unwrap()];
+        encode(submit, &mut shared_arena).unwrap();
+        super::validate_pm4(adreno_a6xx_submit_wire::decode(&shared_arena).unwrap(), &relocations).unwrap();
+
+        let packets: std::vec::Vec<_> = Packets::new(&artifact.words).map(Result::unwrap).collect();
+        let descriptors: std::vec::Vec<_> = packets
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.header,
+                    Header::Type7 {
+                        opcode: super::CP_MEM_WRITE,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(descriptors.len(), 2);
+        let first_draw = packets
+            .iter()
+            .find(|p| {
+                matches!(
+                    p.header,
+                    Header::Type7 {
+                        opcode: super::CP_DRAW_INDX_OFFSET,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(
+            descriptors
+                .iter()
+                .all(|p| p.word_offset < first_draw.word_offset)
+        );
+        // Every descriptor in the prologue needs image validation, including
+        // the second one which used to reside in the second draw's segment.
+        let mut bad_layout = artifact.clone();
+        bad_layout.words[descriptors[1].word_offset as usize + 4] += 1;
+        assert!(accept_codegen(&bad_layout).is_err());
+        // A bounds-valid read inside the same state allocation is still not
+        // a descriptor initialized by the prologue.
+        let texture_base = packets
+            .iter()
+            .find(|p| {
+                matches!(
+                    p.header,
+                    Header::Type4 {
+                        register: super::SP_PS_TEXMEMOBJ_BASE,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let mut bad_lookup = artifact.clone();
+        let fixup = bad_lookup
+            .fixups
+            .iter_mut()
+            .find(|f| f.word_offset == texture_base.word_offset + 1)
+            .unwrap();
+        fixup.object_offset += 16;
+        assert!(accept_codegen(&bad_lookup).is_err());
     }
 
     #[test]

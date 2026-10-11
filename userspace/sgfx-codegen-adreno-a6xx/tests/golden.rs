@@ -1526,7 +1526,7 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
     .unwrap();
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.words.len(), 1_331);
+    assert_eq!(artifact.words.len(), 1_301);
     let packets = Packets::new(&artifact.words)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -1538,6 +1538,16 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
         })
         .collect::<Vec<_>>();
     assert_eq!(draws.len(), 4);
+    // Solid -> textured -> different fragment program must all remain
+    // pipelined, not merely adjacent draws with identical fixed state.
+    assert!(packets[draws[0] + 1..*draws.last().unwrap()].iter().all(|packet| {
+        !matches!(packet.header, Header::Type7 { opcode: opcode::WAIT_FOR_IDLE | 0x3d, .. })
+            && !matches!(packet.header, Header::Type7 { opcode: opcode::EVENT_WRITE, .. }
+                if packet.payload == [0x31])
+    }));
+    assert_eq!(artifact.generated_objects.iter()
+        .filter(|object| object.kind == GeneratedObjectKind::TextureState).count(), 1);
+
     assert!(
         packets[draws[0] + 1..draws[1]].iter().all(|packet| {
             !matches!(
@@ -1750,7 +1760,7 @@ fn coachz_cube_first_frame_uses_upstream_shader_program_bursts() {
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
-    assert_eq!(artifact.words.len(), 496);
+    assert_eq!(artifact.words.len(), 495);
     assert_eq!(artifact.generated_objects.len(), 2);
     let packets = Packets::new(&artifact.words)
         .collect::<Result<Vec<_>, _>>()
@@ -2154,4 +2164,122 @@ fn partial_texture_upload_preserves_padding_and_untouched_pixels() {
         }
         assert_eq!(actual, expected, "{format:?}");
     }
+}
+
+#[test]
+fn alternating_textures_initialize_once_before_draws_without_idle_barriers() {
+    let mut resources = resources();
+    resources.push(image(INDICES, TextureUsage::SAMPLED));
+    let pipeline = PipelineMeta {
+        id: PIPELINE,
+        descriptor: RenderPipelineDesc::new(
+            TextureFormat::Bgra8Unorm,
+            PrimitiveTopology::TriangleList,
+            VertexBufferLayout::new(
+                24,
+                vec![
+                    VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                    VertexAttribute::new(1, VertexFormat::Float32x2, 16),
+                ],
+            )
+            .unwrap(),
+            FragmentProgram::Texture(TextureSampleMode::Rgba),
+            BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+            RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        )
+        .unwrap(),
+    };
+    let mut operations = vec![
+        Operation::BeginRenderPass(RenderPass {
+            target: TARGET,
+            area: rect(0, 0, 16, 16),
+            load: LoadOp::Load,
+            store: StoreOp::Store,
+            depth: None,
+        }),
+        Operation::SetPipeline(PIPELINE),
+        Operation::SetVertexBuffer {
+            buffer: VERTICES,
+            offset: 0,
+        },
+        Operation::SetSampler(SamplerDesc::new(
+            FilterMode::Linear,
+            FilterMode::Linear,
+            AddressMode::ClampToEdge,
+            AddressMode::ClampToEdge,
+        )),
+        Operation::SetUniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(1.0, 1.0, 1.0, 0.5).unwrap(),
+        )),
+    ];
+    for i in 0..128 {
+        operations.push(Operation::SetTexture(if i % 2 == 0 {
+            SOURCE
+        } else {
+            INDICES
+        }));
+        operations.push(Operation::Draw {
+            vertex_count: 3,
+            first_vertex: 0,
+        });
+    }
+    operations.push(Operation::EndRenderPass);
+    let pipelines = [pipeline];
+    let artifact = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 64 * 1024),
+        resources: &resources,
+        pipelines: &pipelines,
+        operations: &operations,
+    })
+    .unwrap();
+    assert_well_formed(&artifact);
+    let packets = Packets::new(&artifact.words)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let draws: Vec<_> = packets
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| matches!(p.header, Header::Type7 { opcode: 0x38, .. }).then_some(i))
+        .collect();
+    assert_eq!(draws.len(), 128);
+    let initializations: Vec<_> = packets
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| matches!(p.header, Header::Type7 { opcode: 0x3d, .. }).then_some(i))
+        .collect();
+    assert_eq!(initializations.len(), 2);
+    assert!(initializations.iter().all(|i| *i < draws[0]));
+    assert!(
+        packets[draws[0] + 1..*draws.last().unwrap()]
+            .iter()
+            .all(|p| !matches!(
+                p.header,
+                Header::Type7 {
+                    opcode: opcode::WAIT_FOR_IDLE
+                        | opcode::WAIT_MEM_WRITES
+                        | opcode::EVENT_WRITE
+                        | 0x3d,
+                    ..
+                }
+            ))
+    );
+    assert_eq!(
+        artifact
+            .generated_objects
+            .iter()
+            .filter(|object| object.kind == GeneratedObjectKind::TextureState)
+            .count(),
+        2
+    );
+    // The prologue participates in the same command budget as the draws.
+    assert_eq!(
+        compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, artifact.words.len() as u32 - 1),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &operations,
+        }),
+        Err(CompileError::CommandBudgetExceeded)
+    );
 }

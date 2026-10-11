@@ -260,6 +260,9 @@ pub(crate) struct Surface {
 pub(crate) struct Emitter {
     words: Vec<u32>,
     fixups: Vec<SymbolicAddress>,
+    texture_words: Vec<u32>,
+    texture_fixups: Vec<SymbolicAddress>,
+    texture_states: Vec<(Surface, [u32; 4], GeneratedObjectId)>,
     accesses: Vec<ResourceAccess>,
     generated_objects: Vec<GeneratedObject>,
     ccu_sequence: Option<GeneratedObjectId>,
@@ -274,6 +277,9 @@ impl Emitter {
         Self {
             words: Vec::new(),
             fixups: Vec::new(),
+            texture_words: Vec::new(),
+            texture_fixups: Vec::new(),
+            texture_states: Vec::new(),
             accesses: Vec::new(),
             generated_objects: Vec::new(),
             ccu_sequence: None,
@@ -288,7 +294,8 @@ impl Emitter {
         if self
             .words
             .len()
-            .checked_add(additional)
+            .checked_add(self.texture_words.len())
+            .and_then(|length| length.checked_add(additional))
             .is_none_or(|length| length > self.max_words)
         {
             return Err(CompileError::CommandBudgetExceeded);
@@ -518,33 +525,45 @@ impl Emitter {
         texture: Surface,
         sampler: [u32; 4],
     ) -> Result<GeneratedObjectId, CompileError> {
-        // Sampler pre-dispatch dereferences the SP base registers even when
-        // CP_LOAD_STATE6 also receives direct state.  Materialize the exact
-        // Mesa layout (16 descriptor dwords followed by four sampler dwords)
-        // in a 64-byte aligned GPU-visible object.  The texture IOVA remains a
-        // kernel relocation inside CP_MEM_WRITE data; userspace never learns
-        // or forges the final GPU address.
-        let state = self.add_generated(
-            &[0; 80],
-            64,
-            Access::READ | Access::WRITE,
-            GeneratedObjectKind::TextureState,
-        )?;
-        let descriptor = Self::texture_descriptor_prefix(texture)?;
-        self.push_word(type7(CP_MEM_WRITE, 22).map_err(|_| CompileError::InvalidPm4)?)?;
-        self.address_words(ObjectRef::Generated(state), 0, 80, Access::WRITE)?;
-        self.extend_words(&descriptor)?;
-        self.texture_descriptor_address(texture)?;
-        self.extend_words(&[0; 10])?;
-        self.extend_words(&sampler)?;
-        self.packet7(opcode::WAIT_MEM_WRITES, &[])?;
-        // The descriptor and sampler are consumed indirectly through the SP
-        // base registers below.  WAIT_MEM_WRITES orders the CP store itself,
-        // but it does not make an earlier cached state-block lookup observe
-        // the newly written backing object.  Invalidate that cache before the
-        // indirect CP_LOAD_STATE6 packets dereference it.
-        self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])?;
-        self.wait_for_idle()?;
+        let state = if let Some((_, _, state)) =
+            self.texture_states
+                .iter()
+                .find(|(previous_texture, previous_sampler, _)| {
+                    *previous_texture == texture && *previous_sampler == sampler
+                }) {
+            *state
+        } else {
+            let state = self.add_generated(
+                &[0; 80],
+                64,
+                Access::READ | Access::WRITE,
+                GeneratedObjectKind::TextureState,
+            )?;
+            // Every descriptor owns a disjoint, immutable generated range.
+            // Initialize them in a submit prologue, before any draw can read
+            // them, rather than draining the GPU at every texture switch.
+            // Addresses remain kernel-relocated CP_MEM_WRITE payloads.
+            core::mem::swap(&mut self.words, &mut self.texture_words);
+            core::mem::swap(&mut self.fixups, &mut self.texture_fixups);
+            let initialized = (|| {
+                let descriptor = Self::texture_descriptor_prefix(texture)?;
+                self.push_word(type7(CP_MEM_WRITE, 22).map_err(|_| CompileError::InvalidPm4)?)?;
+                self.address_words(ObjectRef::Generated(state), 0, 80, Access::WRITE)?;
+                self.extend_words(&descriptor)?;
+                self.texture_descriptor_address(texture)?;
+                self.extend_words(&[0; 10])?;
+                self.extend_words(&sampler)?;
+                self.packet7(opcode::WAIT_MEM_WRITES, &[])
+            })();
+            core::mem::swap(&mut self.words, &mut self.texture_words);
+            core::mem::swap(&mut self.fixups, &mut self.texture_fixups);
+            initialized?;
+            self.texture_states
+                .try_reserve(1)
+                .map_err(|_| CompileError::OutOfMemory)?;
+            self.texture_states.push((texture, sampler, state));
+            state
+        };
         self.address_register(
             SP_PS_SAMPLER_BASE,
             ObjectRef::Generated(state),
@@ -779,7 +798,8 @@ impl Emitter {
                 64,
             )?;
         }
-        self.wait_for_idle()?;
+        // Draw state is consumed in command order. Descriptor writes and
+        // their cache barrier already precede all draws in the prologue.
         match draw.draw {
             DrawCall::NonIndexed { vertex_count, .. } => {
                 self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, vertex_count])?;
@@ -1560,9 +1580,32 @@ impl Emitter {
         Ok(id)
     }
 
-    pub(crate) fn finish(self) -> Result<RelocatablePm4, CompileError> {
+    pub(crate) fn finish(mut self) -> Result<RelocatablePm4, CompileError> {
         if self.draw_batch_active {
             return Err(CompileError::InvalidState);
+        }
+        if !self.texture_words.is_empty() {
+            core::mem::swap(&mut self.words, &mut self.texture_words);
+            core::mem::swap(&mut self.fixups, &mut self.texture_fixups);
+            // CP stores are ordered individually; invalidate descriptor cache
+            // once before the first SP base lookup, including reused arenas.
+            self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])?;
+            self.wait_for_idle()?;
+            let prefix = u32::try_from(self.words.len()).map_err(|_| CompileError::Overflow)?;
+            self.words
+                .try_reserve(self.texture_words.len())
+                .map_err(|_| CompileError::OutOfMemory)?;
+            self.words.append(&mut self.texture_words);
+            self.fixups
+                .try_reserve(self.texture_fixups.len())
+                .map_err(|_| CompileError::OutOfMemory)?;
+            for mut fixup in self.texture_fixups.drain(..) {
+                fixup.word_offset = fixup
+                    .word_offset
+                    .checked_add(prefix)
+                    .ok_or(CompileError::Overflow)?;
+                self.fixups.push(fixup);
+            }
         }
         let mut previous_end = None;
         for fixup in &self.fixups {
@@ -1574,9 +1617,7 @@ impl Emitter {
             if previous_end.is_some_and(|offset| offset > start) {
                 return Err(CompileError::InvalidPm4);
             }
-            if end > self.words.len()
-                || !fixup.encoding.placeholder_is_valid(&self.words[start..end])
-            {
+            if end > self.words.len() || !fixup.encoding.placeholder_is_valid(&self.words[start..end]) {
                 return Err(CompileError::InvalidPm4);
             }
             previous_end = Some(end);
@@ -1686,6 +1727,9 @@ mod tests {
                     encoding: AddressEncoding::GpuVa64,
                 },
             ],
+            texture_words: vec![],
+            texture_fixups: vec![],
+            texture_states: vec![],
             accesses: vec![],
             generated_objects: vec![],
             ccu_sequence: None,
