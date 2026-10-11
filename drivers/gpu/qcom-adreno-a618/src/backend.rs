@@ -963,6 +963,19 @@ impl A618Core {
         registers.write64(UCHE_GMEM_RANGE_MAX, GMEM_BASE + GMEM_SIZE - 1);
         registers.write(UCHE_FILTER_CNTL, 0x804);
         registers.write(UCHE_CACHE_WAYS, 4);
+        // Establish one memory-layout configuration across RB, texture fetch,
+        // SP and UCHE instead of inheriting reset/firmware values. Linux v6.12
+        // a6xx_calc_ubwc_config()/a6xx_set_ubwc_config() select highest bank bit
+        // 14 for A618, encoded relative to 13. The remaining A618 fields are
+        // 32-byte minimum access, swizzle 0x6 and macrotile mode 0. These global
+        // settings do not enable UBWC on our uncompressed image attachments.
+        // https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/msm/adreno/a6xx_gpu.c#L465
+        const A618_BANK_BIT: u32 = 14 - 13;
+        registers.write(RB_NC_MODE_CNTL, A618_BANK_BIT << 1);
+        registers.write(TPL1_NC_MODE_CNTL, A618_BANK_BIT << 1);
+        registers.write(SP_NC_MODE_CNTL, A618_BANK_BIT << 1);
+        registers.write(UCHE_MODE_CNTL, A618_BANK_BIT << 21);
+        registers.write(RBBM_NC_MODE_CNTL, 0);
         registers.write(CP_ROQ_THRESHOLDS_2, 0x0100_00c0);
         registers.write(CP_ROQ_THRESHOLDS_1, 0x8040_362c);
         registers.write(CP_MEM_POOL_SIZE, 128);
@@ -991,6 +1004,14 @@ impl A618Core {
             registers.read64(UCHE_TRAP_BASE),
             registers.read64(UCHE_WRITE_THRU_BASE),
             registers.read(UCHE_CLIENT_PF),
+        );
+        println!(
+            "[qcom-adreno-a618] memory-layout rb={:#x} tpl1={:#x} sp={:#x} uche={:#x} rbbm={:#x}",
+            registers.read(RB_NC_MODE_CNTL),
+            registers.read(TPL1_NC_MODE_CNTL),
+            registers.read(SP_NC_MODE_CNTL),
+            registers.read(UCHE_MODE_CNTL),
+            registers.read(RBBM_NC_MODE_CNTL),
         );
     }
 
