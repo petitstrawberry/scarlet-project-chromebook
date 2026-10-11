@@ -589,6 +589,11 @@ fn image_create_parameters(descriptor: ir::TextureDesc) -> HandleResult<(u32, u3
         {
             usage |= GPU_IMAGE_USAGE_SAMPLED;
         }
+        // Preserve transfer intent for the kernel's layout planner. A sampled
+        // render target alone may be tiled; a copy/readback source stays linear.
+        if descriptor.usage().contains(ir::TextureUsage::COPY_SRC) {
+            usage |= GPU_IMAGE_USAGE_TRANSFER_SRC;
+        }
         if descriptor.usage().contains(ir::TextureUsage::COPY_DST) {
             usage |= GPU_IMAGE_USAGE_TRANSFER_DST;
         }
@@ -732,6 +737,15 @@ mod tests {
             validate_image_layout(&layout, 16, 16, ir::TextureFormat::Depth32Float),
             Ok(())
         );
+    }
+
+    #[test]
+    fn copy_source_usage_is_preserved_for_layout_selection() {
+        let desc = ir::TextureDesc::new(ir::TextureFormat::Bgra8Unorm,
+            ir::Extent2D::new(64, 64).unwrap(),
+            ir::TextureUsage::RENDER_ATTACHMENT | ir::TextureUsage::SAMPLED | ir::TextureUsage::COPY_SRC).unwrap();
+        let (_, usage) = super::image_create_parameters(desc).unwrap();
+        assert_ne!(usage & gpu_raw::GPU_IMAGE_USAGE_TRANSFER_SRC, 0);
     }
 
     #[test]
