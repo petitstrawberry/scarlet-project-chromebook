@@ -5,7 +5,7 @@ hash = "sha256:140dceb6c4a293a790a3276278370cf99bf2fc4e40bcba74c46af8df1ef07530"
 layers = []
 
 [sections.disk]
-hash = "sha256:911a8a0576f6a98b4c265b5fdfaf13cad8c3714d16591e13fd2c38cc8ccd0d2e"
+hash = "sha256:e2c60f15768bf43dd666b7f8279ef35b46f9cbd12a494a06f81e96ffc50d2a0a"
 layers = []
 
 [sections.initramfs]
@@ -407,7 +407,7 @@ type = "path"
 path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [sections.rootfs]
-hash = "sha256:89586ff727e0d13c87bdff9f00e8ba730156ef489e45104b26396ab7340d3742"
+hash = "sha256:951dc5b83bbf85a355a6d91dd8dd7bdcb8186b4a812a523df6e2b6dc3db06028"
 
 [[sections.rootfs.layers]]
 kind = "script"
@@ -955,7 +955,7 @@ rev = "a087a445b8f4e2bd291c2533cb6e52ea6a0c2102"
 kind = "cargo"
 bin = "ui-sgfx-showcase"
 to = "/bin/ui-sgfx-showcase"
-hash = "sha256:00c87105f9826712142c3763e9b570ebdf96fd4131b0edcbfba0d97b980a87df"
+hash = "sha256:311f975605fb3f84f4f3f233cbc1590773bd94037beef052fd5f3d31e1c755b2"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1491,7 +1491,7 @@ path = ".scarlet/cache/git/1d707eff8bef4cad/bundle/build-aarch64.sh"
 [[sections.rootfs.layers]]
 kind = "script"
 to = "/"
-hash = "sha256:d1a33998a948edabd2857c37e12e468694703d57bb0656645e3e0ad5348ac220"
+hash = "sha256:d423f279635d4f13baffc61bd2202b93e1619eb526268348ef0ccac0381e2c35"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1514,7 +1514,7 @@ kind = "cargo"
 package = "sgfx-backend-scarlet-adreno-plugin"
 lib = "sgfx_scarlet_adreno"
 to = "/lib/sgfx/libsgfx_scarlet_adreno.so"
-hash = "sha256:dbb76dd6c4429df2546da88d486619cdc3c087015402702edf1bcda67dce2fe4"
+hash = "sha256:b5513f95b7831e0adcc83e7dd409b6de8152df71dacc601006af01da0bf4f30a"
 
 [sections.rootfs.layers.source]
 type = "path"
