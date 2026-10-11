@@ -62,17 +62,17 @@ output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3ca2258acac0ab9b25deb1b87a5f5405eb561338" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d95680e611c7e2d73510f8138a9b10086fe74ed7" }
 subdir = "bundles/sgfx-native"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3ca2258acac0ab9b25deb1b87a5f5405eb561338" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d95680e611c7e2d73510f8138a9b10086fe74ed7" }
 subdir = "bundles/base"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3ca2258acac0ab9b25deb1b87a5f5405eb561338" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d95680e611c7e2d73510f8138a9b10086fe74ed7" }
 subdir = "bundles/cli-utils"
 
 # Kernel drivers use the global VFS, whose root remains the initramfs after
@@ -89,7 +89,7 @@ output = ".scarlet/images/rootfs-aarch64-coachz-full.ext2"
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3ca2258acac0ab9b25deb1b87a5f5405eb561338" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d95680e611c7e2d73510f8138a9b10086fe74ed7" }
 subdir = "bundles/full"
 
 [[images.rootfs.layers]]
