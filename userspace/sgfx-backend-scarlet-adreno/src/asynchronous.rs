@@ -197,8 +197,13 @@ impl ContextResources {
                     });
                 }
                 ir::Command::WriteTexture { texture, write } => {
-                    let destination =
-                        self.ensure_image(*texture, &mut resources, &mut external_bindings)?;
+                    let destination = self.ensure_image_subresource(
+                        *texture,
+                        write.mip_level(),
+                        write.array_layer(),
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
                     operations.push(codegen::Operation::WriteTexture {
                         destination,
                         area: write.destination(),
@@ -206,16 +211,63 @@ impl ContextResources {
                         data: write.data(),
                     });
                 }
+                ir::Command::BlitTexture {
+                    source,
+                    source_mip,
+                    destination,
+                    destination_mip,
+                    source_rect,
+                    destination_rect,
+                    filter,
+                    flips,
+                } => {
+                    let source = self.ensure_image_subresource(
+                        *source,
+                        *source_mip,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
+                    let destination = self.ensure_image_subresource(
+                        *destination,
+                        *destination_mip,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
+                    operations.push(codegen::Operation::BlitTexture {
+                        source,
+                        destination,
+                        source_rect: *source_rect,
+                        destination_rect: *destination_rect,
+                        filter: *filter,
+                        flips: *flips,
+                    });
+                }
+                // Each transfer and render pass retires its CCUs and the next
+                // begins by invalidating them. The ordered queue therefore
+                // already enforces the explicit IR dependency.
+                ir::Command::ResourceBarrier(_) => {}
                 ir::Command::CopyTextureToTexture {
                     source,
                     source_rect,
                     destination,
                     destination_rect,
                 } => {
-                    let source =
-                        self.ensure_image(*source, &mut resources, &mut external_bindings)?;
-                    let destination =
-                        self.ensure_image(*destination, &mut resources, &mut external_bindings)?;
+                    let source = self.ensure_image_subresource(
+                        *source,
+                        0,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
+                    let destination = self.ensure_image_subresource(
+                        *destination,
+                        0,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
                     operations.push(codegen::Operation::CopyTextureToTexture {
                         source,
                         source_rect: *source_rect,
@@ -224,8 +276,13 @@ impl ContextResources {
                     });
                 }
                 ir::Command::BeginRenderPass(pass) => {
-                    let target =
-                        self.ensure_image(pass.target(), &mut resources, &mut external_bindings)?;
+                    let target = self.ensure_image_subresource(
+                        pass.target(),
+                        0,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
                     let depth = if let Some(depth) = pass.depth_attachment() {
                         Some(codegen::DepthAttachment {
                             target: self.ensure_image(

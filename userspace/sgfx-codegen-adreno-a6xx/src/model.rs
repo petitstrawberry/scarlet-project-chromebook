@@ -113,6 +113,8 @@ pub struct PlaneLayout {
 /// Image metadata selected before compilation by the concrete backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageMeta {
+    /// Canonical layer-first storage for mipmapped or layered color images.
+    pub texture: Option<adreno_a6xx_layout::LinearTextureLayout>,
     /// Portable SGFX pixel format visible to shaders and upload commands.
     pub format: TextureFormat,
     /// Format of the materialized linear allocation.
@@ -226,6 +228,15 @@ pub enum Operation<'data> {
         destination: ObjectId,
         /// Destination rectangle.
         destination_rect: PixelRect,
+    },
+    /// Scale a rectangle between canonical mip/layer views on the GPU.
+    BlitTexture {
+        source: ObjectId,
+        source_rect: PixelRect,
+        destination: ObjectId,
+        destination_rect: PixelRect,
+        filter: sgfx_core::ir::FilterMode,
+        flips: [bool; 2],
     },
     /// Begin a render pass.
     BeginRenderPass(RenderPass),

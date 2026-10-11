@@ -221,6 +221,7 @@ pub(crate) fn split_async_operations<'data>(
             codegen::Operation::WriteBuffer { .. }
                 | codegen::Operation::WriteTexture { .. }
                 | codegen::Operation::CopyTextureToTexture { .. }
+                | codegen::Operation::BlitTexture { .. }
         ) {
             let preceding = split_submission_operations(&graphics, 512)?;
             chunks
@@ -390,6 +391,7 @@ mod tests {
             id,
             size,
             kind: ResourceKind::Image(ImageMeta {
+                texture: None,
                 format,
                 storage_format: TextureFormat::Bgra8Unorm,
                 extent: Extent2D::new(width, height).unwrap(),

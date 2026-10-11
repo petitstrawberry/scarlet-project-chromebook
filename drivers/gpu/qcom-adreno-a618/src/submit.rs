@@ -6,8 +6,7 @@ use alloc::vec::Vec;
 
 use adreno_a6xx_pm4::{Header, Packet, Packets, opcode};
 use adreno_a6xx_shader_pack::{
-    PipelineVariant, SAMPLER_CLAMP_LINEAR, SAMPLER_CLAMP_NEAREST, ShaderMeta, ShaderVariant,
-    link_meta, pipeline_state_meta, shader_meta,
+    PipelineVariant, ShaderMeta, ShaderVariant, link_meta, pipeline_state_meta, shader_meta,
 };
 use adreno_a6xx_submit_wire::{
     ACCESS_READ, ACCESS_WRITE, AddressEncoding, DecodedSubmit, Relocation, RelocationSource,
@@ -189,9 +188,24 @@ const SP_PS_CONST_CONFIG: u32 = 0xbb10;
 
 fn supported_texture_descriptor(word: u32) -> bool {
     matches!(
-        word,
+        word & !0x000f_0000,
         TEX_DESCRIPTOR_BGRA_IDENTITY | TEX_DESCRIPTOR_ALPHA_MASK
     )
+}
+
+fn supported_sampler(words: &[u32], last_mip: u32) -> bool {
+    if words.len() != 4 {
+        return false;
+    }
+    let base = words[0] & !1;
+    let min_lod = words[1] >> 20;
+    let max_lod = (words[1] >> 8) & 0xfff;
+    matches!(base, 0x920 | 0x92a)
+        && words[1] & 0xff == if max_lod == 0 { 0x40 } else { 0 }
+        && min_lod <= max_lod
+        && max_lod <= last_mip * 256
+        && words[3] == 0
+        && words[2] == if base == 0x92a { 0x20 } else { 0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +258,7 @@ struct A2dExpectation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImageExpectation {
+    mip_levels: u32,
     format: LinearImageFormat,
     modifier: ImageModifier,
     row_pitch: u32,
@@ -274,6 +289,7 @@ pub(crate) enum ImageModifier {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinearImage {
+    pub(crate) texture: Option<adreno_a6xx_layout::LinearTextureLayout>,
     pub(crate) format: LinearImageFormat,
     pub(crate) modifier: ImageModifier,
     pub(crate) width: u32,
@@ -328,7 +344,10 @@ fn a2d_control_format(value: u32) -> Option<LinearImageFormat> {
     let common = (0xf << 20) | (1 << 16);
     let color = (FORMAT_8_8_8_8_UNORM << 8) | common;
     let depth = (A2D_IFMT_FLOAT32 << 24) | (FORMAT_32_FLOAT << 8) | common | (1 << 7);
-    match value {
+    if !matches!(value & 7, 0 | 2 | 4 | 5) {
+        return None;
+    }
+    match value & !7 {
         value if value == color || value == color | (1 << 7) => Some(LinearImageFormat::Bgra8Unorm),
         value if value == depth => Some(LinearImageFormat::Depth32Float),
         _ => None,
@@ -498,10 +517,12 @@ fn validate_type4(
         (GRAS_A2D_SRC_XMIN, 4) if payload.iter().all(|value| value & 0xff == 0) => Ok(()),
         (GRAS_A2D_DEST_TL, 2) | (GRAS_A2D_SCISSOR_TL, 2) => Ok(()),
         (SP_A2D_OUTPUT_INFO, 1) if a2d_output_format(payload[0]).is_some() => Ok(()),
-        (TPL1_A2D_SRC_TEXTURE_INFO, 1) => exact(
-            payload,
-            &[FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ | (1 << 20) | (1 << 22)],
-        ),
+        (TPL1_A2D_SRC_TEXTURE_INFO, 1)
+            if payload[0] & !(1 << 16)
+                == FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ | (1 << 20) | (1 << 22) =>
+        {
+            Ok(())
+        }
         (TPL1_A2D_SRC_TEXTURE_SIZE, 1) if payload[0] != 0 && payload[0] & 0xc000_0000 == 0 => {
             Ok(())
         }
@@ -741,7 +762,7 @@ fn validate_type7(
                 && payload[5] & !0x007f_ffff == 0
                 && payload[7] == (1 << 17)
                 && payload[8..18] == [0; 10]
-                && matches!(&payload[18..], [0x920, 0x40, 0, 0] | [0x92a, 0x40, 0x20, 0]) =>
+                && supported_sampler(&payload[18..], (payload[2] >> 16) & 15) =>
         {
             address_field(addresses, packet_word + 1, ACCESS_WRITE, false, Some(80))?;
             address_field_encoded(
@@ -1677,8 +1698,7 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
                         ..
                     }
                 ) && p.payload.len() == 22
-                    && (p.payload[18..] == SAMPLER_CLAMP_NEAREST
-                        || p.payload[18..] == SAMPLER_CLAMP_LINEAR)
+                    && supported_sampler(&p.payload[18..], (p.payload[2] >> 16) & 15)
             })
         } else {
             !packets.iter().copied().any(|p| {
@@ -1886,6 +1906,7 @@ fn validate_3d_sequences(
                 addresses,
                 base_packet + 1,
                 ImageExpectation {
+                    mip_levels: 1,
                     format: LinearImageFormat::Bgra8Unorm,
                     modifier: ImageModifier::Linear,
                     row_pitch,
@@ -1930,6 +1951,7 @@ fn validate_3d_sequences(
                     addresses,
                     depth_packet + 4,
                     ImageExpectation {
+                        mip_levels: 1,
                         format: LinearImageFormat::Depth32Float,
                         modifier: ImageModifier::Tile6_3Depth,
                         row_pitch,
@@ -2016,6 +2038,7 @@ fn validate_3d_sequences(
                 addresses,
                 descriptor_packet + 8,
                 ImageExpectation {
+                    mip_levels: ((descriptor[2] >> 16) & 0xf) + 1,
                     format: LinearImageFormat::Bgra8Unorm,
                     modifier: ImageModifier::Linear,
                     row_pitch,
@@ -2053,6 +2076,7 @@ fn validate_3d_sequences(
                 addresses,
                 descriptor_packet + 7,
                 ImageExpectation {
+                    mip_levels: ((descriptor[2] >> 16) & 0xf) + 1,
                     format: LinearImageFormat::Bgra8Unorm,
                     modifier: ImageModifier::Linear,
                     row_pitch,
@@ -2218,6 +2242,9 @@ fn relocate_one(
 }
 
 fn image_footprint(image: LinearImage) -> Option<u64> {
+    if let Some(texture) = image.texture {
+        return Some(texture.total_size);
+    }
     match (image.format, image.modifier) {
         (LinearImageFormat::Bgra8Unorm, ImageModifier::Linear) => {
             u64::from(image.row_pitch).checked_mul(u64::from(image.height))
@@ -2228,6 +2255,45 @@ fn image_footprint(image: LinearImage) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Resolve only complete canonical subresources; a byte slice cannot invent
+/// dimensions or expose padding as a render target.
+fn image_range(image: LinearImage, offset: u64, size: u64) -> Option<LinearImage> {
+    if offset == 0 && size == image.visible_size {
+        return Some(image);
+    }
+    if image.format == LinearImageFormat::Depth32Float {
+        let layer_size = image_footprint(image)?;
+        if size == layer_size
+            && offset % layer_size == 0
+            && offset.checked_add(size)? <= image.visible_size
+        {
+            return Some(LinearImage {
+                visible_size: size,
+                ..image
+            });
+        }
+        return None;
+    }
+    let texture = image.texture?;
+    let layer = u32::try_from(offset / u64::from(texture.layer_stride)).ok()?;
+    if layer < texture.array_layers {
+        for level in 0..texture.mip_levels {
+            let sub = texture.subresource(level, layer)?;
+            if sub.offset == offset && sub.size == size {
+                return Some(LinearImage {
+                    texture: None,
+                    width: sub.width,
+                    height: sub.height,
+                    row_pitch: sub.row_pitch,
+                    visible_size: sub.size,
+                    ..image
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Decode, authorize, validate, and relocate into a kernel-owned dword vector.
@@ -2269,9 +2335,9 @@ pub(crate) fn validate_and_relocate(
             // the attached object's actual authority. Relocations must be a subset
             // of both layers.
             allowed_access: wire.access,
-            linear_image: resolved.linear_image.and_then(|image| {
-                (wire.range_offset == 0 && wire.range_size == image.visible_size).then_some(image)
-            }),
+            linear_image: resolved
+                .linear_image
+                .and_then(|image| image_range(image, wire.range_offset, wire.range_size)),
         });
     }
     let mut relocations = Vec::new();
@@ -2307,6 +2373,9 @@ pub(crate) fn validate_and_relocate(
         if address.requires_complete_linear_image {
             let image = resource
                 .linear_image
+                .and_then(|image| {
+                    image_range(image, relocation.resource_offset, relocation.required_size)
+                })
                 .ok_or("qcom-adreno-a618: A2D address must cover one complete linear image")?;
             let row_bytes = image
                 .width
@@ -2318,7 +2387,6 @@ pub(crate) fn validate_and_relocate(
                 || image.height == 0
                 || image.row_pitch < row_bytes
                 || layout_size != image.visible_size
-                || relocation.resource_offset != 0
                 || relocation.required_size != image.visible_size
             {
                 return Err("qcom-adreno-a618: A2D relocation does not match image layout");
@@ -2353,6 +2421,9 @@ pub(crate) fn validate_and_relocate(
         if let Some(expectation) = address.image {
             let image = resource
                 .linear_image
+                .and_then(|image| {
+                    image_range(image, relocation.resource_offset, relocation.required_size)
+                })
                 .ok_or("qcom-adreno-a618: 3D image address must cover one complete linear image")?;
             let layout_size = image_footprint(image)
                 .ok_or("qcom-adreno-a618: 3D image layout is not supported")?;
@@ -2364,8 +2435,8 @@ pub(crate) fn validate_and_relocate(
                         .checked_mul(4)
                         .ok_or("qcom-adreno-a618: 3D row size overflows")?
                 || layout_size != image.visible_size
-                || relocation.resource_offset != 0
                 || relocation.required_size != image.visible_size
+                || expectation.mip_levels != image.texture.map_or(1, |t| t.mip_levels)
                 || expectation.format != image.format
                 || expectation.modifier != image.modifier
                 || expectation.row_pitch != image.row_pitch
@@ -2381,8 +2452,7 @@ pub(crate) fn validate_and_relocate(
                 // larger power-of-two factor in the actual row pitch.
                 || expectation.pitch_align.is_some_and(|align| align != 0)
                 || expectation.array_pitch.is_some_and(|pitch| {
-                    image
-                        .visible_size
+                    image.texture.map_or(image.visible_size, |t| u64::from(t.layer_stride))
                         .checked_add(pitch.alignment - 1)
                         .map(|size| size & !(pitch.alignment - 1))
                         != Some(pitch.bytes)
@@ -2426,6 +2496,251 @@ mod tests {
         ResolvedResource, ShaderStage, address_source_matches, diagnose_rejected_packet,
         relocate_one, validate_and_relocate, validate_type7,
     };
+
+    #[test]
+    fn mip_and_cube_layer_views_are_bounded_by_canonical_storage() {
+        let texture = adreno_a6xx_layout::LinearTextureLayout::new(64, 64, 7, 6).unwrap();
+        let image = LinearImage {
+            texture: Some(texture),
+            format: LinearImageFormat::Bgra8Unorm,
+            modifier: KernelImageModifier::Linear,
+            width: 64,
+            height: 64,
+            row_pitch: texture.row_pitch,
+            visible_size: texture.total_size,
+        };
+        for layer in 0..6 {
+            for level in 0..7 {
+                let sub = texture.subresource(level, layer).unwrap();
+                let view = super::image_range(image, sub.offset, sub.size).unwrap();
+                assert_eq!(
+                    (view.width, view.height, view.row_pitch),
+                    (sub.width, sub.height, sub.row_pitch)
+                );
+                assert!(super::image_range(image, sub.offset + 4, sub.size).is_none());
+                assert!(super::image_range(image, sub.offset, sub.size + 4).is_none());
+            }
+        }
+        assert!(super::image_range(image, texture.total_size, 64).is_none());
+    }
+
+    #[test]
+    fn depth_array_views_retain_whole_tiled_layers_only() {
+        let layout = adreno_a6xx_layout::depth32_tile6_3_layout(65, 17).unwrap();
+        let image = LinearImage {
+            texture: None,
+            format: LinearImageFormat::Depth32Float,
+            modifier: KernelImageModifier::Tile6_3Depth,
+            width: 65,
+            height: 17,
+            row_pitch: layout.row_pitch,
+            visible_size: layout.layer_size * 6,
+        };
+        for layer in 0..6 {
+            let offset = layout.layer_size * layer;
+            let view = super::image_range(image, offset, layout.layer_size).unwrap();
+            assert_eq!(super::image_footprint(view), Some(view.visible_size));
+            assert!(super::image_range(image, offset + 64, layout.layer_size).is_none());
+            assert!(super::image_range(image, offset, layout.layer_size - 64).is_none());
+        }
+        assert!(super::image_range(image, image.visible_size, layout.layer_size).is_none());
+    }
+
+    #[test]
+    fn gpu_filtered_blits_and_flips_pass_kernel_validation() {
+        let resources = [
+            image(SOURCE, TextureUsage::COPY_SRC),
+            image(TARGET, TextureUsage::COPY_DST),
+        ];
+        for filter in [FilterMode::Nearest, FilterMode::Linear] {
+            for flips in [[false, false], [true, false], [false, true], [true, true]] {
+                let ops = [Operation::BlitTexture {
+                    source: SOURCE,
+                    destination: TARGET,
+                    source_rect: PixelRect::new(0, 0, 16, 16).unwrap(),
+                    destination_rect: PixelRect::new(0, 0, 8, 8).unwrap(),
+                    filter,
+                    flips,
+                }];
+                let artifact = compile(CompileInput {
+                    capabilities: Capabilities::a618(512 * 1024, 4096),
+                    resources: &resources,
+                    pipelines: &[],
+                    operations: &ops,
+                })
+                .unwrap();
+                accept_codegen(&artifact).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn mip_views_of_every_cube_face_blit_through_real_relocation_validation() {
+        let texture = adreno_a6xx_layout::LinearTextureLayout::new(16, 16, 5, 6).unwrap();
+        for layer in 0..6 {
+            for level in 0..5 {
+                let sub = texture.subresource(level, layer).unwrap();
+                let mut source = image(SOURCE, TextureUsage::COPY_SRC);
+                source.size = texture.total_size;
+                let ResourceKind::Image(ref mut meta) = source.kind else {
+                    unreachable!()
+                };
+                meta.extent = Extent2D::new(sub.width, sub.height).unwrap();
+                meta.planes[0] = PlaneLayout {
+                    offset: sub.offset,
+                    stride: sub.row_pitch,
+                    size: sub.size,
+                };
+                let resources = [source, image(TARGET, TextureUsage::COPY_DST)];
+                let ops = [Operation::BlitTexture {
+                    source: SOURCE,
+                    destination: TARGET,
+                    source_rect: PixelRect::new(0, 0, sub.width, sub.height).unwrap(),
+                    destination_rect: PixelRect::new(0, 0, 16, 16).unwrap(),
+                    filter: FilterMode::Linear,
+                    flips: [false; 2],
+                }];
+                let artifact = compile(CompileInput {
+                    capabilities: Capabilities::a618(512 * 1024, 4096),
+                    resources: &resources,
+                    pipelines: &[],
+                    operations: &ops,
+                })
+                .unwrap();
+                accept_codegen_with_texture(
+                    &artifact,
+                    LinearImageFormat::Depth32Float,
+                    Some(texture),
+                )
+                .unwrap();
+                let mut invalid = artifact.clone();
+                for access in &mut invalid.accesses {
+                    if access.object == ObjectRef::External(SOURCE) {
+                        access.offset += 4;
+                    }
+                }
+                for fixup in &mut invalid.fixups {
+                    if fixup.object == ObjectRef::External(SOURCE) {
+                        fixup.object_offset += 4;
+                    }
+                }
+                assert!(
+                    accept_codegen_with_texture(
+                        &invalid,
+                        LinearImageFormat::Depth32Float,
+                        Some(texture)
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mip_chain_sampling_and_lod_clamps_reach_the_kernel() {
+        let layout = adreno_a6xx_layout::LinearTextureLayout::new(16, 16, 5, 1).unwrap();
+        let mut sampled = image(SOURCE, TextureUsage::SAMPLED);
+        sampled.size = layout.total_size;
+        let ResourceKind::Image(ref mut meta) = sampled.kind else {
+            unreachable!()
+        };
+        meta.texture = Some(layout);
+        meta.planes[0].size = layout.total_size;
+        let resources = [
+            image(TARGET, TextureUsage::RENDER_ATTACHMENT),
+            sampled,
+            ResourceMeta {
+                id: BUFFER,
+                size: 72,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX,
+                },
+            },
+        ];
+        let pipeline = PipelineMeta {
+            id: PipelineId::new(0),
+            descriptor: RenderPipelineDesc::new(
+                TextureFormat::Bgra8Unorm,
+                PrimitiveTopology::TriangleList,
+                VertexBufferLayout::new(
+                    24,
+                    std::vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x2, 16),
+                    ],
+                )
+                .unwrap(),
+                FragmentProgram::Texture(TextureSampleMode::Rgba),
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        };
+        let sampler = SamplerDesc::new(
+            FilterMode::Linear,
+            FilterMode::Linear,
+            AddressMode::ClampToEdge,
+            AddressMode::ClampToEdge,
+        )
+        .with_mip_filter(FilterMode::Linear, 1.5, 4.0)
+        .unwrap();
+        let ops = [
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: PixelRect::new(0, 0, 16, 16).unwrap(),
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetPipeline(pipeline.id),
+            Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            },
+            Operation::SetTexture(SOURCE),
+            Operation::SetSampler(sampler),
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::Draw {
+                vertex_count: 3,
+                first_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &[pipeline],
+            operations: &ops,
+        })
+        .unwrap();
+        accept_codegen_with_texture(&artifact, LinearImageFormat::Depth32Float, Some(layout))
+            .unwrap();
+        let descriptor = Packets::new(&artifact.words)
+            .map(Result::unwrap)
+            .find(|p| {
+                matches!(
+                    p.header,
+                    Header::Type7 {
+                        opcode: super::CP_MEM_WRITE,
+                        ..
+                    }
+                ) && p.payload.len() == 22
+            })
+            .unwrap();
+        assert_eq!((descriptor.payload[2] >> 16) & 15, 4);
+        assert_eq!(descriptor.payload[18] & 1, 1);
+        assert_eq!(descriptor.payload[19], 0x1800_0000 | 0x40000);
+        let descriptor_word = descriptor.word_offset as usize + 3;
+        let mut invalid = artifact.clone();
+        invalid.words[descriptor_word] ^= 1 << 16;
+        assert!(
+            accept_codegen_with_texture(&invalid, LinearImageFormat::Depth32Float, Some(layout))
+                .is_err()
+        );
+    }
 
     #[test]
     fn canonical_shader_relocations_cannot_cross_pipeline_stages() {
@@ -2572,6 +2887,7 @@ mod tests {
             id,
             size: 0x400,
             kind: ResourceKind::Image(ImageMeta {
+                texture: None,
                 format: TextureFormat::Bgra8Unorm,
                 storage_format: TextureFormat::Bgra8Unorm,
                 extent: Extent2D::new(16, 16).unwrap(),
@@ -2591,6 +2907,7 @@ mod tests {
             id,
             size: 0x1000,
             kind: ResourceKind::Image(ImageMeta {
+                texture: None,
                 format: TextureFormat::Depth32Float,
                 storage_format: TextureFormat::Depth32Float,
                 extent: Extent2D::new(16, 16).unwrap(),
@@ -2613,6 +2930,14 @@ mod tests {
         artifact: &RelocatablePm4,
         depth_format: LinearImageFormat,
     ) -> Result<std::vec::Vec<u32>, &'static str> {
+        accept_codegen_with_texture(artifact, depth_format, None)
+    }
+
+    fn accept_codegen_with_texture(
+        artifact: &RelocatablePm4,
+        depth_format: LinearImageFormat,
+        texture: Option<adreno_a6xx_layout::LinearTextureLayout>,
+    ) -> Result<std::vec::Vec<u32>, &'static str> {
         let bytes = wire_from_codegen(artifact);
         validate_and_relocate(
             &bytes,
@@ -2622,12 +2947,15 @@ mod tests {
                     || attachment_token == token(ObjectRef::External(SOURCE))
                     || attachment_token == token(ObjectRef::External(ALPHA))
                     || is_depth;
+                let texture =
+                    texture.filter(|_| attachment_token == token(ObjectRef::External(SOURCE)));
                 Some(ResolvedResource {
                     attachment_token,
                     gpu_va: 0x1_0000_0000 + attachment_token * 0x1_0000,
-                    allocation_size: 0x1000,
+                    allocation_size: texture.map_or(0x1000, |t| t.total_size),
                     allowed_access: ACCESS_READ | ACCESS_WRITE,
                     linear_image: is_image.then_some(LinearImage {
+                        texture,
                         format: if is_depth {
                             depth_format
                         } else {
@@ -2641,7 +2969,8 @@ mod tests {
                         width: 16,
                         height: 16,
                         row_pitch: if is_depth { 256 } else { 64 },
-                        visible_size: if is_depth { 0x1000 } else { 0x400 },
+                        visible_size: texture
+                            .map_or(if is_depth { 0x1000 } else { 0x400 }, |t| t.total_size),
                     }),
                 })
             },
@@ -2703,6 +3032,7 @@ mod tests {
                 allocation_size: 0x1000,
                 allowed_access: ACCESS_WRITE,
                 linear_image: Some(LinearImage {
+                    texture: None,
                     format: LinearImageFormat::Bgra8Unorm,
                     modifier: KernelImageModifier::Linear,
                     width: 16,

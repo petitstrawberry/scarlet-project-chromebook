@@ -137,6 +137,42 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
                     *destination_rect,
                 )?;
             }
+            Operation::BlitTexture {
+                source,
+                source_rect,
+                destination,
+                destination_rect,
+                filter,
+                flips,
+            } => {
+                require_outside_pass(&state)?;
+                if source == destination {
+                    return Err(CompileError::InvalidResource);
+                }
+                let src = require_image_surface(
+                    find_resource(input.resources, *source)?,
+                    TextureUsage::COPY_SRC,
+                    input.capabilities.max_linear_pitch,
+                )?;
+                let dst = require_image_surface(
+                    find_resource(input.resources, *destination)?,
+                    TextureUsage::COPY_DST,
+                    input.capabilities.max_linear_pitch,
+                )?;
+                let src_meta = find_resource(input.resources, *source)?;
+                let dst_meta = find_resource(input.resources, *destination)?;
+                let (ResourceKind::Image(src_image), ResourceKind::Image(dst_image)) =
+                    (&src_meta.kind, &dst_meta.kind)
+                else {
+                    return Err(CompileError::InvalidResource);
+                };
+                if src_image.format != dst_image.format {
+                    return Err(CompileError::InvalidResource);
+                }
+                validate_rect(*source_rect, src)?;
+                validate_rect(*destination_rect, dst)?;
+                emitter.blit(src, *source_rect, dst, *destination_rect, *filter, *flips)?;
+            }
             Operation::BeginRenderPass(pass) => {
                 if state.pass.is_some() {
                     return Err(CompileError::InvalidState);
@@ -375,6 +411,22 @@ fn validate_image_layout(
         return Err(CompileError::UnsupportedFeature);
     }
     let plane = image.planes[0];
+    if let Some(texture) = image.texture {
+        if adreno_a6xx_layout::LinearTextureLayout::new(
+            image.extent.width(),
+            image.extent.height(),
+            texture.mip_levels,
+            texture.array_layers,
+        ) != Some(texture)
+            || image.modifier != ImageModifier::Linear
+            || plane.offset != 0
+            || plane.stride != texture.row_pitch
+            || plane.size != texture.total_size
+            || allocation_size < texture.total_size
+        {
+            return Err(CompileError::InvalidResource);
+        }
+    }
     let row_bytes = image
         .extent
         .width()
@@ -447,6 +499,10 @@ fn require_image_surface(
         stride: plane.stride,
         tile_mode: 0,
         alpha_mask: image.format == TextureFormat::R8Unorm,
+        mip_levels: image.texture.map_or(1, |t| t.mip_levels),
+        array_pitch: image
+            .texture
+            .map_or(plane.size, |t| u64::from(t.layer_stride)),
     })
 }
 
@@ -492,6 +548,8 @@ fn require_depth_surface(
         stride: plane.stride,
         tile_mode: TILE_MODE_3,
         alpha_mask: false,
+        mip_levels: 1,
+        array_pitch: plane.size,
     })
 }
 
@@ -662,7 +720,26 @@ fn emit_draw(
         attributes,
         uniforms: uniform_words,
         texture,
-        linear_sampler,
+        sampler: {
+            let mut words = if linear_sampler {
+                adreno_a6xx_shader_pack::SAMPLER_CLAMP_LINEAR
+            } else {
+                adreno_a6xx_shader_pack::SAMPLER_CLAMP_NEAREST
+            };
+            if let Some(sampler) = state.sampler {
+                if sampler.mip_filter() == FilterMode::Linear {
+                    words[0] |= 1;
+                }
+                let max = texture.map_or(0.0, |t| (t.mip_levels - 1) as f32);
+                let min_lod = (sampler.min_lod().clamp(0.0, max) * 256.0) as u32;
+                let max_lod = (sampler.max_lod().clamp(0.0, max) * 256.0) as u32;
+                if max_lod > 0 {
+                    words[1] &= !0x40;
+                }
+                words[1] |= (min_lod << 20) | (max_lod << 8);
+            }
+            words
+        },
         source_over,
         cull,
         depth,
@@ -810,7 +887,8 @@ fn validate_sample_state(
     };
     let texture = state.texture.ok_or(CompileError::InvalidState)?;
     let sampler = state.sampler.ok_or(CompileError::InvalidState)?;
-    if sampler.min_filter() != sampler.mag_filter()
+    if sampler.compare().is_some()
+        || sampler.min_filter() != sampler.mag_filter()
         || sampler.address_u() != AddressMode::ClampToEdge
         || sampler.address_v() != AddressMode::ClampToEdge
     {

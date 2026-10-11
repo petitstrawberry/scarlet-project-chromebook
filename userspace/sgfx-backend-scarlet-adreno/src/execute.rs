@@ -22,6 +22,7 @@ const PIPELINE_OBJECT_BASE: u32 = 1 << 24;
 // retirements. This is only the optimistic limit: the submission path bisects
 // any unusually resource-heavy chunk whose exact wire encoding exceeds the
 // negotiated ABI limit.
+#[cfg(test)]
 const MAX_DRAWS_PER_SUBMIT: usize = 512;
 
 fn submit_trace_enabled() -> bool {
@@ -123,33 +124,90 @@ impl ContextResources {
                 ir::Command::WriteTexture { texture, write } => {
                     let descriptor = self.resources.texture(*texture)?;
                     require_texture_upload_format(descriptor.format())?;
-                    self.ensure_image(*texture, &mut resources, &mut external_bindings)?;
-
-                    // Image uploads can be much larger than the bounded 64 KiB
-                    // opaque submit wire. Flush earlier GPU work to preserve IR
-                    // ordering, then use Scarlet's synchronous generic BGRA
-                    // upload path, which writes the same kernel-owned linear
-                    // backing already attached to this context.
-                    self.submit_operations(
-                        context,
-                        queue,
-                        &resources,
-                        &pipelines,
-                        &mut operations,
-                        &external_bindings,
-                    )?;
-                    self.upload_texture_bgra(context, *texture, *write)?;
+                    if descriptor.mip_level_count() > 1 || descriptor.array_layer_count() > 1 {
+                        let destination = self.ensure_image_subresource(
+                            *texture,
+                            write.mip_level(),
+                            write.array_layer(),
+                            &mut resources,
+                            &mut external_bindings,
+                        )?;
+                        operations.push(codegen::Operation::WriteTexture {
+                            destination,
+                            area: write.destination(),
+                            bytes_per_row: write.bytes_per_row(),
+                            data: write.data(),
+                        });
+                    } else {
+                        self.ensure_image(*texture, &mut resources, &mut external_bindings)?;
+                        self.submit_operations(
+                            context,
+                            queue,
+                            &resources,
+                            &pipelines,
+                            &mut operations,
+                            &external_bindings,
+                        )?;
+                        self.upload_texture_bgra(context, *texture, *write)?;
+                    }
                 }
+                ir::Command::BlitTexture {
+                    source,
+                    source_mip,
+                    destination,
+                    destination_mip,
+                    source_rect,
+                    destination_rect,
+                    filter,
+                    flips,
+                } => {
+                    let source = self.ensure_image_subresource(
+                        *source,
+                        *source_mip,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
+                    let destination = self.ensure_image_subresource(
+                        *destination,
+                        *destination_mip,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
+                    operations.push(codegen::Operation::BlitTexture {
+                        source,
+                        destination,
+                        source_rect: *source_rect,
+                        destination_rect: *destination_rect,
+                        filter: *filter,
+                        flips: *flips,
+                    });
+                }
+                // Each transfer and render pass retires its CCUs and the next
+                // begins by invalidating them. The ordered queue therefore
+                // already enforces the explicit IR dependency.
+                ir::Command::ResourceBarrier(_) => {}
                 ir::Command::CopyTextureToTexture {
                     source,
                     source_rect,
                     destination,
                     destination_rect,
                 } => {
-                    let source =
-                        self.ensure_image(*source, &mut resources, &mut external_bindings)?;
-                    let destination =
-                        self.ensure_image(*destination, &mut resources, &mut external_bindings)?;
+                    let source = self.ensure_image_subresource(
+                        *source,
+                        0,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
+                    let destination = self.ensure_image_subresource(
+                        *destination,
+                        0,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
                     operations.push(codegen::Operation::CopyTextureToTexture {
                         source,
                         source_rect: *source_rect,
@@ -158,8 +216,13 @@ impl ContextResources {
                     });
                 }
                 ir::Command::BeginRenderPass(pass) => {
-                    let target =
-                        self.ensure_image(pass.target(), &mut resources, &mut external_bindings)?;
+                    let target = self.ensure_image_subresource(
+                        pass.target(),
+                        0,
+                        0,
+                        &mut resources,
+                        &mut external_bindings,
+                    )?;
                     let depth = if let Some(depth) = pass.depth_attachment() {
                         Some(codegen::DepthAttachment {
                             target: self.ensure_image(
@@ -271,7 +334,7 @@ impl ContextResources {
         if operations.is_empty() {
             return Ok(());
         }
-        let chunks = split_submission_operations(operations, MAX_DRAWS_PER_SUBMIT)?;
+        let chunks = crate::preparation::split_async_operations(operations)?;
         let mut pending = Vec::new();
         pending
             .try_reserve_exact(chunks.len())
@@ -410,6 +473,69 @@ impl ContextResources {
             GpuImageBgraRect::new(area.x(), area.y(), area.width(), area.height()),
         )?;
         Ok(())
+    }
+
+    /// Materialize a checked mip/layer as a bounded view of the same allocation.
+    /// Compiler identities remain distinct while native authority stays attached
+    /// to the original image and its canonical subresource byte range.
+    pub(crate) fn ensure_image_subresource(
+        &mut self,
+        reference: ir::TextureRef<'_>,
+        mip_level: u32,
+        array_layer: u32,
+        metadata: &mut Vec<codegen::ResourceMeta>,
+        bindings: &mut Vec<BoundObject>,
+    ) -> Result<codegen::ObjectId, IrSubmitError> {
+        let descriptor = self.resources.texture(reference)?;
+        let extent = descriptor.mip_extent(mip_level)?;
+        if array_layer >= descriptor.array_layer_count() {
+            return Err(ir::Error::OutOfBounds.into());
+        }
+        let base = self.ensure_image(reference, metadata, bindings)?;
+        let mut resource = metadata
+            .iter()
+            .find(|r| r.id == base)
+            .ok_or(IrSubmitError::ResourceTableMismatch)?
+            .clone();
+        let codegen::ResourceKind::Image(ref mut image) = resource.kind else {
+            return Err(IrSubmitError::ResourceTableMismatch);
+        };
+        let Some(texture) = image.texture else {
+            return Ok(base);
+        };
+        let sub = texture
+            .subresource(mip_level, array_layer)
+            .ok_or(ir::Error::OutOfBounds)?;
+        let base_binding = *bindings
+            .iter()
+            .find(|b| b.object == codegen::ObjectRef::External(base))
+            .ok_or(IrSubmitError::ResourceTableMismatch)?;
+        let id = codegen::ObjectId::new(
+            (1 << 25) + u32::try_from(metadata.len()).map_err(|_| IrSubmitError::OutOfMemory)?,
+        );
+        image.texture = None;
+        image.extent = extent;
+        image.planes = alloc::vec![codegen::PlaneLayout {
+            offset: 0,
+            stride: sub.row_pitch,
+            size: sub.size
+        }];
+        resource.id = id;
+        resource.size = sub.size;
+        metadata
+            .try_reserve(1)
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        bindings
+            .try_reserve(1)
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        metadata.push(resource);
+        bindings.push(BoundObject {
+            object: codegen::ObjectRef::External(id),
+            allocation_offset: sub.offset,
+            size: sub.size,
+            ..base_binding
+        });
+        Ok(id)
     }
 
     pub(crate) fn ensure_image(
@@ -593,6 +719,8 @@ pub(crate) fn validate_fixed_command_subset(
             ir::Command::WriteBuffer { .. }
                 | ir::Command::WriteTexture { .. }
                 | ir::Command::CopyTextureToTexture { .. }
+                | ir::Command::BlitTexture { .. }
+                | ir::Command::ResourceBarrier(_)
                 | ir::Command::BeginRenderPass(_)
                 | ir::Command::EndRenderPass
                 | ir::Command::SetPipeline(_)
@@ -727,8 +855,7 @@ fn append_image_resource(
     metadata: &mut Vec<codegen::ResourceMeta>,
     bindings: &mut Vec<BoundObject>,
 ) -> Result<(), IrSubmitError> {
-    if descriptor.mip_level_count() != 1
-        || image.logical_format != descriptor.format()
+    if image.logical_format != descriptor.format()
         || metadata.iter().any(|resource| resource.id == id)
         || bindings
             .iter()
@@ -741,6 +868,13 @@ fn append_image_resource(
     let plane_count = usize::try_from(image.layout.plane_count)
         .map_err(|_| IrSubmitError::Unsupported(UnsupportedIrFeature::ImageLayout))?;
     let mut planes = Vec::new();
+    // Fixed render passes address layer zero. Retain the full allocation in
+    // RawImage while granting this depth attachment only its first tiled layer.
+    let bound_size = if descriptor.format() == ir::TextureFormat::Depth32Float {
+        u64::from(image.layout.planes[0].array_pitch)
+    } else {
+        image.allocation_size()
+    };
     planes
         .try_reserve_exact(plane_count)
         .map_err(|_| IrSubmitError::OutOfMemory)?;
@@ -748,7 +882,7 @@ fn append_image_resource(
         planes.push(codegen::PlaneLayout {
             offset: plane.offset,
             stride: plane.row_pitch,
-            size: plane.size,
+            size: plane.size.min(bound_size),
         });
     }
     metadata
@@ -765,8 +899,9 @@ fn append_image_resource(
     };
     metadata.push(codegen::ResourceMeta {
         id,
-        size: image.allocation_size(),
+        size: bound_size,
         kind: codegen::ResourceKind::Image(codegen::ImageMeta {
+            texture: image.texture,
             format: descriptor.format(),
             storage_format: match descriptor.format() {
                 ir::TextureFormat::Depth32Float => ir::TextureFormat::Depth32Float,
@@ -795,7 +930,7 @@ fn append_image_resource(
         object: codegen::ObjectRef::External(id),
         attachment_token: image.attachment_token,
         allocation_offset: 0,
-        size: image.allocation_size(),
+        size: bound_size,
     });
     Ok(())
 }

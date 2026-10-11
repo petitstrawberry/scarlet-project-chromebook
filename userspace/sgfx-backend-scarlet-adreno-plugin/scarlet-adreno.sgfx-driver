@@ -1,0 +1,4 @@
+abi=2
+name=scarlet-adreno
+gpu_backend=qcom-adreno
+library=libsgfx_scarlet_adreno.so

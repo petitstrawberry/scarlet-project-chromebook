@@ -1,0 +1,26 @@
+[package]
+name = "sgfx-backend-scarlet-adreno-plugin"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[lib]
+name = "sgfx_scarlet_adreno"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sgfx-backend-abi = { git = "https://github.com/petitstrawberry/sgfx", rev = "20bb5b8cc19445520d08c31c3971ac06244bc1d9" }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", features = ["backend-abi"] }
+sgfx-backend-scarlet-adreno = { path = "../sgfx-backend-scarlet-adreno", default-features = false, features = ["std"] }
+sgfx-codegen-adreno-a6xx = { path = "../sgfx-codegen-adreno-a6xx" }
+
+[dev-dependencies]
+sgfx-backend-loader = { git = "https://github.com/petitstrawberry/sgfx", rev = "20bb5b8cc19445520d08c31c3971ac06244bc1d9" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

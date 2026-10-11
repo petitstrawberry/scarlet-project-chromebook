@@ -15,9 +15,10 @@ use scarlet::{
     device::{
         events::InterruptCapableDevice,
         gpu::{
-            GPU_EXECUTION_SUPPORT_ADDRESS_SPACE, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
-            GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD, GPU_EXECUTION_SUPPORT_MEMORY,
-            GPU_EXECUTION_SUPPORT_PRESENTATION, GPU_EXECUTION_SUPPORT_QUEUE,
+            GPU_EXECUTION_SUPPORT_ADDRESS_SPACE, GPU_EXECUTION_SUPPORT_IMAGE_MIPS,
+            GPU_EXECUTION_SUPPORT_IMAGE_READBACK, GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD,
+            GPU_EXECUTION_SUPPORT_MEMORY, GPU_EXECUTION_SUPPORT_PRESENTATION,
+            GPU_EXECUTION_SUPPORT_QUEUE, GPU_EXECUTION_SUPPORT_TEXTURE_ARRAYS,
             GPU_EXECUTION_SUPPORT_TIMELINE, GPU_IMAGE_FORMAT_BGRA8_UNORM,
             GPU_IMAGE_FORMAT_DEPTH32_FLOAT, GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT,
             GPU_IMAGE_USAGE_PRESENTABLE, GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED,
@@ -2122,6 +2123,8 @@ impl GpuBackend for A618Backend {
                         | GPU_EXECUTION_SUPPORT_PRESENTATION
                         | GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD
                         | GPU_EXECUTION_SUPPORT_IMAGE_READBACK
+                        | GPU_EXECUTION_SUPPORT_IMAGE_MIPS
+                        | GPU_EXECUTION_SUPPORT_TEXTURE_ARRAYS
                 } else {
                     0
                 },
@@ -2200,10 +2203,14 @@ impl GpuBackend for A618Backend {
                 .ok_or("qcom-adreno-a618: tiled depth layout overflows")?;
             let array_pitch = u32::try_from(tiled.layer_size)
                 .map_err(|_| "qcom-adreno-a618: depth layer pitch exceeds the backend ABI")?;
+            let total_size = tiled
+                .layer_size
+                .checked_mul(u64::from(create.array_layers))
+                .ok_or("qcom-adreno-a618: depth array size overflows")?;
             let mut planes = [GpuBackendImagePlaneLayout::EMPTY; 4];
             planes[0] = GpuBackendImagePlaneLayout {
                 offset: 0,
-                size: tiled.layer_size,
+                size: total_size,
                 row_pitch: tiled.row_pitch,
                 array_pitch,
                 block_width: 1,
@@ -2212,8 +2219,34 @@ impl GpuBackend for A618Backend {
             };
             return Ok(GpuBackendImageLayout {
                 modifier: IMAGE_MODIFIER_TILE6_3_DEPTH,
-                total_size: tiled.layer_size,
+                total_size,
                 alignment: DEPTH32_LAYER_ALIGNMENT,
+                plane_count: 1,
+                planes,
+            });
+        }
+        if create.mip_levels > 1 || create.array_layers > 1 {
+            let texture = adreno_a6xx_layout::LinearTextureLayout::new(
+                create.width,
+                create.height,
+                create.mip_levels,
+                create.array_layers,
+            )
+            .ok_or("qcom-adreno-a618: texture layout overflows")?;
+            let mut planes = [GpuBackendImagePlaneLayout::EMPTY; 4];
+            planes[0] = GpuBackendImagePlaneLayout {
+                offset: 0,
+                size: texture.total_size,
+                row_pitch: texture.row_pitch,
+                array_pitch: texture.layer_stride,
+                block_width: 1,
+                block_height: 1,
+                bytes_per_block: 4,
+            };
+            return Ok(GpuBackendImageLayout {
+                modifier: 0,
+                total_size: texture.total_size,
+                alignment: PAGE_SIZE as u64,
                 plane_count: 1,
                 planes,
             });
@@ -2261,6 +2294,18 @@ impl GpuBackend for A618Backend {
                     0
                 }),
                 LinearImage {
+                    texture: if create.format == GPU_IMAGE_FORMAT_BGRA8_UNORM
+                        && (create.mip_levels > 1 || create.array_layers > 1)
+                    {
+                        adreno_a6xx_layout::LinearTextureLayout::new(
+                            create.width,
+                            create.height,
+                            create.mip_levels,
+                            create.array_layers,
+                        )
+                    } else {
+                        None
+                    },
                     format: if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
                         LinearImageFormat::Depth32Float
                     } else {
@@ -2277,7 +2322,10 @@ impl GpuBackend for A618Backend {
                     // A relocation exposes exactly the immutable plane
                     // footprint. Linear color excludes backing tail padding;
                     // TILE6_3 depth includes its padded rows and layer tail.
-                    visible_size: if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
+                    visible_size: if create.mip_levels > 1
+                        || create.array_layers > 1
+                        || create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT
+                    {
                         layout.planes[0].size
                     } else {
                         u64::from(layout.planes[0].row_pitch)

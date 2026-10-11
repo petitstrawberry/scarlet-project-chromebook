@@ -276,6 +276,7 @@ mod tests {
             id: texture,
             size: SIZE as u64,
             kind: ResourceKind::Image(ImageMeta {
+                texture: None,
                 format: TextureFormat::Bgra8Unorm,
                 storage_format: TextureFormat::Bgra8Unorm,
                 extent: Extent2D::new(WIDTH, HEIGHT).unwrap(),
@@ -334,6 +335,7 @@ mod tests {
             id,
             size: 1024,
             kind: ResourceKind::Image(ImageMeta {
+                texture: None,
                 format: TextureFormat::Bgra8Unorm,
                 storage_format: TextureFormat::Bgra8Unorm,
                 extent: Extent2D::new(16, 16).unwrap(),

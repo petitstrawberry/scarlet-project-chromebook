@@ -25,6 +25,7 @@ use crate::Handle;
 use crate::{ContextInner, HandleError, HandleResult, Image, IrSubmitError, ir};
 
 pub(crate) struct RawImage {
+    pub(crate) texture: Option<adreno_a6xx_layout::LinearTextureLayout>,
     pub(crate) raw: GpuImage,
     pub(crate) attachment_token: u64,
     pub(crate) layout: GpuImageLayout,
@@ -66,7 +67,18 @@ impl RawImage {
         let raw = context
             .device
             .gpu
-            .create_image_with_format_and_usage(format, width, height, usage)?;
+            .create_layered_image_with_format_and_usage(
+                format,
+                width,
+                height,
+                usage,
+                descriptor.mip_level_count(),
+                descriptor.array_layer_count(),
+                // A6xx uses the same layer-first storage for arrays and cubes.
+                // Scarlet's cube allocation flag describes exactly six faces;
+                // larger cube-compatible arrays use ordinary layered storage.
+                descriptor.cube_compatible() && descriptor.array_layer_count() == 6,
+            )?;
         Self::finish_create(context, raw, descriptor.format(), width, height)
     }
 
@@ -75,9 +87,6 @@ impl RawImage {
         handle: Handle,
         descriptor: ir::TextureDesc,
     ) -> HandleResult<Self> {
-        if descriptor.mip_level_count() != 1 {
-            return Err(HandleError::Unsupported);
-        }
         if descriptor.format() != ir::TextureFormat::Bgra8Unorm
             || !descriptor.usage().contains(ir::TextureUsage::SAMPLED)
             || descriptor.usage().contains(ir::TextureUsage::PRESENT)
@@ -86,6 +95,12 @@ impl RawImage {
         }
         let raw = GpuImage::from_handle(handle)?;
         let info = raw.query()?;
+        let shape = raw.query_texture()?;
+        if shape.mip_levels != descriptor.mip_level_count()
+            || shape.array_layers != descriptor.array_layer_count()
+        {
+            return Err(HandleError::InvalidParameter);
+        }
         let width = descriptor.extent().width();
         let height = descriptor.extent().height();
         if info.format != GPU_IMAGE_FORMAT_BGRA8_UNORM
@@ -106,12 +121,50 @@ impl RawImage {
         height: u32,
     ) -> HandleResult<Self> {
         let layout = raw.query_layout()?;
-        validate_image_layout(&layout, width, height, logical_format)?;
+        let shape = raw.query_texture()?;
+        let texture = if logical_format != ir::TextureFormat::Depth32Float
+            && (shape.mip_levels > 1 || shape.array_layers > 1)
+        {
+            let texture = adreno_a6xx_layout::LinearTextureLayout::new(
+                width,
+                height,
+                shape.mip_levels,
+                shape.array_layers,
+            )
+            .ok_or(HandleError::InvalidParameter)?;
+            if layout.modifier == GPU_IMAGE_MODIFIER_LINEAR
+                && (layout.planes[0].row_pitch != texture.row_pitch
+                    || layout.planes[0].array_pitch != texture.layer_stride
+                    || layout.planes[0].size != texture.total_size
+                    || layout.total_size != texture.total_size)
+            {
+                return Err(HandleError::InvalidParameter);
+            }
+            Some(texture)
+        } else {
+            None
+        };
+        if logical_format == ir::TextureFormat::Depth32Float && shape.array_layers > 1 {
+            let mut layer = layout;
+            let expected = adreno_a6xx_layout::depth32_tile6_3_layout(width, height)
+                .ok_or(HandleError::InvalidParameter)?
+                .layer_size;
+            if layout.planes[0].size != expected * u64::from(shape.array_layers)
+                || layout.total_size < layout.planes[0].size
+            {
+                return Err(HandleError::InvalidParameter);
+            }
+            layer.planes[0].size = expected;
+            validate_image_layout(&layer, width, height, logical_format)?;
+        } else {
+            validate_image_layout(&layout, width, height, logical_format)?;
+        }
         let attachment_token = context.raw.attach_image(&raw)?;
         if attachment_token == 0 {
             return Err(HandleError::InvalidParameter);
         }
         Ok(Self {
+            texture,
             raw,
             attachment_token,
             layout,
@@ -282,6 +335,24 @@ pub(crate) struct ContextResources {
 }
 
 impl ContextResources {
+    pub(crate) fn release_texture(&mut self, texture: ir::TextureId) -> Result<(), IrSubmitError> {
+        let slot = self.resources.texture_ref(texture)?.slot();
+        if let Some(image) = self.images[slot].as_ref() {
+            image.detach()?;
+        }
+        self.images[slot] = None;
+        Ok(())
+    }
+
+    pub(crate) fn release_buffer(&mut self, buffer: ir::BufferId) -> Result<(), IrSubmitError> {
+        let slot = self.resources.buffer_ref(buffer)?.slot();
+        if let Some(buffer) = self.buffers[slot].as_ref() {
+            buffer.detach()?;
+        }
+        self.buffers[slot] = None;
+        Ok(())
+    }
+
     pub(crate) fn new(
         resources: Rc<ir::ResourceTable>,
         context: Arc<ContextInner>,
@@ -494,9 +565,6 @@ impl ContextResources {
 }
 
 fn image_create_parameters(descriptor: ir::TextureDesc) -> HandleResult<(u32, u32)> {
-    if descriptor.mip_level_count() != 1 {
-        return Err(HandleError::Unsupported);
-    }
     let mut usage = 0;
     if descriptor.format() == ir::TextureFormat::Depth32Float {
         if !descriptor

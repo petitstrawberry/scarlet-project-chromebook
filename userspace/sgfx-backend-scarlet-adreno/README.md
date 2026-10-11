@@ -51,19 +51,32 @@ using that backing.
 
 ## Implemented subset
 
+The adjacent `sgfx-backend-scarlet-adreno-plugin` exposes this implementation
+as a cdylib using SGFX ABI v2. It owns sessions, resource tables, imported handles
+and completion receipts inside the driver. Distribution integration uses
+published dependency revisions; the CoachZ image does not inject local clients
+or drivers into the standard Scarlet bundles.
+
 Tracked submission supports the existing fixed pipelines, textures, depth,
-scissor, draw/indexed draw, texture copy and uploads. Buffer uploads require
+scissor, draw/indexed draw, texture copy and uploads. Color textures allocate
+real mip chains and array/cube layers using the shared A6xx layer-first layout.
+Uploads address the selected mip and layer in both execution paths. GPU blits
+support mip generation, nearest/linear filtering, bounded rectangles and flips;
+2D sampling encodes mip counts, LOD clamps and mip filtering. Explicit resource
+barriers use the ordered queue's existing CCU retirement and invalidation.
+Buffer uploads require
 four-byte-aligned offsets and byte counts, matching A6xx `CP_MEMCPY`; unaligned
 writes are rejected during preflight. The synchronous executor retains its
 byte-granular CPU upload path. Programmable pipelines, bind groups, compute,
-explicit barriers and new buffer-copy IR are rejected before any upload or draw
+and new buffer-copy IR are rejected before any upload or draw
 is accepted.
 
 Use the checked-in lockfiles as a compatible source set. The standalone
-userspace locks select SGFX `96e85caa` and Scarlet runtime `d8a19981`.
+userspace locks select SGFX core `040dbb5c` and Scarlet runtime `d3b1c051`,
+matching the source identities used by the current SGFX facade `20bb5b8c`.
 The driver uses the current Scarlet kernel's typed physical/DMA address APIs
 and requires its `begin_image_cpu_access` guard and synchronous backing
-retention. The driver lock also selects `d8a19981`; older kernels without
+retention. The standalone driver selects kernel `72e68549`; older kernels without
 those hooks do not provide the required lifetime and ordering guarantees.
 
 ## Validation
@@ -75,6 +88,8 @@ cargo test --locked --manifest-path tests/a618-async-queue/Cargo.toml
 cargo test --locked --manifest-path tests/a618-async-preparation/Cargo.toml
 cargo test --locked --manifest-path tests/a618-submit-validation/Cargo.toml
 cargo test --locked --manifest-path userspace/sgfx-codegen-adreno-a6xx/Cargo.toml
+cargo test --locked --manifest-path shared/adreno-a6xx-layout/Cargo.toml
+cargo test --locked --manifest-path userspace/sgfx-backend-scarlet-adreno-plugin/Cargo.toml
 ```
 
 Use the Scarlet toolchain for the backend target checks:

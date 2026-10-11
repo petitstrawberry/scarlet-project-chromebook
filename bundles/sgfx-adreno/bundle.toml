@@ -1,0 +1,13 @@
+# Native Adreno ABI v2 driver. Include after Scarlet's sgfx-native bundle.
+[[layers]]
+kind = "cargo"
+source = "../../userspace/sgfx-backend-scarlet-adreno-plugin"
+package = "sgfx-backend-scarlet-adreno-plugin"
+lib = "sgfx_scarlet_adreno"
+architectures = ["aarch64"]
+to = "/lib/sgfx/libsgfx_scarlet_adreno.so"
+
+[[layers]]
+kind = "copy"
+source = "../../userspace/sgfx-backend-scarlet-adreno-plugin/scarlet-adreno.sgfx-driver"
+to = "/lib/sgfx/scarlet-adreno.sgfx-driver"

@@ -37,11 +37,17 @@ held. Direct writes to caller-mapped shared buffers still require caller
 synchronization; the async userspace backend uses retained staging arenas and
 GPU transfers for its uploads.
 
+Color image allocation also supports mip chains and array/cube layers. A6xx
+stores all levels of a layer together, with 64-byte mip pitches and 4 KiB layer
+alignment. The kernel, code generator and userspace backend share the layout
+calculation. Submission validation derives a mip/layer view from the retained
+allocation metadata; an arbitrary byte slice cannot invent a texture extent.
+
 ## Validation
 
 The driver uses Scarlet's 64-bit physical-address API, explicit `PhysAddr`,
 `Iova`, and `DmaAddr` boundaries, and generic CPU-access guards. Use Scarlet
-commit `d8a199815249c784a04c9dec60b6efedbb79d84e` or a compatible successor.
+commit `72e68549b679f5ff471b79847675bbb5ec3dc73a` or a compatible successor.
 The checked-in lockfile selects the published kernel revision:
 
 ```sh

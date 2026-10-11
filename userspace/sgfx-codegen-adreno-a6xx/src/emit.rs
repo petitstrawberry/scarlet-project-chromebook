@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 
 use adreno_a6xx_pm4::{opcode, type4, type7};
 use adreno_a6xx_shader_pack::{
-    FragmentMeta, LinkMeta, PipelineVariant, SAMPLER_CLAMP_LINEAR, SAMPLER_CLAMP_NEAREST,
-    SHADER_SIZE, ShaderMeta, VertexMeta, link_meta, shader_meta,
+    FragmentMeta, LinkMeta, PipelineVariant, SHADER_SIZE, ShaderMeta, VertexMeta, link_meta,
+    shader_meta,
 };
 use sgfx_core::ir::{Color, CompareFunction, IndexFormat, PixelRect};
 
@@ -206,7 +206,7 @@ pub(crate) struct DrawState {
     pub(crate) attributes: &'static [(u32, u32)],
     pub(crate) uniforms: [u32; 20],
     pub(crate) texture: Option<Surface>,
-    pub(crate) linear_sampler: bool,
+    pub(crate) sampler: [u32; 4],
     pub(crate) source_over: bool,
     pub(crate) cull: u32,
     pub(crate) depth: Option<DepthDrawState>,
@@ -244,6 +244,8 @@ pub(crate) struct IndexedDraw {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Surface {
+    pub(crate) mip_levels: u32,
+    pub(crate) array_pitch: u64,
     pub(crate) object: ObjectId,
     pub(crate) plane_offset: u64,
     pub(crate) plane_size: u64,
@@ -465,16 +467,16 @@ impl Emitter {
         // 64-byte minimum pitch alignment (PITCHALIGN encoding zero); a wider
         // incidental stride alignment must not change the descriptor.
         Ok([
-            if texture.alpha_mask {
+            (if texture.alpha_mask {
                 0x4c00_76d0
             } else {
                 0x4c00_6880
-            },
+            }) | ((texture.mip_levels - 1) << 16),
             texture.width | (texture.height << 15),
             (texture.stride << 7) | (1 << 29),
             u32::try_from(
                 texture
-                    .plane_size
+                    .array_pitch
                     .checked_add(0xfff)
                     .ok_or(CompileError::Overflow)?
                     >> 12,
@@ -746,13 +748,7 @@ impl Emitter {
             // descriptors use sixteen dwords under ST6_CONSTANTS, but padding
             // a sampler to that size makes CP_LOAD_STATE6 consume an invalid
             // direct-state payload and raises CP_ILLEGAL_INSTR_ERROR.
-            let sampler = if draw.linear_sampler {
-                // clamp-to-edge, linear min/mag, no mip chain, chroma-linear
-                SAMPLER_CLAMP_LINEAR
-            } else {
-                // clamp-to-edge, nearest min/mag, no mip chain
-                SAMPLER_CLAMP_NEAREST
-            };
+            let sampler = draw.sampler;
             let state = self.texture_state_backing(texture, sampler)?;
             self.load_indirect(
                 CP_LOAD_STATE6_FRAG,
@@ -858,14 +854,10 @@ impl Emitter {
         self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
 
         let texture_changed = self.last_draw.is_none_or(|previous| {
-            previous.texture != draw.texture || previous.linear_sampler != draw.linear_sampler
+            previous.texture != draw.texture || previous.sampler != draw.sampler
         });
         if texture_changed && let Some(texture) = draw.texture {
-            let sampler = if draw.linear_sampler {
-                SAMPLER_CLAMP_LINEAR
-            } else {
-                SAMPLER_CLAMP_NEAREST
-            };
+            let sampler = draw.sampler;
             let state = self.texture_state_backing(texture, sampler)?;
             self.load_indirect(
                 CP_LOAD_STATE6_FRAG,
@@ -1332,6 +1324,25 @@ impl Emitter {
         destination: Surface,
         destination_rect: PixelRect,
     ) -> Result<(), CompileError> {
+        self.blit(
+            source,
+            source_rect,
+            destination,
+            destination_rect,
+            sgfx_core::ir::FilterMode::Nearest,
+            [false; 2],
+        )
+    }
+
+    pub(crate) fn blit(
+        &mut self,
+        source: Surface,
+        source_rect: PixelRect,
+        destination: Surface,
+        destination_rect: PixelRect,
+        filter: sgfx_core::ir::FilterMode,
+        flips: [bool; 2],
+    ) -> Result<(), CompileError> {
         self.submission_begin_2d()?;
         self.wait_for_idle()?;
         self.packet4(
@@ -1345,9 +1356,27 @@ impl Emitter {
         )?;
         self.emit_coordinates(destination_rect, None)?;
         self.emit_a2d_common(FORMAT_8_8_8_8_UNORM, 0, false, true)?;
+        let rotation = match flips {
+            [false, false] => 0,
+            [true, false] => 4,
+            [false, true] => 5,
+            [true, true] => 2,
+        };
+        if rotation != 0 {
+            let control = (FORMAT_8_8_8_8_UNORM << 8) | BLIT_CHANNEL_MASK | BLIT_SCISSOR | rotation;
+            self.packet4(RB_A2D_BLT_CNTL, &[control])?;
+            self.packet4(GRAS_A2D_BLT_CNTL, &[control])?;
+        }
         self.packet4(
             TPL1_A2D_SRC_TEXTURE_INFO,
-            &[FORMAT_8_8_8_8_UNORM | A2D_BGRA_COLOR_SWAP | SOURCE_TEXTURE_REQUIRED],
+            &[FORMAT_8_8_8_8_UNORM
+                | A2D_BGRA_COLOR_SWAP
+                | SOURCE_TEXTURE_REQUIRED
+                | if filter == sgfx_core::ir::FilterMode::Linear {
+                    1 << 16
+                } else {
+                    0
+                }],
         )?;
         self.packet4(
             TPL1_A2D_SRC_TEXTURE_SIZE,

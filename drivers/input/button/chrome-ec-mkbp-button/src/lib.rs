@@ -258,8 +258,8 @@ mod runtime {
             return;
         }
 
-        let metadata = InputDeviceMetadata::new(InputDeviceKind::Keyboard, INPUT_CAP_KEY);
-        let event = Arc::new(EventDevice::new_with_metadata("keyboard", metadata));
+        let metadata = InputDeviceMetadata::new(InputDeviceKind::Buttons, INPUT_CAP_KEY);
+        let event = Arc::new(EventDevice::new_with_metadata("buttons", metadata));
         let device = Arc::new(ChromeEcMkbpButtons {
             event: event.clone(),
             supported,
@@ -277,7 +277,7 @@ mod runtime {
         let registered: Arc<dyn Device> = event;
         DeviceManager::get_manager().register_device_with_name(name, registered);
         println!(
-            "[chrome-ec-mkbp-button] registered keyboard buttons supported={:#x} source=EC-MKBP-IRQ",
+            "[chrome-ec-mkbp-button] registered system buttons supported={:#x} source=EC-MKBP-IRQ",
             supported,
         );
     }

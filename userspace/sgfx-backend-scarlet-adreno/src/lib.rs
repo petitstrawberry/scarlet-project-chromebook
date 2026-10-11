@@ -79,6 +79,8 @@ pub struct Capabilities {
     image_upload: bool,
     image_readback: bool,
     depth: bool,
+    image_mips: bool,
+    texture_arrays: bool,
 }
 
 impl Capabilities {
@@ -89,6 +91,8 @@ impl Capabilities {
             image_upload: execution_support & GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD != 0,
             image_readback: execution_support & GPU_EXECUTION_SUPPORT_IMAGE_READBACK != 0,
             depth: true,
+            image_mips: execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_IMAGE_MIPS != 0,
+            texture_arrays: execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_TEXTURE_ARRAYS != 0,
         }
     }
 
@@ -115,6 +119,16 @@ impl Capabilities {
     /// Return whether depth attachments are available.
     pub const fn supports_depth(&self) -> bool {
         self.depth
+    }
+
+    /// Return whether the kernel allocates complete mip chains.
+    pub const fn supports_image_mips(&self) -> bool {
+        self.image_mips
+    }
+
+    /// Return whether the kernel allocates independent array/cube layers.
+    pub const fn supports_texture_arrays(&self) -> bool {
+        self.texture_arrays
     }
 }
 
@@ -502,7 +516,7 @@ pub enum UnsupportedIrFeature {
     TextureUpload,
     /// A command references an unsupported resource state.
     ResourceState,
-    /// Programmable pipelines, compute, or barriers need an extended backend.
+    /// Programmable pipelines and compute need an extended backend.
     ProgrammableExecution,
 }
 
@@ -516,6 +530,25 @@ pub struct MappedTargetSession {
 }
 
 impl MappedTargetSession {
+    /// Observe quiescence without waiting during dynamic metadata retirement.
+    pub fn is_idle(&self) -> Result<bool, IrSubmitError> {
+        Ok(self.context.inner.dispatcher.is_idle()?)
+    }
+
+    /// Retire a texture before its logical slot is reused by the frontend.
+    pub fn release_texture(&mut self, texture: ir::TextureId) -> Result<(), IrSubmitError> {
+        self.resources.drain_async()?;
+        self.resources.release_texture(texture)?;
+        self.images.retain(|(id, _)| *id != texture);
+        Ok(())
+    }
+
+    /// Retire a buffer before its logical slot is reused by the frontend.
+    pub fn release_buffer(&mut self, buffer: ir::BufferId) -> Result<(), IrSubmitError> {
+        self.resources.drain_async()?;
+        self.resources.release_buffer(buffer)
+    }
+
     /// Import a transferred shared BGRA image into a logical sampled texture.
     pub fn import_shared_bgra_texture(
         &mut self,

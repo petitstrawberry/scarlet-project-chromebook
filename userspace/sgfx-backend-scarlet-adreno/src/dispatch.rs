@@ -318,6 +318,22 @@ impl NativeScheduler {
         }
         Ok(())
     }
+
+    pub(crate) fn is_idle(&self) -> HandleResult<bool> {
+        let Some(scheduler) = try_lock(&self.shared.scheduler) else {
+            return Ok(false);
+        };
+        if scheduler.failure().is_some() {
+            return Err(HandleError::SystemError(-1));
+        }
+        match scheduler.last_signal() {
+            None => Ok(true),
+            Some(signal) => signal
+                .poll()
+                .map(|status| status == CompletionStatus::Complete)
+                .map_err(|_| HandleError::SystemError(-1)),
+        }
+    }
 }
 
 impl Drop for NativeScheduler {
