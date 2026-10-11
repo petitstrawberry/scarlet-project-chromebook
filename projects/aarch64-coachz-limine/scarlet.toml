@@ -94,7 +94,7 @@ subdir = "bundles/full"
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook", rev = "1d257cce0c86ec07ddcc4afa6ecce5e3e2f9a66c" }
+source = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook", rev = "e8e72900ae8760fb0ccc7eddfd47bd206d4ec399" }
 subdir = "bundles/sgfx-adreno"
 
 [[images.rootfs.layers]]
