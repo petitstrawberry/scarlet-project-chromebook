@@ -6,6 +6,7 @@ delay_ms="${SCARLET_ALTFW_KEY_DELAY_MS:-5000}"
 key="${SCARLET_ALTFW_KEY:-ctrl-l}"
 device="${SCARLET_CCD_DEVICE:-18d1:5014}"
 serial="${SCARLET_CCD_SERIAL:-}"
+reset_ap=true
 
 usage() {
   cat >&2 <<'EOF'
@@ -15,6 +16,7 @@ Reset the Chromebook through the Mac's CCD EC console, then inject the
 selected keyboard shortcut after the Developer Mode screen has appeared.
 
 Options:
+  --no-reset         Send the key without resetting an AP already at the boot menu.
   --delay-ms MS       Delay after apreset before sending the key (default: 5000).
   --key KEY           ctrl-l, enter, ctrl-d, or release (default: ctrl-l).
   --device VID:PID    CCD USB device (default: 18d1:5014).
@@ -40,6 +42,10 @@ valid_key() {
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
+    --no-reset)
+      reset_ap=false
+      shift
+      ;;
     --delay-ms)
       [[ "$#" -ge 2 ]] || die '--delay-ms requires milliseconds'
       delay_ms=$2
@@ -78,8 +84,10 @@ if [[ -n "$serial" ]]; then
   ec_args+=(--serial "$serial")
 fi
 
-echo "Resetting Chromebook through CCD EC (apreset)..." >&2
-printf 'apreset\n' | "$script_dir/ec-usb-command.py" "${ec_args[@]}"
+if [[ "$reset_ap" == true ]]; then
+  echo "Resetting Chromebook through CCD EC (apreset)..." >&2
+  printf 'apreset\n' | "$script_dir/ec-usb-command.py" "${ec_args[@]}"
+fi
 
 wait_before_key() {
   local delay_seconds
@@ -117,4 +125,4 @@ send_ec_key() {
 echo "Waiting $delay_ms ms, then injecting EC keyboard key '$key'..." >&2
 wait_before_key
 send_ec_key "$key"
-echo "Reset/key sequence started." >&2
+echo "Boot key sequence sent." >&2
