@@ -969,8 +969,9 @@ fn validate_ccu_transitions(packets: &[Packet<'_>]) -> Result<(), &'static str> 
 }
 
 /// A618 can consume the complete IB while a misplaced WFI remains parked in
-/// front of dirty color-cache retirement. A2D blits remain self-contained,
-/// while consecutive 3D draws may share one render-pass retirement sequence.
+/// front of dirty color-cache retirement. Solid A2D clears may share one
+/// retirement sequence; sampled blits still retire independently. Consecutive
+/// 3D draws may share one render-pass retirement sequence.
 /// The canonical 3D validator independently requires a complete safe state
 /// segment before every draw.
 fn validate_render_retirement(packets: &[Packet<'_>]) -> Result<(), &'static str> {
@@ -1011,9 +1012,56 @@ fn validate_render_retirement(packets: &[Packet<'_>]) -> Result<(), &'static str
     };
 
     let mut pending_draw = false;
+    let mut pending_clear = false;
+    let mut solid_blit = false;
     let mut index = 0usize;
     while index < packets.len() {
         let packet = &packets[index];
+        if (pending_draw || pending_clear)
+            && packets
+                .get(index..index.saturating_add(5))
+                .is_some_and(is_sysmem_retirement)
+        {
+            pending_draw = false;
+            pending_clear = false;
+            index += 5;
+            continue;
+        }
+        if matches!(
+            packet.header,
+            Header::Type4 {
+                register: RB_A2D_BLT_CNTL,
+                ..
+            }
+        ) {
+            solid_blit = packet.payload[0] & (1 << 7) != 0;
+        }
+        // An unretired clear can only be followed by another solid clear's
+        // bounded A2D setup. Do not permit texture reads, 3D state, cache
+        // invalidations or memory operations before the complete epilogue.
+        if pending_clear
+            && !matches!(
+                packet.header,
+                Header::Type4 {
+                    register: RB_A2D_BLT_CNTL
+                        | GRAS_A2D_BLT_CNTL
+                        | RB_A2D_PIXEL_CNTL
+                        | SP_A2D_OUTPUT_INFO
+                        | RB_A2D_CLEAR_COLOR_DW0
+                        | RB_A2D_DEST_BUFFER_INFO
+                        | RB_A2D_DEST_BUFFER_BASE
+                        | RB_A2D_DEST_BUFFER_PITCH
+                        | GRAS_A2D_DEST_TL
+                        | GRAS_A2D_SCISSOR_TL,
+                    ..
+                } | Header::Type7 {
+                    opcode: opcode::WAIT_FOR_IDLE | opcode::BLIT,
+                    ..
+                }
+            )
+        {
+            return Err("qcom-adreno-a618: clear batch lacks sysmem retirement");
+        }
         if matches!(
             packet.header,
             Header::Type7 {
@@ -1041,6 +1089,14 @@ fn validate_render_retirement(packets: &[Packet<'_>]) -> Result<(), &'static str
             if !packets.get(index + 1).is_some_and(is_wfi) {
                 return Err("qcom-adreno-a618: A2D blit is not idle before retirement");
             }
+            if solid_blit {
+                pending_clear = true;
+                index += 2;
+                continue;
+            }
+            if pending_clear {
+                return Err("qcom-adreno-a618: sampled blit follows an unretired clear");
+            }
             let Some(retirement) = packets.get(index + 2..index + 7) else {
                 return Err("qcom-adreno-a618: rendering operation lacks sysmem retirement");
             };
@@ -1053,19 +1109,9 @@ fn validate_render_retirement(packets: &[Packet<'_>]) -> Result<(), &'static str
             continue;
         }
 
-        if pending_draw
-            && packets
-                .get(index..index.saturating_add(5))
-                .is_some_and(is_sysmem_retirement)
-        {
-            pending_draw = false;
-            index += 5;
-            continue;
-        }
-
         index += 1;
     }
-    if pending_draw {
+    if pending_draw || pending_clear {
         return Err("qcom-adreno-a618: rendering operation lacks sysmem retirement");
     }
     Ok(())
@@ -1279,7 +1325,13 @@ fn validate_a2d_sequences(
                 } else if !state.clear_color {
                     return Err("qcom-adreno-a618: A2D solid blit clear color is missing");
                 }
-                state = A2dState::default();
+                // CP_SET_MARKER persists across a batch of solid clears.
+                // Bounds, addresses and format still need fresh authority
+                // for every BLIT; only retain the current render mode.
+                state = A2dState {
+                    render_mode: state.render_mode,
+                    ..A2dState::default()
+                };
             }
             _ => {}
         }
@@ -3618,7 +3670,72 @@ mod tests {
             operations: &operations,
         })
         .unwrap();
-        assert!(accept_codegen(&artifact).is_ok());
+        accept_codegen(&artifact).unwrap();
+        // Partial, transparent color clears and independent load operations
+        // must keep the same validated depth/alpha semantics.
+        for color_clear in [false, true] {
+            for depth_clear in [false, true] {
+                let mut operations = operations.clone();
+                let Operation::BeginRenderPass(ref mut pass) = operations[0] else {
+                    unreachable!()
+                };
+                pass.area = PixelRect::new(2, 3, 8, 7).unwrap();
+                pass.load = if color_clear {
+                    LoadOp::Clear(Color::rgba(0.2, 0.4, 0.6, 0.25).unwrap())
+                } else {
+                    LoadOp::Load
+                };
+                pass.depth.as_mut().unwrap().load = if depth_clear {
+                    DepthLoadOp::Clear(0.5)
+                } else {
+                    DepthLoadOp::Load
+                };
+                let part = compile(CompileInput {
+                    capabilities: Capabilities::a618(512 * 1024, 4096),
+                    resources: &resources,
+                    pipelines: &pipelines,
+                    operations: &operations,
+                })
+                .unwrap();
+                accept_codegen(&part).unwrap();
+            }
+        }
+        let packets = Packets::new(&artifact.words)
+            .collect::<Result<std::vec::Vec<_>, _>>()
+            .unwrap();
+        let first_blit = packets
+            .iter()
+            .position(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: opcode::BLIT,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let mut missing_idle = packets.clone();
+        missing_idle.remove(first_blit + 1);
+        assert!(super::validate_render_retirement(&missing_idle).is_err());
+        let second_blit = packets
+            .iter()
+            .rposition(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: opcode::BLIT,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let mut missing_retirement = packets.clone();
+        missing_retirement.drain(second_blit + 2..second_blit + 7);
+        assert!(super::validate_render_retirement(&missing_retirement).is_err());
+        let mut early_invalidate = packets.clone();
+        early_invalidate.insert(first_blit + 2, packets[second_blit + 4]);
+        assert!(super::validate_render_retirement(&early_invalidate).is_err());
         assert_eq!(
             accept_codegen_with_depth_format(&artifact, LinearImageFormat::Bgra8Unorm),
             Err("qcom-adreno-a618: A2D state exceeds the authorized image layout")
@@ -4633,11 +4750,20 @@ mod tests {
             resource
         }).collect();
         let relocations: std::vec::Vec<_> = (0..decoded.relocation_len())
-            .map(|i| decoded.relocation(i).unwrap()).collect();
-        let submit = Submit { pm4: &artifact.words, resources: &resources, relocations: &relocations };
+            .map(|i| decoded.relocation(i).unwrap())
+            .collect();
+        let submit = Submit {
+            pm4: &artifact.words,
+            resources: &resources,
+            relocations: &relocations,
+        };
         let mut shared_arena = std::vec![0; encoded_len(submit).unwrap()];
         encode(submit, &mut shared_arena).unwrap();
-        super::validate_pm4(adreno_a6xx_submit_wire::decode(&shared_arena).unwrap(), &relocations).unwrap();
+        super::validate_pm4(
+            adreno_a6xx_submit_wire::decode(&shared_arena).unwrap(),
+            &relocations,
+        )
+        .unwrap();
 
         let packets: std::vec::Vec<_> = Packets::new(&artifact.words).map(Result::unwrap).collect();
         let descriptors: std::vec::Vec<_> = packets

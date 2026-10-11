@@ -385,13 +385,37 @@ fn depth32_clear_test_and_write_are_a_relocatable_sysmem_stream() {
         },
         Operation::EndRenderPass,
     ];
+    let pipelines = [pipeline];
     let artifact = compile(CompileInput {
         capabilities: Capabilities::a618(512 * 1024, 4096),
         resources: &resources,
-        pipelines: &[pipeline],
+        pipelines: &pipelines,
         operations: &operations,
     })
     .unwrap();
+
+
+    // Reproduce the old independent clear batches without changing the draws.
+    let Operation::BeginRenderPass(mut depth_only) = operations[0].clone() else {
+        unreachable!()
+    };
+    depth_only.load = LoadOp::Load;
+    let mut separate = vec![Operation::BeginRenderPass(depth_only), Operation::EndRenderPass];
+    separate.extend(operations.iter().cloned());
+    if let Operation::BeginRenderPass(pass) = &mut separate[2] {
+        pass.depth.as_mut().unwrap().load = DepthLoadOp::Load;
+    }
+    let unbatched = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 4096),
+        resources: &resources,
+        pipelines: &pipelines,
+        operations: &separate,
+    }).unwrap();
+    let idle_count = |artifact: &sgfx_codegen_adreno_a6xx::RelocatablePm4| Packets::new(&artifact.words)
+        .map(Result::unwrap).filter(|packet| matches!(packet.header,
+            Header::Type7 { opcode: opcode::WAIT_FOR_IDLE, .. })).count();
+    assert_eq!(idle_count(&unbatched), idle_count(&artifact) + 4);
+    println!("CLEAR_BATCH unbatched_wfi={} batched_wfi={}", idle_count(&unbatched), idle_count(&artifact));
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
@@ -444,6 +468,59 @@ fn depth32_clear_test_and_write_are_a_relocatable_sysmem_stream() {
             }
         ) && packet.payload == [0x47]
     }));
+    let blits: Vec<_> = packets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, packet)| {
+            matches!(
+                packet.header,
+                Header::Type7 {
+                    opcode: opcode::BLIT,
+                    ..
+                }
+            )
+            .then_some(index)
+        })
+        .collect();
+    assert_eq!(blits.len(), 2, "both attachments must still be cleared");
+    assert!(
+        packets[blits[0] + 1..blits[1]].iter().all(|packet| {
+            !matches!(
+                packet.header,
+                Header::Type7 {
+                    opcode: opcode::EVENT_WRITE,
+                    ..
+                }
+            )
+        }),
+        "independent attachment clears must not flush/invalidate the CCUs between blits"
+    );
+    assert!(
+        matches!(
+            packets[blits[0] + 1].header,
+            Header::Type7 {
+                opcode: opcode::WAIT_FOR_IDLE,
+                ..
+            }
+        ),
+        "the first BLIT must retire before its destination registers are reused"
+    );
+    assert_eq!(
+        packets
+            .iter()
+            .filter(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: opcode::EVENT_WRITE,
+                        ..
+                    }
+                ) && packet.payload.first() == Some(&0x4000_001c)
+            })
+            .count(),
+        2,
+        "retire depth once after the paired clears and once after 3D"
+    );
 }
 
 #[test]

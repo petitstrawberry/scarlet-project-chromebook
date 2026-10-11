@@ -1350,6 +1350,41 @@ impl Emitter {
         self.submission_end()
     }
 
+    pub(crate) fn clear_color_and_depth(
+        &mut self,
+        target: Surface,
+        depth_target: Surface,
+        area: PixelRect,
+        color: Color,
+        depth: f32,
+    ) -> Result<(), CompileError> {
+        if !depth.is_finite() || !(0.0..=1.0).contains(&depth) {
+            return Err(CompileError::InvalidResource);
+        }
+        // Both clears are A2D writes through the color CCU. Keep them in one
+        // transfer batch: the post-BLIT WFI completes the depth clear before
+        // reprogramming its destination/format for color. Retire both CCUs
+        // once, before the following 3D pass can read either attachment.
+        self.submission_begin_2d()?;
+        self.emit_coordinates(area, None)?;
+        self.packet4(RB_A2D_CLEAR_COLOR_DW0, &[depth.to_bits(), 0, 0, 0])?;
+        self.emit_a2d_common(FORMAT_32_FLOAT, A2D_IFMT_FLOAT32, true, true)?;
+        self.emit_destination(depth_target, FORMAT_32_FLOAT, 0)?;
+        self.emit_blit()?;
+
+        // Each blit's bounds are independently checked by the kernel.
+        self.emit_coordinates(area, None)?;
+        let [red, green, blue, alpha] = color.components();
+        self.packet4(
+            RB_A2D_CLEAR_COLOR_DW0,
+            &[unorm8(red), unorm8(green), unorm8(blue), unorm8(alpha)],
+        )?;
+        self.emit_a2d_common(FORMAT_8_8_8_8_UNORM, 0, true, true)?;
+        self.emit_destination(target, FORMAT_8_8_8_8_UNORM, A2D_BGRA_COLOR_SWAP)?;
+        self.emit_blit()?;
+        self.submission_end()
+    }
+
     pub(crate) fn copy(
         &mut self,
         source: Surface,

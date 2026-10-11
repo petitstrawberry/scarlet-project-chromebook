@@ -186,6 +186,7 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
                     input.capabilities.max_linear_pitch,
                 )?;
                 validate_rect(pass.area, target)?;
+                let mut depth_clear = None;
                 let depth = if let Some(depth) = pass.depth {
                     let depth_resource = find_resource(input.resources, depth.target)?;
                     let depth_target = require_depth_surface(
@@ -195,14 +196,27 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
                         input.capabilities.max_linear_pitch,
                     )?;
                     if let DepthLoadOp::Clear(value) = depth.load {
-                        emitter.clear_depth(depth_target, pass.area, value)?;
+                        depth_clear = Some((depth_target, value));
                     }
                     Some(depth.target)
                 } else {
                     None
                 };
-                if let LoadOp::Clear(color) = pass.load {
-                    emitter.clear(target, pass.area, color)?;
+                match (pass.load, depth_clear) {
+                    (LoadOp::Clear(color), Some((depth_target, value))) => {
+                        emitter.clear_color_and_depth(
+                            target,
+                            depth_target,
+                            pass.area,
+                            color,
+                            value,
+                        )?;
+                    }
+                    (LoadOp::Clear(color), None) => emitter.clear(target, pass.area, color)?,
+                    (_, Some((depth_target, value))) => {
+                        emitter.clear_depth(depth_target, pass.area, value)?;
+                    }
+                    _ => {}
                 }
                 state.pass = Some(PassState {
                     target: pass.target,
