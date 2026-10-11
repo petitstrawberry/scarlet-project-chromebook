@@ -21,6 +21,14 @@ pub(crate) fn encode(
     compiled: &RelocatablePm4,
     bindings: &[BoundObject],
 ) -> Result<Vec<u8>, IrSubmitError> {
+    let mut sorted_bindings: Vec<_> = bindings.iter().copied().collect();
+    sorted_bindings.sort_by_key(|bound| bound.object);
+    let bindings = sorted_bindings.as_slice();
+    let mut access_indices: Vec<_> = (0..compiled.accesses.len()).collect();
+    access_indices.sort_by_key(|&index| {
+        let access = &compiled.accesses[index];
+        (access.object, access.offset)
+    });
     let mut resources = Vec::new();
     resources
         .try_reserve_exact(compiled.accesses.len())
@@ -83,20 +91,24 @@ pub(crate) fn encode(
             ));
         }
         let fixup_access = wire_access(fixup.access)?;
-        let resource_index = compiled
-            .accesses
+        let first =
+            access_indices.partition_point(|&index| compiled.accesses[index].object < fixup.object);
+        let end = access_indices.partition_point(|&index| {
+            let access = &compiled.accesses[index];
+            (access.object, access.offset) <= (fixup.object, fixup.object_offset)
+        });
+        let resource_index = access_indices[first..end]
             .iter()
-            .enumerate()
-            .find(|(_, access)| {
-                if access.object != fixup.object || !access.access.contains(fixup.access) {
-                    return false;
-                }
-                let Some(end) = access.offset.checked_add(access.size) else {
-                    return false;
-                };
-                access.offset <= fixup.object_offset && required_end <= end
+            .rev()
+            .copied()
+            .find(|&index| {
+                let access = &compiled.accesses[index];
+                access.access.contains(fixup.access)
+                    && access
+                        .offset
+                        .checked_add(access.size)
+                        .is_some_and(|end| required_end <= end)
             })
-            .map(|(index, _)| index)
             .ok_or(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::ResourceState,
             ))?;
@@ -144,10 +156,11 @@ pub(crate) fn encode(
 }
 
 fn binding(bindings: &[BoundObject], object: ObjectRef) -> Result<BoundObject, IrSubmitError> {
+    let index = bindings.partition_point(|bound| bound.object < object);
     bindings
-        .iter()
+        .get(index)
         .copied()
-        .find(|binding| binding.object == object)
+        .filter(|bound| bound.object == object)
         .ok_or(IrSubmitError::Unsupported(
             UnsupportedIrFeature::ResourceState,
         ))
@@ -320,8 +333,9 @@ mod tests {
 
         let encoded = encode(&compiled, &bindings).expect("production texture upload wire");
         assert_eq!(compiled.fixups.len(), 1_024);
-        assert_eq!(compiled.accesses.len(), 257);
-        assert_eq!(encoded.len(), 55_392);
+        assert_eq!(compiled.generated_objects.len(), 1);
+        assert_eq!(compiled.accesses.len(), 2);
+        assert_eq!(encoded.len(), 47_232);
         assert!(encoded.len() <= adreno_a6xx_submit_wire::MAX_SUBMIT_SIZE);
     }
 
@@ -485,5 +499,17 @@ mod tests {
             ) && relocation.required_size == 4
                 && relocation.access == adreno_a6xx_submit_wire::ACCESS_WRITE
         }));
+    }
+    #[test]
+    #[ignore = "explicit CPU profiling workload; timings are not a correctness assertion"]
+    fn profile_texture_upload_encoding() {
+        let start = std::time::Instant::now();
+        for _ in 0..500 {
+            production_256_square_texture_upload_fits_the_submit_transport();
+        }
+        std::println!(
+            "texture_upload_256x256 iterations=500 elapsed_us={}",
+            start.elapsed().as_micros()
+        );
     }
 }

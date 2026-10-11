@@ -5,9 +5,9 @@ use gpu_raw::{GPU_ABI_VERSION, GPU_RESULT_SUCCESS, GpuQueue};
 use sgfx_codegen_adreno_a6xx as codegen;
 use sgfx_core::backend::SubmitError;
 
-use crate::dispatch::Chunk;
-use crate::execute::{validate_fixed_command_subset, submit_trace_enabled};
 use crate::completion::monotonic_time_ns;
+use crate::dispatch::Chunk;
+use crate::execute::{submit_trace_enabled, validate_fixed_command_subset};
 use crate::preparation::{
     PreparedChunk, UPLOAD_ARENA_BYTES, prepare_chunk, split_async_operations,
     split_submission_operations,
@@ -46,16 +46,41 @@ impl ContextResources {
         Ok(())
     }
 
-    fn prepare_upload_arenas(&mut self) -> Result<(), IrSubmitError> {
+    fn prepare_upload_arenas(&mut self, prepared: &[PreparedChunk]) -> Result<(), IrSubmitError> {
+        let mut required = [0u64; UPLOAD_ARENAS];
+        for (index, chunk) in prepared.iter().enumerate() {
+            let end = chunk
+                .placements
+                .iter()
+                .map(|&(_, offset, size)| offset + size)
+                .max()
+                .unwrap_or(0);
+            required[index % UPLOAD_ARENAS] = required[index % UPLOAD_ARENAS].max(end);
+        }
+        let count = prepared.len().clamp(1, UPLOAD_ARENAS);
         self.async_arenas
-            .try_reserve_exact(UPLOAD_ARENAS.saturating_sub(self.async_arenas.len()))
+            .try_reserve_exact(count.saturating_sub(self.async_arenas.len()))
             .map_err(|_| IrSubmitError::OutOfMemory)?;
-        while self.async_arenas.len() < UPLOAD_ARENAS {
-            let buffer = RawBuffer::create(&self.context, UPLOAD_ARENA_BYTES)?;
-            self.async_arenas.push(Arc::new(UploadArena {
-                buffer,
+        for (index, &required) in required[..count].iter().enumerate() {
+            let size = upload_arena_size(required)?;
+            if self
+                .async_arenas
+                .get(index)
+                .is_some_and(|arena| arena.buffer.logical_size >= size)
+            {
+                continue;
+            }
+            // Queued chunks retain their old Arc when a slot grows. Replacing
+            // this cache entry never overwrites in-flight bytes or drains GPU.
+            let arena = Arc::new(UploadArena {
+                buffer: RawBuffer::create(&self.context, size)?,
                 completion: std::sync::Mutex::new(None),
-            }));
+            });
+            if index < self.async_arenas.len() {
+                self.async_arenas[index] = arena;
+            } else {
+                self.async_arenas.push(arena);
+            }
         }
         Ok(())
     }
@@ -93,7 +118,7 @@ impl ContextResources {
             .prepare_async(context, commands, limits.max_opaque_command_size as usize)
             .map_err(SubmitError::Rejected)?;
         let prepared_at = if trace { monotonic_time_ns() } else { 0 };
-        self.prepare_upload_arenas()
+        self.prepare_upload_arenas(&prepared)
             .map_err(SubmitError::Rejected)?;
         let mut chunks = Vec::new();
         chunks
@@ -163,12 +188,23 @@ impl ContextResources {
             static SEQUENCE: AtomicU64 = AtomicU64::new(0);
             let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
             if sequence <= 8 || sequence % 64 == 0 {
-                std::println!("[a618-async-prepare] seq={} ops={} chunks={} upload_bytes={} wire_bytes={} prepare_us={} encode_us={}",
-                    sequence, commands.commands().len(), chunks.len(),
-                    chunks.iter().flat_map(|chunk| &chunk.uploads).map(|(_, bytes)| bytes.len()).sum::<usize>(),
-                    chunks.iter().map(|chunk| chunk.commands.len()).sum::<usize>(),
+                std::println!(
+                    "[a618-async-prepare] seq={} ops={} chunks={} upload_bytes={} wire_bytes={} prepare_us={} encode_us={}",
+                    sequence,
+                    commands.commands().len(),
+                    chunks.len(),
+                    chunks
+                        .iter()
+                        .flat_map(|chunk| &chunk.uploads)
+                        .map(|(_, bytes)| bytes.len())
+                        .sum::<usize>(),
+                    chunks
+                        .iter()
+                        .map(|chunk| chunk.commands.len())
+                        .sum::<usize>(),
                     prepared_at.saturating_sub(started) / 1_000,
-                    monotonic_time_ns().saturating_sub(prepared_at) / 1_000);
+                    monotonic_time_ns().saturating_sub(prepared_at) / 1_000
+                );
             }
         }
         let dispatcher = &self.context.dispatcher;
@@ -449,5 +485,30 @@ impl ContextResources {
             }
         }
         Ok((chunks, external_bindings))
+    }
+}
+
+fn upload_arena_size(required: u64) -> Result<u64, IrSubmitError> {
+    required
+        .max(64 * 1024)
+        .checked_next_power_of_two()
+        .filter(|&size| size <= UPLOAD_ARENA_BYTES)
+        .ok_or(IrSubmitError::SubmissionTooLarge)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn arenas_grow_with_actual_uploads_and_remain_bounded() {
+        assert_eq!(upload_arena_size(0).unwrap(), 64 * 1024);
+        assert_eq!(upload_arena_size(80).unwrap(), 64 * 1024);
+        assert_eq!(upload_arena_size(65_537).unwrap(), 128 * 1024);
+        assert_eq!(
+            upload_arena_size(UPLOAD_ARENA_BYTES).unwrap(),
+            UPLOAD_ARENA_BYTES
+        );
+        assert!(upload_arena_size(UPLOAD_ARENA_BYTES + 1).is_err());
+        assert!(upload_arena_size(u64::MAX).is_err());
     }
 }

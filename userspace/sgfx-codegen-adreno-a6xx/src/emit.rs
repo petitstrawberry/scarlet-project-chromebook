@@ -1406,11 +1406,76 @@ impl Emitter {
             return Err(CompileError::UnsupportedFeature);
         }
         let generated = self.add_generated(bytes, 64, Access::READ, GeneratedObjectKind::Upload)?;
-        let upload_size = u64::try_from(bytes.len()).map_err(|_| CompileError::Overflow)?;
-        if upload_size > destination_required_size {
+        self.copy_upload(
+            generated,
+            0,
+            bytes.len(),
+            destination,
+            destination_offset,
+            destination_required_size,
+        )
+    }
+
+    /// One immutable staging allocation for a complete texture strip. Row
+    /// copies retain precise destination bounds, including partial updates.
+    pub(crate) fn upload_rows(
+        &mut self,
+        destination: ObjectId,
+        destination_offset: u64,
+        destination_stride: u32,
+        row_bytes: usize,
+        bytes: Vec<u8>,
+    ) -> Result<(), CompileError> {
+        if row_bytes == 0 || row_bytes % 4 != 0 || bytes.len() % row_bytes != 0 {
+            return Err(CompileError::InvalidResource);
+        }
+        let rows = bytes.len() / row_bytes;
+        let id = GeneratedObjectId::new(
+            u32::try_from(self.generated_objects.len()).map_err(|_| CompileError::Overflow)?,
+        );
+        self.generated_objects
+            .try_reserve(1)
+            .map_err(|_| CompileError::OutOfMemory)?;
+        self.generated_objects.push(GeneratedObject {
+            id,
+            alignment: 64,
+            bytes,
+            access: Access::READ,
+            kind: GeneratedObjectKind::Upload,
+        });
+        for row in 0..rows {
+            let offset = destination_offset
+                .checked_add(
+                    (row as u64)
+                        .checked_mul(u64::from(destination_stride))
+                        .ok_or(CompileError::Overflow)?,
+                )
+                .ok_or(CompileError::Overflow)?;
+            self.copy_upload(
+                id,
+                (row * row_bytes) as u64,
+                row_bytes,
+                destination,
+                offset,
+                row_bytes as u64,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn copy_upload(
+        &mut self,
+        generated: GeneratedObjectId,
+        source_offset: u64,
+        size: usize,
+        destination: ObjectId,
+        destination_offset: u64,
+        destination_required_size: u64,
+    ) -> Result<(), CompileError> {
+        if size as u64 > destination_required_size {
             return Err(CompileError::OutOfBounds);
         }
-        let total_dwords = u32::try_from(bytes.len() / 4).map_err(|_| CompileError::Overflow)?;
+        let total_dwords = u32::try_from(size / 4).map_err(|_| CompileError::Overflow)?;
         let mut copied_dwords = 0_u32;
         while copied_dwords < total_dwords {
             let chunk_dwords = (total_dwords - copied_dwords).min(CP_MEMCPY_MAX_DWORDS);
@@ -1428,7 +1493,9 @@ impl Emitter {
             self.push_word(chunk_dwords)?;
             self.address_words(
                 ObjectRef::Generated(generated),
-                chunk_offset,
+                source_offset
+                    .checked_add(chunk_offset)
+                    .ok_or(CompileError::Overflow)?,
                 chunk_size,
                 Access::READ,
             )?;

@@ -1,6 +1,6 @@
 //! Normalized SGFX validation and A618 lowering.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use adreno_a6xx_layout::{DEPTH32_LAYER_ALIGNMENT, TILE_MODE_3, depth32_tile6_3_layout};
 use adreno_a6xx_shader_pack::PipelineVariant;
@@ -976,78 +976,49 @@ fn emit_texture_upload(
     if required_data > data.len() as u64 {
         return Err(CompileError::OutOfBounds);
     }
-    for row in 0..area.height() {
-        let source_offset = usize::try_from(
-            u64::from(row)
-                .checked_mul(u64::from(bytes_per_row))
-                .ok_or(CompileError::Overflow)?,
-        )
-        .map_err(|_| CompileError::Overflow)?;
-        let source_end = source_offset
-            .checked_add(logical_row_size as usize)
-            .ok_or(CompileError::Overflow)?;
-        let physical_row = convert_upload_row(
-            image.format,
-            image.storage_format,
-            &data[source_offset..source_end],
-        )?;
-        let destination_offset = surface
-            .plane_offset
-            .checked_add(
-                u64::from(area.y() + row)
-                    .checked_mul(u64::from(surface.stride))
-                    .ok_or(CompileError::Overflow)?,
-            )
-            .and_then(|offset| {
-                offset.checked_add(
-                    u64::from(area.x()) * u64::from(image.storage_format.bytes_per_pixel()?),
-                )
-            })
-            .ok_or(CompileError::Overflow)?;
-        emitter.upload_buffer(
-            destination,
-            destination_offset,
-            physical_row.len() as u64,
-            &physical_row,
-        )?;
-    }
-    Ok(())
-}
-
-fn convert_upload_row(
-    logical: TextureFormat,
-    storage: TextureFormat,
-    source: &[u8],
-) -> Result<Vec<u8>, CompileError> {
-    if storage != TextureFormat::Bgra8Unorm {
+    let row_bytes = (area.width() as usize)
+        .checked_mul(4)
+        .ok_or(CompileError::Overflow)?;
+    let total_bytes = row_bytes
+        .checked_mul(area.height() as usize)
+        .ok_or(CompileError::Overflow)?;
+    if image.storage_format != TextureFormat::Bgra8Unorm {
         return Err(CompileError::UnsupportedFeature);
     }
-    match logical {
-        TextureFormat::Bgra8Unorm => Ok(source.to_vec()),
-        TextureFormat::Rgba8Unorm => {
-            if source.len() & 3 != 0 {
-                return Err(CompileError::InvalidResource);
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(total_bytes)
+        .map_err(|_| CompileError::OutOfMemory)?;
+    for row in 0..area.height() as usize {
+        let start = row * bytes_per_row as usize;
+        let source = &data[start..start + logical_row_size as usize];
+        match image.format {
+            TextureFormat::Bgra8Unorm => pixels.extend_from_slice(source),
+            TextureFormat::Rgba8Unorm => {
+                for pixel in source.chunks_exact(4) {
+                    pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
             }
-            let mut converted = vec![0; source.len()];
-            for (source, destination) in source.chunks_exact(4).zip(converted.chunks_exact_mut(4)) {
-                destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
+            TextureFormat::R8Unorm => {
+                for &alpha in source {
+                    pixels.extend_from_slice(&[0, 0, 0, alpha]);
+                }
             }
-            Ok(converted)
+            _ => return Err(CompileError::UnsupportedFeature),
         }
-        TextureFormat::R8Unorm => {
-            let length = source.len().checked_mul(4).ok_or(CompileError::Overflow)?;
-            let mut converted = vec![0; length];
-            for (&alpha, destination) in source.iter().zip(converted.chunks_exact_mut(4)) {
-                destination.copy_from_slice(&[0, 0, 0, alpha]);
-            }
-            Ok(converted)
-        }
-        TextureFormat::Rg8Unorm
-        | TextureFormat::Nv12
-        | TextureFormat::Bgra8UnormSrgb
-        | TextureFormat::Rgba8UnormSrgb
-        | TextureFormat::Depth32Float => Err(CompileError::UnsupportedFeature),
     }
+    let destination_offset = surface
+        .plane_offset
+        .checked_add(u64::from(area.y()) * u64::from(surface.stride))
+        .and_then(|offset| offset.checked_add(u64::from(area.x()) * 4))
+        .ok_or(CompileError::Overflow)?;
+    emitter.upload_rows(
+        destination,
+        destination_offset,
+        surface.stride,
+        row_bytes,
+        pixels,
+    )
 }
 
 fn validate_pipeline_descriptor(pipeline: &PipelineMeta) -> Result<(), CompileError> {

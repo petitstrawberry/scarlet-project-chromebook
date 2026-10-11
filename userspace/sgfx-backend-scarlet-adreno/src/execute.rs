@@ -41,6 +41,12 @@ pub(crate) fn submit_trace_enabled() -> bool {
             "1" | "true" | "TRUE" | "debug" | "DEBUG" | "trace" | "TRACE"
         )
     });
+    // A cdylib can own a private std environment map that was never populated
+    // by the executable CRT. This explicit per-device diagnostic switch also
+    // works for dynamically loaded drivers; it is read only once per process.
+    #[cfg(feature = "std")]
+    let enabled = enabled || std::fs::read_to_string("/etc/sgfx-adreno-trace")
+        .is_ok_and(|value| value.trim() == "1");
     TRACE_CACHE.store(enabled as u8, Ordering::Relaxed);
     enabled
 }

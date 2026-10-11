@@ -676,7 +676,7 @@ impl sgfx_core::backend::CommandSubmitter for Executor<'_> {
 
     /// Submit owned GPU work without waiting for its completion or capacity.
     ///
-    /// The first tracked call creates four persistent upload arenas; first-use
+    /// Tracked calls grow at most four persistent upload arenas as needed; first-use
     /// logical resources can also synchronize while their SMMU mappings are
     /// installed. Subsequent calls reuse arenas only after successful native
     /// completion. Upload bytes and generated objects occupy disjoint retained

@@ -26,3 +26,10 @@ with `lib = "sgfx_scarlet_adreno"`, followed by a copy layer for the manifest.
 The SDK owns compilation, target selection, caching, installation and locking.
 Include this bundle after Scarlet's `sgfx-native` bundle. No project-specific
 build or install script is needed.
+
+For sampled submission profiling, set `SGFX_ADRENO_TRACE=1` before starting
+an application. If the platform loads a private std runtime in the DSO, put
+`1` in `/etc/sgfx-adreno-trace` before starting the application instead.
+The switch is cached once; removing the file and restarting disables it.
+Prepare timings cover normalization/compilation, encode timings cover wire
+creation, and retire timings include worker queueing, upload and GPU execution.

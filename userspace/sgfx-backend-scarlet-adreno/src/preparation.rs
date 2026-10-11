@@ -1,7 +1,7 @@
 //! Pure chunk planning shared by synchronous execution and tracked dispatch.
 
 use crate::wire::BoundObject;
-use crate::{IrSubmitError, UnsupportedIrFeature, ir, wire};
+use crate::{IrSubmitError, UnsupportedIrFeature, ir};
 use alloc::vec::Vec;
 use sgfx_codegen_adreno_a6xx as codegen;
 
@@ -340,24 +340,21 @@ pub(crate) fn prepare_chunk(
         operations,
     })?;
     let (placements, end) = generated_placements(&compiled, arena_end)?;
-    let mut bindings = external.to_vec();
-    bindings
-        .try_reserve_exact(placements.len())
-        .map_err(|_| IrSubmitError::OutOfMemory)?;
-    for &(id, offset, size) in &placements {
-        bindings.push(BoundObject {
-            object: codegen::ObjectRef::Generated(id),
-            attachment_token: 1,
-            allocation_offset: offset,
-            size,
-        });
-    }
-    match wire::encode(&compiled, &bindings) {
-        Ok(payload) if payload.len() <= native_limit => {}
-        Ok(_) | Err(IrSubmitError::SubmitWire(adreno_a6xx_submit_wire::Error::InvalidSize)) => {
+    // Count-only preflight avoids allocating, relocating and then discarding
+    // a complete wire stream. submit_async performs the actual checked encode
+    // for every chunk before publishing any work to the dispatcher.
+    let _ = external;
+    let size = adreno_a6xx_submit_wire::encoded_len_for_counts(
+        compiled.words.len(),
+        compiled.accesses.len(),
+        compiled.fixups.len(),
+    );
+    match size {
+        Ok(size) if size <= native_limit => {}
+        Ok(_) | Err(adreno_a6xx_submit_wire::Error::InvalidSize) => {
             return Err(IrSubmitError::SubmissionTooLarge);
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(IrSubmitError::SubmitWire(error)),
     }
     Ok((
         PreparedChunk {
@@ -371,6 +368,7 @@ pub(crate) fn prepare_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire;
     use alloc::vec;
     use codegen::{
         Access, Capabilities, GeneratedObjectKind, ImageMeta, ImageModifier, ObjectId, ObjectRef,
@@ -518,12 +516,18 @@ mod tests {
                 .iter()
                 .filter(|object| object.kind == GeneratedObjectKind::Upload)
                 .collect();
-            assert_eq!(uploads.len(), area.height() as usize);
-            for (local_row, upload) in uploads.iter().enumerate() {
-                assert_eq!(upload.bytes.len(), WIDTH as usize * 4);
+            assert_eq!(uploads.len(), 1);
+            assert_eq!(
+                uploads[0].bytes.len(),
+                WIDTH as usize * area.height() as usize * 4
+            );
+            for (local_row, upload) in uploads[0]
+                .bytes
+                .chunks_exact(WIDTH as usize * 4)
+                .enumerate()
+            {
                 let first = (rows as usize + local_row) * STRIDE as usize;
                 for (pixel, &alpha) in upload
-                    .bytes
                     .chunks_exact(4)
                     .zip(&source[first..first + WIDTH as usize])
                 {

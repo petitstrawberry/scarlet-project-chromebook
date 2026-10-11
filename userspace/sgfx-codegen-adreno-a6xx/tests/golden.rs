@@ -2072,3 +2072,86 @@ fn showcase_first_frame_compiles_as_one_complete_multipass_stream() {
     }));
     operations.clear();
 }
+
+#[test]
+fn partial_texture_upload_preserves_padding_and_untouched_pixels() {
+    // Exercise encoded copy addresses, not only the staging byte layout.
+    for format in [
+        TextureFormat::Bgra8Unorm,
+        TextureFormat::Rgba8Unorm,
+        TextureFormat::R8Unorm,
+    ] {
+        let mut destination = image(TARGET, TextureUsage::COPY_DST);
+        let ResourceKind::Image(ref mut meta) = destination.kind else {
+            unreachable!()
+        };
+        meta.format = format;
+        let bpp = format.bytes_per_pixel().unwrap() as usize;
+        let stride = 3 * bpp + 5;
+        let mut source = vec![0x99; stride * 2 + 3 * bpp];
+        for row in 0..3 {
+            for x in 0..3 * bpp {
+                source[row * stride + x] = (row * 17 + x + 1) as u8;
+            }
+        }
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &[destination],
+            pipelines: &[],
+            operations: &[Operation::WriteTexture {
+                destination: TARGET,
+                area: rect(2, 4, 3, 3),
+                bytes_per_row: stride as u32,
+                data: &source,
+            }],
+        })
+        .unwrap();
+        assert_eq!(artifact.generated_objects.len(), 1);
+        let mut actual = vec![0xa5; 16 * 64];
+        for packet in Packets::new(&artifact.words) {
+            let packet = packet.unwrap();
+            if matches!(packet.header, Header::Type7 { opcode: 0x75, .. }) {
+                let src = artifact
+                    .fixups
+                    .iter()
+                    .find(|f| f.word_offset == packet.word_offset + 2)
+                    .unwrap();
+                let dst = artifact
+                    .fixups
+                    .iter()
+                    .find(|f| f.word_offset == packet.word_offset + 4)
+                    .unwrap();
+                let ObjectRef::Generated(id) = src.object else {
+                    panic!("staging source")
+                };
+                assert_eq!(dst.object, ObjectRef::External(TARGET));
+                let staging = &artifact.generated_objects[id.raw() as usize].bytes;
+                let count = packet.payload[0] as usize * 4;
+                actual[dst.object_offset as usize..dst.object_offset as usize + count]
+                    .copy_from_slice(
+                        &staging[src.object_offset as usize..src.object_offset as usize + count],
+                    );
+            }
+        }
+        let mut expected = vec![0xa5; 16 * 64];
+        for row in 0..3 {
+            for x in 0..3 {
+                let from = row * stride + x * bpp;
+                let color = match format {
+                    TextureFormat::Bgra8Unorm => source[from..from + 4].try_into().unwrap(),
+                    TextureFormat::Rgba8Unorm => [
+                        source[from + 2],
+                        source[from + 1],
+                        source[from],
+                        source[from + 3],
+                    ],
+                    TextureFormat::R8Unorm => [0, 0, 0, source[from]],
+                    _ => unreachable!(),
+                };
+                let to = (row + 4) * 64 + (x + 2) * 4;
+                expected[to..to + 4].copy_from_slice(&color);
+            }
+        }
+        assert_eq!(actual, expected, "{format:?}");
+    }
+}

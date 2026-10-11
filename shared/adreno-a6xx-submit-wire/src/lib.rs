@@ -201,6 +201,17 @@ fn layout(
     })
 }
 
+/// Check wire table limits and compute the exact allocation size without
+/// constructing or encoding payload tables. Content validation still belongs
+/// to `encode` and must complete before submission is accepted.
+pub fn encoded_len_for_counts(
+    pm4: usize,
+    resources: usize,
+    relocations: usize,
+) -> Result<usize, Error> {
+    Ok(layout(pm4, resources, relocations)?.total)
+}
+
 /// Return the exact number of bytes needed to encode `submit`.
 pub fn encoded_len(submit: Submit<'_>) -> Result<usize, Error> {
     Ok(layout(
