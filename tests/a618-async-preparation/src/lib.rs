@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use sgfx_core::ir;
 

@@ -4741,14 +4741,16 @@ mod tests {
         // resource records may share a token but have different range offsets.
         let bytes = wire_from_codegen(&artifact);
         let decoded = adreno_a6xx_submit_wire::decode(&bytes).unwrap();
-        let resources: std::vec::Vec<_> = (0..decoded.resource_len()).map(|i| {
-            let mut resource = decoded.resource(i).unwrap();
-            if resource.attachment_token >= 0x1000 {
-                resource.range_offset += (resource.attachment_token - 0x1000) * 256;
-                resource.attachment_token = 0x1000;
-            }
-            resource
-        }).collect();
+        let resources: std::vec::Vec<_> = (0..decoded.resource_len())
+            .map(|i| {
+                let mut resource = decoded.resource(i).unwrap();
+                if resource.attachment_token >= 0x1000 {
+                    resource.range_offset += (resource.attachment_token - 0x1000) * 256;
+                    resource.attachment_token = 0x1000;
+                }
+                resource
+            })
+            .collect();
         let relocations: std::vec::Vec<_> = (0..decoded.relocation_len())
             .map(|i| decoded.relocation(i).unwrap())
             .collect();

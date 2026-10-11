@@ -1652,7 +1652,9 @@ impl Emitter {
             if previous_end.is_some_and(|offset| offset > start) {
                 return Err(CompileError::InvalidPm4);
             }
-            if end > self.words.len() || !fixup.encoding.placeholder_is_valid(&self.words[start..end]) {
+            if end > self.words.len()
+                || !fixup.encoding.placeholder_is_valid(&self.words[start..end])
+            {
                 return Err(CompileError::InvalidPm4);
             }
             previous_end = Some(end);

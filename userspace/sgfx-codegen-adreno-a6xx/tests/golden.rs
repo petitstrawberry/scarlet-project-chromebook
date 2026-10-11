@@ -394,13 +394,15 @@ fn depth32_clear_test_and_write_are_a_relocatable_sysmem_stream() {
     })
     .unwrap();
 
-
     // Reproduce the old independent clear batches without changing the draws.
     let Operation::BeginRenderPass(mut depth_only) = operations[0].clone() else {
         unreachable!()
     };
     depth_only.load = LoadOp::Load;
-    let mut separate = vec![Operation::BeginRenderPass(depth_only), Operation::EndRenderPass];
+    let mut separate = vec![
+        Operation::BeginRenderPass(depth_only),
+        Operation::EndRenderPass,
+    ];
     separate.extend(operations.iter().cloned());
     if let Operation::BeginRenderPass(pass) = &mut separate[2] {
         pass.depth.as_mut().unwrap().load = DepthLoadOp::Load;
@@ -410,12 +412,28 @@ fn depth32_clear_test_and_write_are_a_relocatable_sysmem_stream() {
         resources: &resources,
         pipelines: &pipelines,
         operations: &separate,
-    }).unwrap();
-    let idle_count = |artifact: &sgfx_codegen_adreno_a6xx::RelocatablePm4| Packets::new(&artifact.words)
-        .map(Result::unwrap).filter(|packet| matches!(packet.header,
-            Header::Type7 { opcode: opcode::WAIT_FOR_IDLE, .. })).count();
+    })
+    .unwrap();
+    let idle_count = |artifact: &sgfx_codegen_adreno_a6xx::RelocatablePm4| {
+        Packets::new(&artifact.words)
+            .map(Result::unwrap)
+            .filter(|packet| {
+                matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: opcode::WAIT_FOR_IDLE,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
     assert_eq!(idle_count(&unbatched), idle_count(&artifact) + 4);
-    println!("CLEAR_BATCH unbatched_wfi={} batched_wfi={}", idle_count(&unbatched), idle_count(&artifact));
+    println!(
+        "CLEAR_BATCH unbatched_wfi={} batched_wfi={}",
+        idle_count(&unbatched),
+        idle_count(&artifact)
+    );
 
     assert_well_formed(&artifact);
     assert_ccu_clean_before_every_color_invalidate(&artifact);
@@ -1617,13 +1635,28 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
     assert_eq!(draws.len(), 4);
     // Solid -> textured -> different fragment program must all remain
     // pipelined, not merely adjacent draws with identical fixed state.
-    assert!(packets[draws[0] + 1..*draws.last().unwrap()].iter().all(|packet| {
-        !matches!(packet.header, Header::Type7 { opcode: opcode::WAIT_FOR_IDLE | 0x3d, .. })
-            && !matches!(packet.header, Header::Type7 { opcode: opcode::EVENT_WRITE, .. }
+    assert!(
+        packets[draws[0] + 1..*draws.last().unwrap()]
+            .iter()
+            .all(|packet| {
+                !matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: opcode::WAIT_FOR_IDLE | 0x3d,
+                        ..
+                    }
+                ) && !matches!(packet.header, Header::Type7 { opcode: opcode::EVENT_WRITE, .. }
                 if packet.payload == [0x31])
-    }));
-    assert_eq!(artifact.generated_objects.iter()
-        .filter(|object| object.kind == GeneratedObjectKind::TextureState).count(), 1);
+            })
+    );
+    assert_eq!(
+        artifact
+            .generated_objects
+            .iter()
+            .filter(|object| object.kind == GeneratedObjectKind::TextureState)
+            .count(),
+        1
+    );
 
     assert!(
         packets[draws[0] + 1..draws[1]].iter().all(|packet| {

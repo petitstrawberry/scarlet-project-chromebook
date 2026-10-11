@@ -741,9 +741,14 @@ mod tests {
 
     #[test]
     fn copy_source_usage_is_preserved_for_layout_selection() {
-        let desc = ir::TextureDesc::new(ir::TextureFormat::Bgra8Unorm,
+        let desc = ir::TextureDesc::new(
+            ir::TextureFormat::Bgra8Unorm,
             ir::Extent2D::new(64, 64).unwrap(),
-            ir::TextureUsage::RENDER_ATTACHMENT | ir::TextureUsage::SAMPLED | ir::TextureUsage::COPY_SRC).unwrap();
+            ir::TextureUsage::RENDER_ATTACHMENT
+                | ir::TextureUsage::SAMPLED
+                | ir::TextureUsage::COPY_SRC,
+        )
+        .unwrap();
         let (_, usage) = super::image_create_parameters(desc).unwrap();
         assert_ne!(usage & gpu_raw::GPU_IMAGE_USAGE_TRANSFER_SRC, 0);
     }

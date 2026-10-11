@@ -183,14 +183,15 @@ From the Nix development shell:
 cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
-The normal Scarlet bundles select SGFX `3a8d90cf` and ScarletUI `feed7b6a`.
-The Adreno driver uses core `040dbb5c` and runtime `d3b1c051` internally.
-The loadable driver exposes SGFX ABI v2; Rust objects and allocators remain
-private to the library. Native 64-bit clients load Adreno dynamically from
-`/lib/sgfx/libsgfx_scarlet_adreno.so`; `sgfx-probe` reports the linkage and path.
-The `sgfx-native` bundle installs `/lib/sgfx` and generates the native linker
-configuration before any userspace compilation. The project selects that
-configuration for both initramfs and rootfs builds.
+The current Scarlet bundles select SGFX `1a27c83c` and ScarletUI `5e167123`.
+Native 64-bit clients currently use the statically linked Adreno backend;
+`sgfx-probe` reports `scarlet-adreno` with `linkage: static`. This selection is
+retained while investigating the remaining GPU performance regression.
+The shared Adreno driver is also bundled at `/lib/sgfx/libsgfx_scarlet_adreno.so`
+for dynamic clients. It exposes SGFX ABI v2; Rust objects and allocators remain
+private to the library. The `sgfx-native` bundle installs `/lib/sgfx` and
+generates the native linker configuration before userspace compilation. The
+project selects that configuration for both initramfs and rootfs builds.
 
 Userspace is built by the standard Scarlet bundles with their published Git
 revisions and checked-in Cargo locks. The project does not inject local source
