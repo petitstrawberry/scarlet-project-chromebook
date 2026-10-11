@@ -19,6 +19,7 @@ use std::{
 
 use crate::asynchronous::{DispatchOwner, UploadArena};
 use crate::completion::{completion_status, monotonic_time_ns, remaining_timeout_ns};
+use crate::resource::RawBuffer;
 use crate::scheduler::{AdmissionError, DispatchError, Scheduler, Transport};
 use crate::{Handle, HandleError, HandleResult, IrSubmitError};
 use sgfx_core::backend::CompletionStatus;
@@ -190,10 +191,23 @@ impl Signal {
     }
 }
 
-pub(crate) struct Chunk {
-    pub(crate) commands: Vec<u8>,
-    pub(crate) arena: Arc<UploadArena>,
-    pub(crate) uploads: Vec<(u64, Vec<u8>)>,
+pub(crate) enum Chunk {
+    Commands {
+        commands: Vec<u8>,
+        arena: Arc<UploadArena>,
+        uploads: Vec<(u64, Vec<u8>)>,
+    },
+    WriteBuffer {
+        buffer: Arc<RawBuffer>,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    Barrier,
+}
+
+enum Receipt {
+    Native(Arc<GpuCompletion>),
+    Cpu,
 }
 
 struct Native;
@@ -204,21 +218,31 @@ impl Transport for Native {
     // chunk has been submitted and retired. Session/receipt drop cannot detach
     // resources needed by chunks that have not reached the kernel yet.
     type Owner = Arc<DispatchOwner>;
-    type Receipt = Arc<GpuCompletion>;
+    type Receipt = Receipt;
     type Signal = Arc<Signal>;
     type Error = Failure;
 
     fn size(chunk: &Chunk) -> usize {
-        chunk
-            .uploads
-            .iter()
-            .fold(chunk.commands.len(), |size, (_, bytes)| {
+        match chunk {
+            Chunk::Commands {
+                commands, uploads, ..
+            } => uploads.iter().fold(commands.len(), |size, (_, bytes)| {
                 size.saturating_add(bytes.len())
-            })
+            }),
+            Chunk::WriteBuffer { data, .. } => data.len(),
+            Chunk::Barrier => 0,
+        }
+    }
+
+    fn requires_idle(chunk: &Chunk) -> bool {
+        !matches!(chunk, Chunk::Commands { .. })
     }
 
     fn ready(&self, chunk: &Chunk) -> Result<bool, Failure> {
-        let previous = lock(&chunk.arena.completion).clone();
+        let Chunk::Commands { arena, .. } = chunk else {
+            return Ok(true);
+        };
+        let previous = lock(&arena.completion).clone();
         previous
             .as_ref()
             .map_or(Ok(true), |completion| native_status(completion))
@@ -228,22 +252,39 @@ impl Transport for Native {
         &self,
         owner: &Arc<DispatchOwner>,
         chunk: &Chunk,
-    ) -> Result<Arc<GpuCompletion>, DispatchError<Failure>> {
-        // This arena's previous native use has retired. Upload writes happen
-        // only on the worker, before submission; a Busy response can retry
-        // these same bytes without changing anything consumed by pending work.
-        for (offset, bytes) in &chunk.uploads {
-            chunk
-                .arena
+    ) -> Result<Receipt, DispatchError<Failure>> {
+        let (commands, arena, uploads) = match chunk {
+            Chunk::Commands {
+                commands,
+                arena,
+                uploads,
+            } => (commands, arena, uploads),
+            Chunk::WriteBuffer {
+                buffer,
+                offset,
+                data,
+            } => {
+                // Only the worker writes, after every earlier native receipt
+                // retired. Admission keeps owned bytes; subsequent draws cannot
+                // pass this update. RawBuffer is CPU/GPU coherent on A618.
+                buffer
+                    .write(*offset, data)
+                    .map_err(|error| DispatchError::Failed(Failure::Backend(error)))?;
+                return Ok(Receipt::Cpu);
+            }
+            Chunk::Barrier => return Ok(Receipt::Cpu),
+        };
+        for (offset, bytes) in uploads {
+            arena
                 .buffer
                 .write(*offset, bytes)
                 .map_err(|error| DispatchError::Failed(Failure::Backend(error)))?;
         }
-        match owner.queue.submit_async(&chunk.commands) {
+        match owner.queue.submit_async(commands) {
             Ok(completion) => {
                 let completion = Arc::new(completion);
-                *lock(&chunk.arena.completion) = Some(Arc::clone(&completion));
-                Ok(completion)
+                *lock(&arena.completion) = Some(Arc::clone(&completion));
+                Ok(Receipt::Native(completion))
             }
             Err(GpuSubmitError::Busy) => Err(DispatchError::Busy),
             Err(GpuSubmitError::Rejected(error) | GpuSubmitError::Failed { error, .. }) => {
@@ -257,8 +298,11 @@ impl Transport for Native {
         }
     }
 
-    fn poll(&self, receipt: &Arc<GpuCompletion>) -> Result<bool, Failure> {
-        native_status(receipt)
+    fn poll(&self, receipt: &Receipt) -> Result<bool, Failure> {
+        match receipt {
+            Receipt::Native(completion) => native_status(completion),
+            Receipt::Cpu => Ok(true),
+        }
     }
     fn complete(&self, signal: &Arc<Signal>, result: Result<(), Failure>) {
         signal.complete(result);
@@ -382,11 +426,13 @@ fn run(shared: Arc<Shared>) {
             {
                 return;
             }
-            handles.extend(
-                scheduler
-                    .receipts()
-                    .map(|receipt| PollHandle::new(receipt.as_handle().as_raw() as u32, POLLIN)),
-            );
+            handles.extend(scheduler.receipts().filter_map(|receipt| match receipt {
+                Receipt::Native(completion) => Some(PollHandle::new(
+                    completion.as_handle().as_raw() as u32,
+                    POLLIN,
+                )),
+                Receipt::Cpu => None,
+            }));
             (progressed, !scheduler.is_empty())
         };
         if progressed {

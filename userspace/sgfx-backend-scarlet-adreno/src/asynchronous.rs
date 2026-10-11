@@ -39,15 +39,37 @@ pub(crate) struct DispatchOwner {
     pub(crate) _resources: Arc<RetainedResources>,
 }
 
+enum PreparedWork {
+    Commands(PreparedChunk),
+    WriteBuffer {
+        buffer: Arc<RawBuffer>,
+        offset: u64,
+        data: Vec<u8>,
+    },
+}
+
+impl PreparedWork {
+    fn commands(&self) -> Option<&PreparedChunk> {
+        match self {
+            Self::Commands(chunk) => Some(chunk),
+            _ => None,
+        }
+    }
+}
+
 impl ContextResources {
     pub(crate) fn drain_async(&self) -> Result<(), IrSubmitError> {
         self.context.dispatcher.wait_idle()?;
         Ok(())
     }
 
-    fn prepare_upload_arenas(&mut self, prepared: &[PreparedChunk]) -> Result<(), IrSubmitError> {
+    fn prepare_upload_arenas(&mut self, prepared: &[PreparedWork]) -> Result<(), IrSubmitError> {
         let mut required = [0u64; UPLOAD_ARENAS];
-        for (index, chunk) in prepared.iter().enumerate() {
+        for (index, chunk) in prepared
+            .iter()
+            .filter_map(PreparedWork::commands)
+            .enumerate()
+        {
             let end = chunk
                 .placements
                 .iter()
@@ -56,7 +78,11 @@ impl ContextResources {
                 .unwrap_or(0);
             required[index % UPLOAD_ARENAS] = required[index % UPLOAD_ARENAS].max(end);
         }
-        let count = prepared.len().clamp(1, UPLOAD_ARENAS);
+        let count = prepared
+            .iter()
+            .filter_map(PreparedWork::commands)
+            .count()
+            .min(UPLOAD_ARENAS);
         self.async_arenas
             .try_reserve_exact(count.saturating_sub(self.async_arenas.len()))
             .map_err(|_| IrSubmitError::OutOfMemory)?;
@@ -120,8 +146,25 @@ impl ContextResources {
         chunks
             .try_reserve_exact(prepared.len().max(1))
             .map_err(|_| SubmitError::Rejected(IrSubmitError::OutOfMemory))?;
-        for (index, chunk) in prepared.into_iter().enumerate() {
+        let mut index = 0;
+        for work in prepared {
+            let chunk = match work {
+                PreparedWork::Commands(chunk) => chunk,
+                PreparedWork::WriteBuffer {
+                    buffer,
+                    offset,
+                    data,
+                } => {
+                    chunks.push(Chunk::WriteBuffer {
+                        buffer,
+                        offset,
+                        data,
+                    });
+                    continue;
+                }
+            };
             let arena = Arc::clone(&self.async_arenas[index % UPLOAD_ARENAS]);
+            index += 1;
             let mut bindings = Vec::new();
             bindings
                 .try_reserve_exact(external_bindings.len() + chunk.placements.len())
@@ -149,18 +192,14 @@ impl ContextResources {
             {
                 uploads.push((offset, generated.bytes));
             }
-            chunks.push(Chunk {
+            chunks.push(Chunk::Commands {
                 commands,
                 arena,
                 uploads,
             });
         }
         if chunks.is_empty() {
-            chunks.push(Chunk {
-                commands: Vec::new(),
-                arena: Arc::clone(&self.async_arenas[0]),
-                uploads: Vec::new(),
-            });
+            chunks.push(Chunk::Barrier);
         }
         let mut images = Vec::new();
         let mut buffers = Vec::new();
@@ -198,7 +237,7 @@ impl ContextResources {
         context: &ContextInner,
         commands: &ir::CommandBuffer<'r, 'data>,
         native_limit: usize,
-    ) -> Result<(Vec<PreparedChunk>, Vec<BoundObject>), IrSubmitError> {
+    ) -> Result<(Vec<PreparedWork>, Vec<BoundObject>), IrSubmitError> {
         let mut resources = Vec::new();
         let mut pipelines = Vec::new();
         let mut operations = Vec::new();
@@ -405,6 +444,43 @@ impl ContextResources {
         let mut chunks = Vec::new();
         let mut owned_bytes = 0usize;
         while let Some(operations) = pending.pop() {
+            if let [
+                codegen::Operation::WriteBuffer {
+                    destination,
+                    offset,
+                    data,
+                },
+            ] = operations.as_slice()
+            {
+                let resource = resources
+                    .iter()
+                    .find(|resource| resource.id == *destination)
+                    .ok_or(IrSubmitError::ResourceTableMismatch)?;
+                let binding = external_bindings
+                    .iter()
+                    .find(|binding| binding.object == codegen::ObjectRef::External(*destination))
+                    .ok_or(IrSubmitError::ResourceTableMismatch)?;
+                let buffer = self
+                    .buffers
+                    .iter()
+                    .flatten()
+                    .find(|buffer| buffer.attachment_token == binding.attachment_token)
+                    .ok_or(IrSubmitError::ResourceTableMismatch)?;
+                let data = own_buffer_write(resource, *offset, data)?;
+                owned_bytes = owned_bytes
+                    .checked_add(data.len())
+                    .filter(|bytes| *bytes <= MAX_LOGICAL_BYTES)
+                    .ok_or(IrSubmitError::SubmissionTooLarge)?;
+                chunks
+                    .try_reserve(1)
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+                chunks.push(PreparedWork::WriteBuffer {
+                    buffer: Arc::clone(buffer),
+                    offset: *offset,
+                    data,
+                });
+                continue;
+            }
             let result = prepare_chunk(
                 context.device.codegen_capabilities,
                 &resources,
@@ -424,7 +500,7 @@ impl ContextResources {
                     chunks
                         .try_reserve(1)
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
-                    chunks.push(chunk);
+                    chunks.push(PreparedWork::Commands(chunk));
                 }
                 Err(
                     error @ (IrSubmitError::SubmissionTooLarge
@@ -460,6 +536,35 @@ impl ContextResources {
     }
 }
 
+/// Validate before admission, then retain only the caller's written range.
+fn own_buffer_write(
+    resource: &codegen::ResourceMeta,
+    offset: u64,
+    data: &[u8],
+) -> Result<Vec<u8>, IrSubmitError> {
+    let codegen::ResourceKind::Buffer { usage } = resource.kind else {
+        return Err(codegen::CompileError::InvalidResource.into());
+    };
+    if !usage.contains(ir::BufferUsage::COPY_DST) {
+        return Err(codegen::CompileError::InvalidResource.into());
+    }
+    if data.is_empty() || data.len() % 4 != 0 || offset % 4 != 0 {
+        return Err(codegen::CompileError::UnsupportedFeature.into());
+    }
+    if offset
+        .checked_add(data.len() as u64)
+        .is_none_or(|end| end > resource.size)
+    {
+        return Err(codegen::CompileError::OutOfBounds.into());
+    }
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(data.len())
+        .map_err(|_| IrSubmitError::OutOfMemory)?;
+    owned.extend_from_slice(data);
+    Ok(owned)
+}
+
 fn upload_arena_size(required: u64) -> Result<u64, IrSubmitError> {
     required
         .max(64 * 1024)
@@ -471,6 +576,35 @@ fn upload_arena_size(required: u64) -> Result<u64, IrSubmitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_write_owns_only_the_written_range_and_preserves_validation() {
+        let resource = codegen::ResourceMeta {
+            id: codegen::ObjectId::new(1),
+            size: 8 * 1024 * 1024,
+            kind: codegen::ResourceKind::Buffer {
+                usage: ir::BufferUsage::COPY_DST,
+            },
+        };
+        let mut input = alloc::vec![7; 256 * 1024];
+        let retained = own_buffer_write(&resource, 1024, &input).unwrap();
+        input.fill(0);
+        assert_eq!(retained.len(), 256 * 1024);
+        assert!(retained.iter().all(|&byte| byte == 7));
+        assert!(own_buffer_write(&resource, resource.size - 4, &[1; 8]).is_err());
+        assert!(own_buffer_write(&resource, u64::MAX - 3, &[1; 8]).is_err());
+        assert!(own_buffer_write(&resource, 1, &[1; 4]).is_err());
+        assert!(own_buffer_write(&resource, 0, &[1; 3]).is_err());
+        assert!(own_buffer_write(&resource, 0, &[]).is_err());
+        let readonly = codegen::ResourceMeta {
+            kind: codegen::ResourceKind::Buffer {
+                usage: ir::BufferUsage::VERTEX,
+            },
+            ..resource
+        };
+        assert!(own_buffer_write(&readonly, 0, &[1; 4]).is_err());
+    }
+
     #[test]
     fn arenas_grow_with_actual_uploads_and_remain_bounded() {
         assert_eq!(upload_arena_size(0).unwrap(), 64 * 1024);

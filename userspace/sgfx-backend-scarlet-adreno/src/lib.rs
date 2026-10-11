@@ -679,10 +679,11 @@ impl sgfx_core::backend::CommandSubmitter for Executor<'_> {
     /// Tracked calls grow at most four persistent upload arenas as needed; first-use
     /// logical resources can also synchronize while their SMMU mappings are
     /// installed. Subsequent calls reuse arenas only after successful native
-    /// completion. Upload bytes and generated objects occupy disjoint retained
-    /// storage, and kernel ownership survives session or receipt destruction.
-    /// Buffer upload offsets and lengths must be multiples of four for native
-    /// CP_MEMCPY; unsupported alignment is rejected before logical admission.
+    /// completion. Buffer updates retain owned bytes and write the coherent
+    /// mapping on the worker after preceding GPU work retires, without a staging
+    /// GPU copy. Texture uploads and generated objects still use the arenas.
+    /// Kernel ownership survives session or receipt destruction. Buffer updates
+    /// retain the four-byte alignment contract and are validated before admission.
     fn submit<'r, 'data>(
         &mut self,
         commands: &ir::CommandBuffer<'r, 'data>,

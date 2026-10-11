@@ -29,6 +29,10 @@ pub(crate) trait Transport {
     type Error: Copy;
 
     fn size(chunk: &Self::Chunk) -> usize;
+    /// CPU updates must not overwrite data still read by preceding GPU work.
+    fn requires_idle(_chunk: &Self::Chunk) -> bool {
+        false
+    }
     fn ready(&self, chunk: &Self::Chunk) -> Result<bool, Self::Error>;
     fn submit(
         &self,
@@ -167,7 +171,8 @@ impl<T: Transport> Scheduler<T> {
         let mut in_flight = self.receipts().count();
         for job in &mut self.jobs {
             while let Some(chunk) = job.chunks.get(job.next) {
-                if in_flight == MAX_NATIVE_IN_FLIGHT {
+                if in_flight == MAX_NATIVE_IN_FLIGHT || (in_flight != 0 && T::requires_idle(chunk))
+                {
                     return progressed;
                 }
                 match transport.ready(chunk) {
@@ -435,5 +440,124 @@ mod tests {
                 Err(AdmissionError::Failed(7))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mapped_write_tests {
+    use super::*;
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    enum Chunk {
+        Draw(usize),
+        Write(u32),
+    }
+    #[derive(Default)]
+    struct State {
+        buffer: u32,
+        retired: [bool; 3],
+        reads: Vec<(usize, u32)>,
+        signals: Vec<Result<(), u32>>,
+        fail: bool,
+    }
+    struct Fake(Rc<RefCell<State>>);
+    impl Transport for Fake {
+        type Chunk = Chunk;
+        type Owner = ();
+        type Receipt = Option<usize>;
+        type Signal = ();
+        type Error = u32;
+        fn size(_: &Chunk) -> usize {
+            4
+        }
+        fn requires_idle(chunk: &Chunk) -> bool {
+            matches!(chunk, Chunk::Write(_))
+        }
+        fn ready(&self, _: &Chunk) -> Result<bool, u32> {
+            Ok(true)
+        }
+        fn submit(&self, _: &(), chunk: &Chunk) -> Result<Option<usize>, DispatchError<u32>> {
+            let mut state = self.0.borrow_mut();
+            match *chunk {
+                Chunk::Write(value) => {
+                    state.buffer = value;
+                    Ok(None)
+                }
+                Chunk::Draw(id) => {
+                    let value = state.buffer;
+                    state.reads.push((id, value));
+                    Ok(Some(id))
+                }
+            }
+        }
+        fn poll(&self, receipt: &Option<usize>) -> Result<bool, u32> {
+            let state = self.0.borrow();
+            if state.fail {
+                return Err(7);
+            }
+            Ok(receipt.is_none_or(|id| state.retired[id]))
+        }
+        fn complete(&self, _: &(), result: Result<(), u32>) {
+            self.0.borrow_mut().signals.push(result);
+        }
+    }
+
+    #[test]
+    fn cpu_updates_cannot_overtake_reads_in_the_same_or_previous_job() {
+        let state = Rc::new(RefCell::new(State {
+            buffer: 11,
+            ..State::default()
+        }));
+        let fake = Fake(Rc::clone(&state));
+        let mut queue = Scheduler::new();
+        queue
+            .enqueue(
+                alloc::vec![Chunk::Draw(0), Chunk::Write(22), Chunk::Draw(1)],
+                (),
+                (),
+            )
+            .unwrap();
+        queue
+            .enqueue(alloc::vec![Chunk::Write(33), Chunk::Draw(2)], (), ())
+            .unwrap();
+        queue.advance(&fake);
+        assert_eq!(state.borrow().buffer, 11);
+        assert_eq!(state.borrow().reads, [(0, 11)]);
+        // Polling again must not turn mere admission into retirement.
+        queue.advance(&fake);
+        assert_eq!(state.borrow().buffer, 11);
+        state.borrow_mut().retired[0] = true;
+        queue.advance(&fake);
+        assert_eq!(state.borrow().buffer, 22);
+        assert_eq!(state.borrow().reads, [(0, 11), (1, 22)]);
+        queue.advance(&fake);
+        assert_eq!(state.borrow().buffer, 22);
+        state.borrow_mut().retired[1] = true;
+        queue.advance(&fake);
+        assert_eq!(state.borrow().reads, [(0, 11), (1, 22), (2, 33)]);
+        state.borrow_mut().retired[2] = true;
+        queue.advance(&fake);
+        assert!(queue.is_empty());
+        assert_eq!(state.borrow().signals, [Ok(()), Ok(())]);
+    }
+
+    #[test]
+    fn failed_gpu_read_never_authorizes_a_cpu_overwrite() {
+        let state = Rc::new(RefCell::new(State {
+            buffer: 11,
+            ..State::default()
+        }));
+        let fake = Fake(Rc::clone(&state));
+        let mut queue = Scheduler::new();
+        queue
+            .enqueue(alloc::vec![Chunk::Draw(0), Chunk::Write(22)], (), ())
+            .unwrap();
+        queue.advance(&fake);
+        state.borrow_mut().fail = true;
+        queue.advance(&fake);
+        assert_eq!(state.borrow().buffer, 11);
+        assert_eq!(state.borrow().signals, [Err(7)]);
+        assert_eq!(queue.failure(), Some(7));
     }
 }
