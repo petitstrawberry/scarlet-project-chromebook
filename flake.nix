@@ -147,6 +147,8 @@
             buildAndTestSubdir = "cargo-scarlet";
             cargoLock.lockFile = "${scarlet-sdk}/Cargo.lock";
             nativeBuildInputs = [ pkgs.curl ];
+            # Cache safety tests create Git repositories to check tracked files.
+            nativeCheckInputs = [ pkgs.git ];
           };
 
           cargo-scarlet-plugin-limine = pkgs.rustPlatform.buildRustPackage {
