@@ -342,6 +342,9 @@ impl ContextResources {
                 ir::Command::SetUniforms(uniforms) => {
                     operations.push(codegen::Operation::SetUniforms(*uniforms));
                 }
+                ir::Command::SetViewport(viewport) => {
+                    operations.push(codegen::Operation::SetViewport(*viewport));
+                }
                 ir::Command::SetScissor(scissor) => {
                     operations.push(codegen::Operation::SetScissor(*scissor));
                 }

@@ -7,7 +7,7 @@ use adreno_a6xx_shader_pack::{
     FragmentMeta, LinkMeta, PipelineVariant, SHADER_SIZE, ShaderMeta, VertexMeta, link_meta,
     shader_meta,
 };
-use sgfx_core::ir::{Color, CompareFunction, IndexFormat, PixelRect};
+use sgfx_core::ir::{Color, CompareFunction, IndexFormat, PixelRect, Viewport};
 
 use crate::model::{
     Access, AddressEncoding, CompileError, GeneratedObject, GeneratedObjectId, GeneratedObjectKind,
@@ -199,6 +199,7 @@ pub(crate) struct DrawState {
     pub(crate) target: Surface,
     pub(crate) area: PixelRect,
     pub(crate) scissor: PixelRect,
+    pub(crate) viewport: Viewport,
     pub(crate) vertex: ObjectId,
     pub(crate) vertex_offset: u64,
     pub(crate) vertex_size: u64,
@@ -666,8 +667,6 @@ impl Emitter {
         self.emit_depth_state(draw.depth)?;
         self.emit_single_sample_state()?;
 
-        let target_area = PixelRect::new(0, 0, draw.target.width, draw.target.height)
-            .map_err(|_| CompileError::InvalidResource)?;
         let target_br = pack_xy(draw.target.width - 1, draw.target.height - 1);
         let area_br = pack_xy(
             draw.area.x() + draw.area.width() - 1,
@@ -682,10 +681,10 @@ impl Emitter {
         // framebuffer: shrinking the hardware viewport to that area remaps
         // the whole scene into each dirty rectangle.  VirGL/wgpu keep the
         // target viewport stable and apply damage only through scissors.
-        self.packet4(GRAS_CL_VIEWPORT_XOFFSET, &viewport_transform(target_area))?;
+        self.packet4(GRAS_CL_VIEWPORT_XOFFSET, &viewport_transform(draw.viewport))?;
         self.packet4(
             GRAS_CL_GUARDBAND_CLIP_ADJ,
-            &[guardband_clip_adj(target_area)],
+            &[guardband_clip_adj(draw.viewport)],
         )?;
         self.packet4(
             GRAS_SC_SCREEN_SCISSOR_TL,
@@ -802,6 +801,7 @@ impl Emitter {
         previous.variant == next.variant
             && previous.target == next.target
             && previous.area == next.area
+            && previous.viewport == next.viewport
             && previous.stride == next.stride
             && previous.attributes == next.attributes
             && previous.source_over == next.source_over
@@ -1522,16 +1522,17 @@ fn f32_bits(value: f32) -> u32 {
 /// spans `[-W, +W]`.  A6xx framebuffer coordinates grow downwards, so Y must
 /// use a negative scale.  Z uses the OpenGL-style half-scale/half-offset that
 /// pairs with `GRAS_CL_CNTL.ZERO_GB_SCALE_Z = 0`.
-fn viewport_transform(area: PixelRect) -> [u32; 6] {
-    let x_scale = area.width() as f32 * 0.5;
-    let y_scale = area.height() as f32 * 0.5;
+fn viewport_transform(viewport: Viewport) -> [u32; 6] {
+    let [x, y, width, height, min_depth, max_depth] = viewport.components();
+    let x_scale = width * 0.5;
+    let y_scale = height * 0.5;
     [
-        f32_bits(area.x() as f32 + x_scale),
+        f32_bits(x + x_scale),
         f32_bits(x_scale),
-        f32_bits(area.y() as f32 + y_scale),
+        f32_bits(y + y_scale),
         f32_bits(-y_scale),
-        f32_bits(0.5),
-        f32_bits(0.5),
+        f32_bits((max_depth + min_depth) * 0.5),
+        f32_bits((max_depth - min_depth) * 0.5),
     ]
 }
 
@@ -1557,12 +1558,11 @@ fn guardband_axis(offset: f32, scale: f32) -> u32 {
     ((exponent as u32) << 6) | ((bits >> 17) & 0x3f)
 }
 
-fn guardband_clip_adj(area: PixelRect) -> u32 {
-    let x_scale = area.width() as f32 * 0.5;
-    let y_scale = area.height() as f32 * 0.5;
-    let x_offset = area.x() as f32 + x_scale;
-    let y_offset = area.y() as f32 + y_scale;
-    guardband_axis(x_offset, x_scale) | (guardband_axis(y_offset, y_scale) << 10)
+fn guardband_clip_adj(viewport: Viewport) -> u32 {
+    let [x, y, width, height, _, _] = viewport.components();
+    let x_scale = width * 0.5;
+    let y_scale = height * 0.5;
+    guardband_axis(x + x_scale, x_scale) | (guardband_axis(y + y_scale, y_scale) << 10)
 }
 
 fn unorm8(value: f32) -> u32 {
@@ -1574,7 +1574,7 @@ fn unorm8(value: f32) -> u32 {
 mod tests {
     use alloc::vec;
 
-    use sgfx_core::ir::PixelRect;
+    use sgfx_core::ir::Viewport;
 
     use super::{Emitter, guardband_axis, guardband_clip_adj, viewport_transform};
     use crate::model::{
@@ -1621,13 +1621,13 @@ mod tests {
         assert_eq!(guardband_axis(1080.0, 1080.0), 0x135);
         assert_eq!(guardband_axis(720.0, 720.0), 0x159);
 
-        let panel = PixelRect::new(0, 0, 2160, 1440).unwrap();
+        let panel = Viewport::new(0.0, 0.0, 2160.0, 1440.0, 0.0, 1.0).unwrap();
         assert_eq!(guardband_clip_adj(panel), 0x0005_6535);
     }
 
     #[test]
     fn viewport_uses_the_sgfx_upper_left_and_negative_one_to_one_depth_contract() {
-        let area = PixelRect::new(32, 48, 640, 480).unwrap();
+        let area = Viewport::new(32.0, 48.0, 640.0, 480.0, 0.0, 1.0).unwrap();
         let words = viewport_transform(area);
         let values = words.map(f32::from_bits);
         assert_eq!(values, [352.0, 320.0, 288.0, -240.0, 0.5, 0.5]);

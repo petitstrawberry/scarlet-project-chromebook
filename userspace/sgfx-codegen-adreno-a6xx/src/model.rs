@@ -268,6 +268,7 @@ pub enum Operation<'data> {
     SetUniforms(DrawUniforms),
     /// Set or reset the draw scissor.
     SetScissor(Option<PixelRect>),
+    SetViewport(sgfx_core::ir::Viewport),
     /// Draw non-indexed vertices.
     Draw {
         /// Vertex count.

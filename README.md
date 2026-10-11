@@ -183,11 +183,11 @@ From the Nix development shell:
 cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
-The normal Scarlet bundles select SGFX `20bb5b8c` and ScarletUI `1b0f08ae`.
+The normal Scarlet bundles select SGFX `3a8d90cf` and ScarletUI `feed7b6a`.
 The Adreno driver uses core `040dbb5c` and runtime `d3b1c051` internally.
 The loadable driver exposes SGFX ABI v2; Rust objects and allocators remain
-private to the library. Client selection follows the published SGFX backend
-policy; this bundle does not change application preferences.
+private to the library. Native 64-bit clients load Adreno dynamically from
+`/lib/sgfx/libsgfx_scarlet_adreno.so`; `sgfx-probe` reports the linkage and path.
 The `sgfx-native` bundle installs `/lib/sgfx` and generates the native linker
 configuration before any userspace compilation. The project selects that
 configuration for both initramfs and rootfs builds.
@@ -437,3 +437,15 @@ This project builds on:
 This repository is licensed under the GNU General Public License version 2
 only. See [LICENSE](LICENSE). Imported or referenced upstream work remains
 subject to its original copyright and license terms.
+
+## GPU frequency policy
+
+After the GPU initializes, `devfreqctl get` lists the device-tree and speed-bin
+validated OPPs for `gpu`. Select an available rate with
+`devfreqctl set gpu <kHz>`, or use `devfreqctl governor gpu performance` /
+`devfreqctl governor gpu powersave`. The common `/dev/devfreq` interface also
+feeds Task Manager. Frequency values are the GMU-acknowledged OPP, not an
+independent clock measurement. The GMU applies the matching voltage vote;
+changes serialize with GPU submissions. A failed vote marks the GPU lost
+rather than allowing submissions at an unknown rate. Utilization-based
+governors require hardware counters and are not enabled by this driver.

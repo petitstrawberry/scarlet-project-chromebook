@@ -1881,22 +1881,24 @@ fn validate_3d_sequences(
             {
                 return Err("qcom-adreno-a618: unsafe 3D scissor state");
             }
-            // SGFX clip-space coordinates are defined against the complete
-            // attachment. The render area is damage and may only narrow the
-            // screen/window scissors; it must never remap the viewport.
-            let width = (x(viewport[1]) - x(viewport[0]) + 1) as f32;
-            let height = (y(viewport[1]) - y(viewport[0]) + 1) as f32;
-            let x_scale = width * 0.5;
-            let y_scale = height * 0.5;
-            let expected_clip_transform = [
-                (x(viewport[0]) as f32 + x_scale).to_bits(),
-                x_scale.to_bits(),
-                (y(viewport[0]) as f32 + y_scale).to_bits(),
-                (-y_scale).to_bits(),
-                0.5_f32.to_bits(),
-                0.5_f32.to_bits(),
-            ];
-            if clip_transform != expected_clip_transform {
+            // The attachment scissor continues to authorize the complete image.
+            // Explicit SGFX viewports may map into a smaller region, invert Y,
+            // or reverse depth, but must remain finite and inside that image.
+            let width = (x(viewport[1]) + 1) as f32;
+            let height = (y(viewport[1]) + 1) as f32;
+            let transform: [u32; 6] = clip_transform
+                .try_into()
+                .map_err(|_| "qcom-adreno-a618: invalid viewport transform")?;
+            let [xo, xs, yo, ys, zo, zs] = transform.map(f32::from_bits);
+            if ![xo, xs, yo, ys, zo, zs].iter().all(|v| v.is_finite())
+                || xs <= 0.0
+                || xo - xs < 0.0
+                || xo + xs > width
+                || yo - ys.abs() < 0.0
+                || yo + ys.abs() > height
+                || zo - zs.abs() < 0.0
+                || zo + zs.abs() > 1.0
+            {
                 return Err("qcom-adreno-a618: unsafe 3D viewport transform");
             }
             let row_pitch = pitch[0]
@@ -3909,7 +3911,7 @@ mod tests {
         bad_pitch.words[pitch.word_offset as usize + 1] = u32::MAX;
         assert!(accept_codegen(&bad_pitch).is_err());
 
-        let mut upside_down_viewport = artifact.clone();
+        let mut nonfinite_viewport = artifact.clone();
         let viewport = Packets::new(&artifact.words)
             .filter_map(Result::ok)
             .find(|packet| {
@@ -3922,11 +3924,36 @@ mod tests {
                 )
             })
             .unwrap();
-        upside_down_viewport.words[viewport.word_offset as usize + 4] ^= 1 << 31;
+        nonfinite_viewport.words[viewport.word_offset as usize + 4] = f32::INFINITY.to_bits();
         assert_eq!(
-            accept_codegen(&upside_down_viewport),
+            accept_codegen(&nonfinite_viewport),
             Err("qcom-adreno-a618: unsafe 3D viewport transform")
         );
+
+        for values in [
+            [4.5, 2.0, 6.5, -3.0, 0.5, 0.25],
+            [4.5, 2.0, 6.5, 3.0, 0.5, -0.25],
+            [4.5, 2.0, 6.5, 0.0, 0.5, 0.0],
+        ] {
+            let mut explicit = artifact.clone();
+            let start = viewport.word_offset as usize + 1;
+            explicit.words[start..start + 6].copy_from_slice(&values.map(f32::to_bits));
+            assert!(accept_codegen(&explicit).is_ok());
+        }
+        for values in [
+            [1.0, 2.0, 6.5, -3.0, 0.5, 0.25],
+            [4.5, 2.0, 15.0, -3.0, 0.5, 0.25],
+            [4.5, 2.0, 6.5, -3.0, 0.8, 0.25],
+            [f32::NAN, 2.0, 6.5, -3.0, 0.5, 0.25],
+        ] {
+            let mut invalid = artifact.clone();
+            let start = viewport.word_offset as usize + 1;
+            invalid.words[start..start + 6].copy_from_slice(&values.map(f32::to_bits));
+            assert_eq!(
+                accept_codegen(&invalid),
+                Err("qcom-adreno-a618: unsafe 3D viewport transform")
+            );
+        }
 
         let mut bad_vfd_count = artifact.clone();
         let vfd = Packets::new(&artifact.words)

@@ -568,6 +568,43 @@ impl A618Gmu {
         )
     }
 
+    pub(crate) fn frequencies_khz(&self) -> Result<Vec<u64>, &'static str> {
+        let power = self
+            .power
+            .as_ref()
+            .ok_or("qcom-adreno-a618: OPPs unavailable")?;
+        Ok(power
+            .gx_levels
+            .iter()
+            .skip(1)
+            .map(|level| u64::from(level.frequency_khz))
+            .collect())
+    }
+
+    /// Last firmware-acknowledged OPP, not an independently measured clock.
+    pub(crate) fn current_frequency_khz(&self) -> Result<u64, &'static str> {
+        if !self.ready || !self.active {
+            return Err("qcom-adreno-a618: GMU is not ready");
+        }
+        self.current_gpu_index
+            .and_then(|index| self.power.as_ref()?.gx_levels.get(index))
+            .map(|level| u64::from(level.frequency_khz))
+            .ok_or("qcom-adreno-a618: current OPP is unknown")
+    }
+
+    pub(crate) fn set_frequency_khz(&mut self, frequency: u64) -> Result<(), &'static str> {
+        let index =
+            self.power
+                .as_ref()
+                .and_then(|power| {
+                    power.gx_levels.iter().position(|level| {
+                        u64::from(level.frequency_khz) == frequency && frequency != 0
+                    })
+                })
+                .ok_or("qcom-adreno-a618: frequency is not an available OPP")?;
+        self.set_performance_index(index)
+    }
+
     fn set_performance_index(&mut self, index: usize) -> Result<(), &'static str> {
         let level_count = self
             .power

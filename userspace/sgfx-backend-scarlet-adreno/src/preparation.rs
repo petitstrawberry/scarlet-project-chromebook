@@ -23,6 +23,7 @@ struct RenderReplayState {
     sampler: Option<ir::SamplerDesc>,
     uniforms: Option<ir::DrawUniforms>,
     scissor: Option<ir::PixelRect>,
+    viewport: Option<ir::Viewport>,
 }
 
 impl RenderReplayState {
@@ -48,6 +49,9 @@ impl RenderReplayState {
         }
         if let Some(uniforms) = self.uniforms {
             operations.push(codegen::Operation::SetUniforms(uniforms));
+        }
+        if let Some(viewport) = self.viewport {
+            operations.push(codegen::Operation::SetViewport(viewport));
         }
         if let Some(scissor) = self.scissor {
             operations.push(codegen::Operation::SetScissor(Some(scissor)));
@@ -115,6 +119,10 @@ pub(crate) fn split_submission_operations<'data>(
             }
             codegen::Operation::SetUniforms(uniforms) => {
                 replay.uniforms = Some(*uniforms);
+                current.push(operation.clone());
+            }
+            codegen::Operation::SetViewport(viewport) => {
+                replay.viewport = Some(*viewport);
                 current.push(operation.clone());
             }
             codegen::Operation::SetScissor(scissor) => {
@@ -646,6 +654,7 @@ mod tests {
             Operation::SetTexture(texture),
             Operation::SetSampler(sampler),
             Operation::SetUniforms(uniforms),
+            Operation::SetViewport(ir::Viewport::new(1.5, 2.5, 8.0, 8.0, 0.25, 0.75).unwrap()),
             Operation::SetScissor(Some(scissor)),
         ];
         let draw = Operation::DrawIndexed {

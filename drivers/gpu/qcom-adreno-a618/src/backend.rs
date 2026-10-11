@@ -476,6 +476,7 @@ struct A618Core {
     resources: IrqSpinLock<Vec<Arc<ResourceEntry>>>,
     next_resource_token: AtomicU64,
     backend_cookie: u64,
+    frequency_policy_registered: Mutex<bool>,
 }
 
 impl Drop for A618Core {
@@ -501,7 +502,62 @@ impl Drop for A618Core {
     }
 }
 
+struct A618FrequencyDriver(Weak<A618Core>);
+
+impl scarlet::device::devfreq::DeviceFrequencyDriver for A618FrequencyDriver {
+    fn current_frequency_khz(&self) -> Result<u64, &'static str> {
+        let core = self.0.upgrade().ok_or("qcom-adreno-a618: GPU removed")?;
+        let hardware = core.hardware.lock();
+        if hardware.boot != BootState::Ready {
+            return Err("qcom-adreno-a618: GPU is not ready");
+        }
+        core.gmu.lock().current_frequency_khz()
+    }
+
+    fn set_frequency_khz(&self, frequency: u64) -> Result<(), &'static str> {
+        let core = self.0.upgrade().ok_or("qcom-adreno-a618: GPU removed")?;
+        // The same locks cover the complete submit/fence interval. DCVS runs
+        // between submissions, while the GMU owns voltage ordering and ACKs.
+        let _mapping_gate = core.resource_mapping_gate.execution.lock();
+        let mut hardware = core.hardware.lock();
+        if hardware.boot != BootState::Ready {
+            return Err("qcom-adreno-a618: GPU is not ready");
+        }
+        let result = core.gmu.lock().set_frequency_khz(frequency);
+        if let Err(reason) = result {
+            // A timed-out vote can have reached firmware. Do not continue
+            // submitting work at an unknown voltage/frequency state.
+            core.quiesce_lost(&mut hardware, reason);
+        }
+        result
+    }
+}
+
 impl A618Core {
+    fn register_frequency_policy(self: &Arc<Self>) {
+        let mut registered = self.frequency_policy_registered.lock();
+        if *registered {
+            return;
+        }
+        let frequencies = match self.gmu.lock().frequencies_khz() {
+            Ok(frequencies) => frequencies,
+            Err(_) => return,
+        };
+        match scarlet::device::devfreq::register_firmware_managed(
+            "gpu",
+            &frequencies,
+            Arc::new(A618FrequencyDriver(Arc::downgrade(self))),
+        ) {
+            Ok(()) => {
+                *registered = true;
+                println!(
+                    "[qcom-adreno-a618] registered GPU devfreq policy (GMU-acknowledged OPPs)"
+                );
+            }
+            Err(reason) => println!("[qcom-adreno-a618] devfreq registration failed: {}", reason),
+        }
+    }
+
     fn process_submission(&self) -> bool {
         let (mut submission, previous_failure) = {
             let mut pending = self.pending.lock();
@@ -2094,7 +2150,10 @@ impl GpuBackend for A618Backend {
 
     fn query_info(&self) -> scarlet::device::gpu::GpuBackendInfo {
         let ready = match self.core.ensure_hardware_ready() {
-            Ok(()) => true,
+            Ok(()) => {
+                self.core.register_frequency_policy();
+                true
+            }
             Err(error) => {
                 let (class, detail) = match error {
                     GpuBackendSubmitError::Rejected(detail) => ("rejected", detail),
@@ -2474,6 +2533,7 @@ pub(crate) fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             resources: IrqSpinLock::new(Vec::new()),
             next_resource_token: AtomicU64::new(1),
             backend_cookie,
+            frequency_policy_registered: Mutex::new(false),
         });
         scarlet::interrupt::register_and_enable_platform_irq_device(
             interrupt_resource,

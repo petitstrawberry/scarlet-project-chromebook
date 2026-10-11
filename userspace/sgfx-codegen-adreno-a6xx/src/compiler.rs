@@ -5,9 +5,9 @@ use alloc::{vec, vec::Vec};
 use adreno_a6xx_layout::{DEPTH32_LAYER_ALIGNMENT, TILE_MODE_3, depth32_tile6_3_layout};
 use adreno_a6xx_shader_pack::PipelineVariant;
 use sgfx_core::ir::{
-    AddressMode, BlendState, BufferUsage, CullMode, DepthLoadOp, DrawUniforms, FilterMode,
-    FragmentProgram, IndexFormat, LoadOp, PixelRect, SamplerDesc, TextureFormat, TextureSampleMode,
-    TextureUsage,
+    AddressMode, BlendState, BufferUsage, CullMode, DepthLoadOp, DrawUniforms, Extent2D,
+    FilterMode, FragmentProgram, IndexFormat, LoadOp, PixelRect, SamplerDesc, TextureFormat,
+    TextureSampleMode, TextureUsage, Viewport,
 };
 
 use crate::emit::{DrawCall, DrawState, Emitter, IndexedDraw, Surface};
@@ -48,6 +48,7 @@ struct State<'a> {
     sampler: Option<SamplerDesc>,
     uniforms: Option<DrawUniforms>,
     scissor: Option<PixelRect>,
+    viewport: Option<Viewport>,
 }
 
 impl State<'_> {
@@ -62,6 +63,7 @@ impl State<'_> {
             sampler: None,
             uniforms: None,
             scissor: None,
+            viewport: None,
         }
     }
 }
@@ -215,6 +217,7 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
                 state.sampler = None;
                 state.uniforms = None;
                 state.scissor = None;
+                state.viewport = None;
             }
             Operation::EndRenderPass => {
                 if state.pass.take().is_none() {
@@ -231,6 +234,7 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
                 state.sampler = None;
                 state.uniforms = None;
                 state.scissor = None;
+                state.viewport = None;
             }
             Operation::SetPipeline(id) => {
                 require_inside_pass(&state)?;
@@ -282,6 +286,20 @@ pub fn compile(input: CompileInput<'_>) -> Result<RelocatablePm4, CompileError> 
             Operation::SetUniforms(uniforms) => {
                 require_inside_pass(&state)?;
                 state.uniforms = Some(*uniforms);
+            }
+            Operation::SetViewport(viewport) => {
+                let pass = require_inside_pass(&state)?;
+                let target = require_target_surface(
+                    find_resource(input.resources, pass.target)?,
+                    TextureUsage::RENDER_ATTACHMENT,
+                    input.capabilities.max_linear_pitch,
+                )?;
+                let extent = Extent2D::new(target.width, target.height)
+                    .map_err(|_| CompileError::InvalidResource)?;
+                if !viewport.is_within(extent) {
+                    return Err(CompileError::OutOfBounds);
+                }
+                state.viewport = Some(*viewport);
             }
             Operation::SetScissor(scissor) => {
                 let pass = require_inside_pass(&state)?;
@@ -713,6 +731,17 @@ fn emit_draw(
         target,
         area: pass.area,
         scissor: state.scissor.unwrap_or(pass.area),
+        viewport: state.viewport.unwrap_or(
+            Viewport::new(
+                0.0,
+                0.0,
+                target.width as f32,
+                target.height as f32,
+                0.0,
+                1.0,
+            )
+            .map_err(|_| CompileError::InvalidResource)?,
+        ),
         vertex: vertex.object,
         vertex_offset: vertex.offset,
         vertex_size,

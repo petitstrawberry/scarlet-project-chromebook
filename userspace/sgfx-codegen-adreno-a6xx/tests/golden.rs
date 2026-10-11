@@ -618,6 +618,85 @@ fn partial_render_area_keeps_full_target_viewport_and_uses_damage_scissors() {
 }
 
 #[test]
+fn explicit_viewports_update_retained_draw_state_and_validate_attachment_bounds() {
+    use sgfx_core::ir::Viewport;
+    let resources = resources();
+    let pipelines = [pipeline()];
+    let viewport = Viewport::new(1.5, 2.5, 8.0, 6.0, 0.25, 0.75).unwrap();
+    let inverted = Viewport::new(1.5, 8.5, 8.0, -6.0, 0.75, 0.25).unwrap();
+    let mut operations = vec![
+        Operation::BeginRenderPass(RenderPass {
+            target: TARGET,
+            area: rect(0, 0, 16, 16),
+            load: LoadOp::Load,
+            store: StoreOp::Store,
+            depth: None,
+        }),
+        Operation::SetPipeline(PIPELINE),
+        Operation::SetVertexBuffer {
+            buffer: VERTICES,
+            offset: 0,
+        },
+        Operation::SetUniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+        )),
+        Operation::SetViewport(viewport),
+        Operation::Draw {
+            vertex_count: 3,
+            first_vertex: 0,
+        },
+        Operation::SetViewport(inverted),
+        Operation::Draw {
+            vertex_count: 3,
+            first_vertex: 0,
+        },
+        Operation::EndRenderPass,
+    ];
+    let compile_ops = |operations: &[Operation<'_>]| {
+        compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations,
+        })
+    };
+    let artifact = compile_ops(&operations).unwrap();
+    let transforms: Vec<_> = Packets::new(&artifact.words)
+        .map(Result::unwrap)
+        .filter(|p| {
+            matches!(
+                p.header,
+                Header::Type4 {
+                    register: 0x8010,
+                    ..
+                }
+            )
+        })
+        .map(|p| {
+            p.payload
+                .iter()
+                .copied()
+                .map(f32::from_bits)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        transforms,
+        vec![
+            vec![5.5, 4.0, 5.5, -3.0, 0.5, 0.25],
+            vec![5.5, 4.0, 5.5, 3.0, 0.5, -0.25],
+        ]
+    );
+    operations[4] = Operation::SetViewport(Viewport::new(9.0, 0.0, 8.0, 8.0, 0.0, 1.0).unwrap());
+    assert_eq!(compile_ops(&operations), Err(CompileError::OutOfBounds));
+    assert_eq!(
+        compile_ops(&[Operation::SetViewport(viewport)]),
+        Err(CompileError::InvalidState)
+    );
+}
+
+#[test]
 fn vertex_color_draw_uses_only_canonical_shader_relocations() {
     let resources = resources();
     let pipelines = [pipeline()];
