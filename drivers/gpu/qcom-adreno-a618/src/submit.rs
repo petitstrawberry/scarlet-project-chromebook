@@ -189,7 +189,7 @@ const SP_PS_CONST_CONFIG: u32 = 0xbb10;
 fn supported_texture_descriptor(word: u32) -> bool {
     matches!(
         word & !0x000f_0000,
-        TEX_DESCRIPTOR_BGRA_IDENTITY | TEX_DESCRIPTOR_ALPHA_MASK
+        TEX_DESCRIPTOR_BGRA_IDENTITY | TEX_DESCRIPTOR_ALPHA_MASK | 0x0c00_6883
     )
 }
 
@@ -285,6 +285,7 @@ pub(crate) enum LinearImageFormat {
 pub(crate) enum ImageModifier {
     Linear,
     Tile6_3Depth,
+    Tile6_3Color,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,10 +355,23 @@ fn a2d_control_format(value: u32) -> Option<LinearImageFormat> {
     }
 }
 
+fn color_target_modifier(value: u32) -> Option<ImageModifier> {
+    if value == FORMAT_8_8_8_8_UNORM | MRT_COLOR_SWAP_WXYZ {
+        Some(ImageModifier::Linear)
+    } else if value == FORMAT_8_8_8_8_UNORM | (3 << 8) {
+        Some(ImageModifier::Tile6_3Color)
+    } else {
+        None
+    }
+}
+
 fn a2d_destination_format(value: u32) -> Option<(LinearImageFormat, ImageModifier)> {
     match value {
         value if value == FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ => {
             Some((LinearImageFormat::Bgra8Unorm, ImageModifier::Linear))
+        }
+        value if value == FORMAT_8_8_8_8_UNORM | (3 << 8) => {
+            Some((LinearImageFormat::Bgra8Unorm, ImageModifier::Tile6_3Color))
         }
         value if value == FORMAT_32_FLOAT | (adreno_a6xx_layout::TILE_MODE_3 << 8) => {
             Some((LinearImageFormat::Depth32Float, ImageModifier::Tile6_3Depth))
@@ -624,7 +638,7 @@ fn validate_type4(
         (RB_MRT_CONTROL, 2) if matches!(payload, [0x7e0, 0x0001_0001] | [0x7e3, 0x0701_0706]) => {
             Ok(())
         }
-        (RB_MRT_BUF_INFO, 1) => exact(payload, &[FORMAT_8_8_8_8_UNORM | MRT_COLOR_SWAP_WXYZ]),
+        (RB_MRT_BUF_INFO, 1) if color_target_modifier(payload[0]).is_some() => Ok(()),
         (RB_MRT_PITCH, 2)
             if payload[0] != 0
                 && payload[0] <= 0xffff
@@ -757,7 +771,7 @@ fn validate_type7(
                 && payload[3] & 0xc000_0000 == 0
                 && payload[3] & 0x7fff != 0
                 && (payload[3] >> 15) & 0x7fff != 0
-                && payload[4] & 0x7f == 0
+                && payload[4] & 0x7f == if payload[2] & 3 == 3 { 2 } else { 0 }
                 && payload[4] >> 29 == 1
                 && payload[5] & !0x007f_ffff == 0
                 && payload[7] == (1 << 17)
@@ -1632,7 +1646,7 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
             == Some(&[
                 (fixed.vfd_fetch.len() as u32 / 2) | ((fixed.vfd_fetch.len() as u32 / 2) << 8)
             ])
-        && reg(RB_MRT_BUF_INFO) == Some(&[FORMAT_8_8_8_8_UNORM | MRT_COLOR_SWAP_WXYZ])
+        && reg(RB_MRT_BUF_INFO).is_some_and(|p| p.len() == 1 && color_target_modifier(p[0]).is_some())
         && reg(RB_MRT_BASE_GMEM) == Some(&[0])
         && reg(RB_COLOR_FLAG_BUFFER_ADDR) == Some(&[0, 0, 0])
         && reg(GRAS_LRZ_MRT_BUFFER_INFO_0) == Some(&[FORMAT_8_8_8_8_UNORM])
@@ -1910,7 +1924,11 @@ fn validate_3d_sequences(
                 ImageExpectation {
                     mip_levels: 1,
                     format: LinearImageFormat::Bgra8Unorm,
-                    modifier: ImageModifier::Linear,
+                    modifier: segment
+                        .reg(RB_MRT_BUF_INFO)
+                        .and_then(|(_, values)| values.first().copied())
+                        .and_then(color_target_modifier)
+                        .ok_or("qcom-adreno-a618: invalid color attachment modifier")?,
                     row_pitch,
                     width: (viewport[1] & 0xffff).saturating_add(1),
                     height: (viewport[1] >> 16).saturating_add(1),
@@ -2042,7 +2060,11 @@ fn validate_3d_sequences(
                 ImageExpectation {
                     mip_levels: ((descriptor[2] >> 16) & 0xf) + 1,
                     format: LinearImageFormat::Bgra8Unorm,
-                    modifier: ImageModifier::Linear,
+                    modifier: if descriptor[2] & 3 == 3 {
+                        ImageModifier::Tile6_3Color
+                    } else {
+                        ImageModifier::Linear
+                    },
                     row_pitch,
                     width,
                     height,
@@ -2080,7 +2102,11 @@ fn validate_3d_sequences(
                 ImageExpectation {
                     mip_levels: ((descriptor[2] >> 16) & 0xf) + 1,
                     format: LinearImageFormat::Bgra8Unorm,
-                    modifier: ImageModifier::Linear,
+                    modifier: if descriptor[2] & 3 == 3 {
+                        ImageModifier::Tile6_3Color
+                    } else {
+                        ImageModifier::Linear
+                    },
                     row_pitch,
                     width,
                     height,
@@ -2251,7 +2277,8 @@ fn image_footprint(image: LinearImage) -> Option<u64> {
         (LinearImageFormat::Bgra8Unorm, ImageModifier::Linear) => {
             u64::from(image.row_pitch).checked_mul(u64::from(image.height))
         }
-        (LinearImageFormat::Depth32Float, ImageModifier::Tile6_3Depth) => {
+        (LinearImageFormat::Depth32Float, ImageModifier::Tile6_3Depth)
+        | (LinearImageFormat::Bgra8Unorm, ImageModifier::Tile6_3Color) => {
             let layout = adreno_a6xx_layout::depth32_tile6_3_layout(image.width, image.height)?;
             (layout.row_pitch == image.row_pitch).then_some(layout.layer_size)
         }
@@ -2452,7 +2479,7 @@ pub(crate) fn validate_and_relocate(
                 // Freedreno assigns that layout the minimum 64-byte pitch
                 // alignment (descriptor encoding zero), independent of any
                 // larger power-of-two factor in the actual row pitch.
-                || expectation.pitch_align.is_some_and(|align| align != 0)
+                || expectation.pitch_align.is_some_and(|align| align != if image.modifier == ImageModifier::Tile6_3Color { 2 } else { 0 })
                 || expectation.array_pitch.is_some_and(|pitch| {
                     image.texture.map_or(image.visible_size, |t| u64::from(t.layer_stride))
                         .checked_add(pitch.alignment - 1)
@@ -4183,6 +4210,206 @@ mod tests {
         let mut negative_base = artifact.clone();
         negative_base.words[index_offset_packet.word_offset as usize + 1] = u32::MAX;
         assert!(accept_codegen(&negative_base).is_err());
+    }
+
+    #[test]
+    fn tiled_color_clear_draw_and_sample_preserve_alpha_and_validate_layout() {
+        let tiled = adreno_a6xx_layout::depth32_tile6_3_layout(64, 17).unwrap();
+        let resources = [
+            ResourceMeta {
+                id: TARGET,
+                size: tiled.layer_size,
+                kind: ResourceKind::Image(ImageMeta {
+                    texture: None,
+                    format: TextureFormat::Bgra8Unorm,
+                    storage_format: TextureFormat::Bgra8Unorm,
+                    extent: Extent2D::new(64, 17).unwrap(),
+                    usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::SAMPLED,
+                    modifier: ImageModifier::A6xxTile6_3Color,
+                    planes: std::vec![PlaneLayout {
+                        offset: 0,
+                        stride: tiled.row_pitch,
+                        size: tiled.layer_size
+                    }],
+                }),
+            },
+            ResourceMeta {
+                id: SOURCE,
+                size: 256 * 17,
+                kind: ResourceKind::Image(ImageMeta {
+                    texture: None,
+                    format: TextureFormat::Bgra8Unorm,
+                    storage_format: TextureFormat::Bgra8Unorm,
+                    extent: Extent2D::new(64, 17).unwrap(),
+                    usage: TextureUsage::RENDER_ATTACHMENT,
+                    modifier: ImageModifier::Linear,
+                    planes: std::vec![PlaneLayout {
+                        offset: 0,
+                        stride: 256,
+                        size: 256 * 17
+                    }],
+                }),
+            },
+            ResourceMeta {
+                id: BUFFER,
+                size: 144,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX,
+                },
+            },
+        ];
+        let pipelines: std::vec::Vec<_> = [
+            FragmentProgram::Solid,
+            FragmentProgram::Texture(TextureSampleMode::Rgba),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, fragment)| PipelineMeta {
+            id: PipelineId::new(i as u32),
+            descriptor: RenderPipelineDesc::new(
+                TextureFormat::Bgra8Unorm,
+                PrimitiveTopology::TriangleList,
+                VertexBufferLayout::new(
+                    24,
+                    std::vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x2, 16),
+                    ],
+                )
+                .unwrap(),
+                fragment,
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        })
+        .collect();
+        let mut operations = std::vec::Vec::new();
+        for (i, target) in [TARGET, SOURCE].into_iter().enumerate() {
+            operations.push(Operation::BeginRenderPass(RenderPass {
+                target,
+                area: PixelRect::new(0, 0, 64, 17).unwrap(),
+                load: LoadOp::Clear(Color::rgba(0.1, 0.2, 0.3, 0.4).unwrap()),
+                store: StoreOp::Store,
+                depth: None,
+            }));
+            operations.push(Operation::SetPipeline(PipelineId::new(i as u32)));
+            operations.push(Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            });
+            if i == 1 {
+                operations.push(Operation::SetTexture(TARGET));
+                operations.push(Operation::SetSampler(SamplerDesc::new(
+                    FilterMode::Linear,
+                    FilterMode::Linear,
+                    AddressMode::ClampToEdge,
+                    AddressMode::ClampToEdge,
+                )));
+            }
+            operations.push(Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(0.8, 0.4, 0.2, 0.5).unwrap(),
+            )));
+            operations.push(Operation::Draw {
+                vertex_count: 6,
+                first_vertex: 0,
+            });
+            operations.push(Operation::EndRenderPass);
+        }
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &operations,
+        })
+        .unwrap();
+        let validate = |artifact: &RelocatablePm4, target_modifier| {
+            validate_and_relocate(
+                &wire_from_codegen(artifact),
+                |attachment_token| {
+                    let image = if attachment_token == token(ObjectRef::External(TARGET)) {
+                        Some(LinearImage {
+                            texture: None,
+                            format: LinearImageFormat::Bgra8Unorm,
+                            modifier: target_modifier,
+                            width: 64,
+                            height: 17,
+                            row_pitch: 256,
+                            visible_size: tiled.layer_size,
+                        })
+                    } else if attachment_token == token(ObjectRef::External(SOURCE)) {
+                        Some(LinearImage {
+                            texture: None,
+                            format: LinearImageFormat::Bgra8Unorm,
+                            modifier: KernelImageModifier::Linear,
+                            width: 64,
+                            height: 17,
+                            row_pitch: 256,
+                            visible_size: 256 * 17,
+                        })
+                    } else {
+                        None
+                    };
+                    Some(ResolvedResource {
+                        attachment_token,
+                        gpu_va: 0x1_0000_0000 + attachment_token * 0x1_0000,
+                        allocation_size: image.map_or(4096, |i| i.visible_size),
+                        allowed_access: ACCESS_READ | ACCESS_WRITE,
+                        linear_image: image,
+                    })
+                },
+                |variant| {
+                    Some(ResolvedResource {
+                        attachment_token: 0,
+                        gpu_va: 0x4_0000_0000 + variant.offset() as u64,
+                        allocation_size: adreno_a6xx_shader_pack::SHADER_SIZE as u64,
+                        allowed_access: ACCESS_READ,
+                        linear_image: None,
+                    })
+                },
+            )
+        };
+        assert!(validate(&artifact, KernelImageModifier::Tile6_3Color).is_ok());
+        assert!(validate(&artifact, KernelImageModifier::Linear).is_err());
+        assert!(Packets::new(&artifact.words).flatten().any(|p| matches!(
+            p.header,
+            Header::Type4 {
+                register: super::RB_MRT_BUF_INFO,
+                ..
+            }
+        ) && p.payload
+            == [super::FORMAT_8_8_8_8_UNORM | (3 << 8)]));
+        assert!(
+            Packets::new(&artifact.words)
+                .flatten()
+                .filter(|p| matches!(
+                    p.header,
+                    Header::Type4 {
+                        register: super::RB_MRT_CONTROL,
+                        ..
+                    }
+                ))
+                .all(|p| p.payload == [0x7e3, 0x0701_0706])
+        );
+        let descriptor = Packets::new(&artifact.words)
+            .flatten()
+            .find(|p| {
+                matches!(
+                    p.header,
+                    Header::Type7 {
+                        opcode: CP_MEM_WRITE,
+                        ..
+                    }
+                ) && p.payload.len() == 22
+            })
+            .unwrap();
+        assert_eq!(descriptor.payload[2], 0x0c00_6883); // native channel order, TILE6_3
+        assert_eq!(descriptor.payload[4] & 0x7f, 2); // 256-byte pitch alignment
+        let index = descriptor.word_offset as usize;
+        let mut bad = artifact.clone();
+        bad.words[index + 5] &= !0xf;
+        assert!(validate(&bad, KernelImageModifier::Tile6_3Color).is_err());
     }
 
     #[test]

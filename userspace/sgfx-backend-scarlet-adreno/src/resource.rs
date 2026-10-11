@@ -633,8 +633,17 @@ fn validate_image_layout(
     {
         return Err(HandleError::Unsupported);
     }
-    if logical_format == ir::TextureFormat::Depth32Float {
-        if layout.modifier != IMAGE_MODIFIER_TILE6_3_DEPTH
+    if logical_format == ir::TextureFormat::Depth32Float
+        || layout.modifier == adreno_a6xx_layout::IMAGE_MODIFIER_TILE6_3_COLOR
+    {
+        let expected_modifier = if logical_format == ir::TextureFormat::Depth32Float {
+            IMAGE_MODIFIER_TILE6_3_DEPTH
+        } else if logical_format == ir::TextureFormat::Bgra8Unorm && width >= 64 {
+            adreno_a6xx_layout::IMAGE_MODIFIER_TILE6_3_COLOR
+        } else {
+            return Err(HandleError::Unsupported);
+        };
+        if layout.modifier != expected_modifier
             || layout.alignment != DEPTH32_LAYER_ALIGNMENT
             || plane.offset & (DEPTH32_LAYER_ALIGNMENT - 1) != 0
             || !is_depth32_tile6_3_layout(width, height, plane.row_pitch, plane.size)
@@ -723,6 +732,28 @@ mod tests {
             validate_image_layout(&layout, 16, 16, ir::TextureFormat::Depth32Float),
             Ok(())
         );
+    }
+
+    #[test]
+    fn tiled_color_requires_exact_pitch_size_and_color_format() {
+        let mut layout = sample_layout();
+        layout.modifier = adreno_a6xx_layout::IMAGE_MODIFIER_TILE6_3_COLOR;
+        layout.total_size = 8192;
+        layout.alignment = 4096;
+        layout.planes[0].size = 8192;
+        layout.planes[0].row_pitch = 256;
+        layout.planes[0].array_pitch = 8192;
+        assert_eq!(
+            validate_image_layout(&layout, 64, 17, ir::TextureFormat::Bgra8Unorm),
+            Ok(())
+        );
+        assert!(validate_image_layout(&layout, 64, 17, ir::TextureFormat::R8Unorm).is_err());
+        assert!(validate_image_layout(&layout, 64, 17, ir::TextureFormat::Depth32Float).is_err());
+        layout.planes[0].size = 256 * 17;
+        assert!(validate_image_layout(&layout, 64, 17, ir::TextureFormat::Bgra8Unorm).is_err());
+        layout.planes[0].size = 8192;
+        layout.planes[0].row_pitch = 320;
+        assert!(validate_image_layout(&layout, 64, 17, ir::TextureFormat::Bgra8Unorm).is_err());
     }
 
     #[test]

@@ -46,7 +46,8 @@ use scarlet::{
 };
 
 use adreno_a6xx_layout::{
-    DEPTH32_LAYER_ALIGNMENT, IMAGE_MODIFIER_TILE6_3_DEPTH, depth32_tile6_3_layout,
+    DEPTH32_LAYER_ALIGNMENT, IMAGE_MODIFIER_TILE6_3_COLOR, IMAGE_MODIFIER_TILE6_3_DEPTH,
+    depth32_tile6_3_layout,
 };
 use adreno_a6xx_pm4::{opcode, type4, type7};
 use adreno_a6xx_shader_pack::{PACK_SIZE, SHADER_ALIGNMENT, SHADER_SIZE, ShaderVariant, copy_pack};
@@ -2257,7 +2258,15 @@ impl GpuBackend for A618Backend {
         ) {
             return Err("qcom-adreno-a618: image format is not supported");
         }
-        if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
+        // Keep scanout, CPU transfers, and mip/array textures linear. Internal
+        // render-and-sample attachments benefit from CCU/texture tile locality
+        // without any detiling copy or a change to blending semantics.
+        let tiled_color = create.format == GPU_IMAGE_FORMAT_BGRA8_UNORM
+            && create.usage == (GPU_IMAGE_USAGE_RENDER_TARGET | GPU_IMAGE_USAGE_SAMPLED)
+            && create.mip_levels == 1
+            && create.array_layers == 1
+            && create.width >= 64;
+        if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT || tiled_color {
             let tiled = depth32_tile6_3_layout(create.width, create.height)
                 .ok_or("qcom-adreno-a618: tiled depth layout overflows")?;
             let array_pitch = u32::try_from(tiled.layer_size)
@@ -2277,7 +2286,11 @@ impl GpuBackend for A618Backend {
                 bytes_per_block: 4,
             };
             return Ok(GpuBackendImageLayout {
-                modifier: IMAGE_MODIFIER_TILE6_3_DEPTH,
+                modifier: if tiled_color {
+                    IMAGE_MODIFIER_TILE6_3_COLOR
+                } else {
+                    IMAGE_MODIFIER_TILE6_3_DEPTH
+                },
                 total_size,
                 alignment: DEPTH32_LAYER_ALIGNMENT,
                 plane_count: 1,
@@ -2372,6 +2385,8 @@ impl GpuBackend for A618Backend {
                     },
                     modifier: if create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT {
                         ImageModifier::Tile6_3Depth
+                    } else if layout.modifier == IMAGE_MODIFIER_TILE6_3_COLOR {
+                        ImageModifier::Tile6_3Color
                     } else {
                         ImageModifier::Linear
                     },
@@ -2383,7 +2398,7 @@ impl GpuBackend for A618Backend {
                     // TILE6_3 depth includes its padded rows and layer tail.
                     visible_size: if create.mip_levels > 1
                         || create.array_layers > 1
-                        || create.format == GPU_IMAGE_FORMAT_DEPTH32_FLOAT
+                        || layout.modifier != 0
                     {
                         layout.planes[0].size
                     } else {

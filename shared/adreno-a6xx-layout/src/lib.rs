@@ -13,6 +13,10 @@
 /// distinct from the backend-neutral linear modifier (`0`).
 pub const IMAGE_MODIFIER_TILE6_3_DEPTH: u64 = u64::from_le_bytes(*b"A6D3TILE");
 
+/// Private uncompressed TILE6_3 color layout. Tiled CCU storage uses native
+/// channel ordering; texture views must use WZYX, as in Mesa fd6_pipe2swap.
+pub const IMAGE_MODIFIER_TILE6_3_COLOR: u64 = u64::from_le_bytes(*b"A6C3TILE");
+
 /// Hardware tile-mode value used for A6xx depth/stencil surfaces.
 pub const TILE_MODE_3: u32 = 3;
 /// Byte alignment of a 32-bit TILE6_3 row pitch.

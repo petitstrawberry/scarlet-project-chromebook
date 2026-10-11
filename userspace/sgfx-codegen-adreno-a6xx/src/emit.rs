@@ -472,9 +472,14 @@ impl Emitter {
                 0x4c00_76d0
             } else {
                 0x4c00_6880
-            }) | ((texture.mip_levels - 1) << 16),
+            } & if texture.tile_mode == 0 {
+                u32::MAX
+            } else {
+                !(3 << 30)
+            }) | texture.tile_mode
+                | ((texture.mip_levels - 1) << 16),
             texture.width | (texture.height << 15),
-            (texture.stride << 7) | (1 << 29),
+            (texture.stride << 7) | (1 << 29) | if texture.tile_mode == 0 { 0 } else { 2 },
             u32::try_from(
                 texture
                     .array_pitch
@@ -626,7 +631,13 @@ impl Emitter {
         )?;
         self.packet4(
             RB_MRT_BUF_INFO,
-            &[FORMAT_8_8_8_8_UNORM | MRT_BGRA_COLOR_SWAP],
+            &[FORMAT_8_8_8_8_UNORM
+                | (draw.target.tile_mode << 8)
+                | if draw.target.tile_mode == 0 {
+                    MRT_BGRA_COLOR_SWAP
+                } else {
+                    0
+                }],
         )?;
         self.packet4(
             RB_MRT_PITCH,
@@ -1260,7 +1271,9 @@ impl Emitter {
     ) -> Result<(), CompileError> {
         self.packet4(
             RB_A2D_DEST_BUFFER_INFO,
-            &[format | (target.tile_mode << 8) | color_swap],
+            &[format
+                | (target.tile_mode << 8)
+                | if target.tile_mode == 0 { color_swap } else { 0 }],
         )?;
         self.address_register(
             RB_A2D_DEST_BUFFER_BASE,
@@ -1343,6 +1356,9 @@ impl Emitter {
         filter: sgfx_core::ir::FilterMode,
         flips: [bool; 2],
     ) -> Result<(), CompileError> {
+        if source.tile_mode != 0 {
+            return Err(CompileError::UnsupportedFeature);
+        }
         self.submission_begin_2d()?;
         self.wait_for_idle()?;
         self.packet4(

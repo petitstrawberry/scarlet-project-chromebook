@@ -97,6 +97,8 @@ pub enum ImageModifier {
     Linear,
     /// Uncompressed A6xx TILE6_3 depth memory.
     A6xxTile6_3Depth,
+    /// Uncompressed native-channel A6xx TILE6_3 color attachment.
+    A6xxTile6_3Color,
 }
 
 /// Immutable layout of one image plane in an external allocation.

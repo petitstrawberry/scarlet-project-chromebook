@@ -45,8 +45,8 @@ pub(crate) fn submit_trace_enabled() -> bool {
     // by the executable CRT. This explicit per-device diagnostic switch also
     // works for dynamically loaded drivers; it is read only once per process.
     #[cfg(feature = "std")]
-    let enabled = enabled || std::fs::read_to_string("/etc/sgfx-adreno-trace")
-        .is_ok_and(|value| value.trim() == "1");
+    let enabled = enabled
+        || std::fs::read_to_string("/etc/sgfx-adreno-trace").is_ok_and(|value| value.trim() == "1");
     TRACE_CACHE.store(enabled as u8, Ordering::Relaxed);
     enabled
 }
@@ -902,6 +902,8 @@ fn append_image_resource(
         codegen::ImageModifier::Linear
     } else if image.layout.modifier == adreno_a6xx_layout::IMAGE_MODIFIER_TILE6_3_DEPTH {
         codegen::ImageModifier::A6xxTile6_3Depth
+    } else if image.layout.modifier == adreno_a6xx_layout::IMAGE_MODIFIER_TILE6_3_COLOR {
+        codegen::ImageModifier::A6xxTile6_3Color
     } else {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::ImageLayout,

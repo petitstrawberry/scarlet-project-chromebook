@@ -468,9 +468,13 @@ fn validate_image_layout(
                 .and_then(|bytes| bytes.checked_add(u64::from(row_bytes)))
                 .ok_or(CompileError::Overflow)?
         }
-        ImageModifier::A6xxTile6_3Depth => {
-            if image.storage_format != TextureFormat::Depth32Float
-                || plane.offset & (DEPTH32_LAYER_ALIGNMENT - 1) != 0
+        ImageModifier::A6xxTile6_3Depth | ImageModifier::A6xxTile6_3Color => {
+            let expected = if image.modifier == ImageModifier::A6xxTile6_3Depth {
+                TextureFormat::Depth32Float
+            } else {
+                TextureFormat::Bgra8Unorm
+            };
+            if image.storage_format != expected || plane.offset & (DEPTH32_LAYER_ALIGNMENT - 1) != 0
             {
                 return Err(CompileError::InvalidResource);
             }
@@ -502,7 +506,12 @@ fn require_image_surface(
     };
     if !image.usage.contains(required)
         || image.storage_format != TextureFormat::Bgra8Unorm
-        || image.modifier != ImageModifier::Linear
+        || !matches!(
+            image.modifier,
+            ImageModifier::Linear | ImageModifier::A6xxTile6_3Color
+        )
+        || (image.modifier == ImageModifier::A6xxTile6_3Color
+            && (image.format != TextureFormat::Bgra8Unorm || image.extent.width() < 64))
     {
         return Err(CompileError::InvalidResource);
     }
@@ -515,7 +524,11 @@ fn require_image_surface(
         width: image.extent.width(),
         height: image.extent.height(),
         stride: plane.stride,
-        tile_mode: 0,
+        tile_mode: if image.modifier == ImageModifier::A6xxTile6_3Color {
+            TILE_MODE_3
+        } else {
+            0
+        },
         alpha_mask: image.format == TextureFormat::R8Unorm,
         mip_levels: image.texture.map_or(1, |t| t.mip_levels),
         array_pitch: image
