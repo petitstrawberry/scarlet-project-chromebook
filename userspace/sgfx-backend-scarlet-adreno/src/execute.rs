@@ -25,7 +25,7 @@ const PIPELINE_OBJECT_BASE: u32 = 1 << 24;
 #[cfg(test)]
 const MAX_DRAWS_PER_SUBMIT: usize = 512;
 
-fn submit_trace_enabled() -> bool {
+pub(crate) fn submit_trace_enabled() -> bool {
     static TRACE_CACHE: AtomicU8 = AtomicU8::new(u8::MAX);
     let cached = TRACE_CACHE.load(Ordering::Relaxed);
     if cached != u8::MAX {
