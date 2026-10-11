@@ -83,16 +83,16 @@
     "scarlet-sdk": {
       "flake": false,
       "locked": {
-        "lastModified": 1791453280,
-        "narHash": "sha256-Hjxu5kH0VPsPTUNk/69LaUxaz0TcXufJxT1QmrUYOFU=",
-        "ref": "main",
-        "rev": "29e82f9b797fcedef2fe8f967c2d7f7729d51cbc",
-        "revCount": 64,
+        "lastModified": 1791704268,
+        "narHash": "sha256-IWUUJJ4FEjgGoeHGXTJRhFlabXFdoIN0yQMFJFsFR10=",
+        "ref": "feat/cargo-cdylib-layers",
+        "rev": "ad692dc3e466ff0a700399b05cbb85ab42a56327",
+        "revCount": 65,
         "type": "git",
         "url": "https://github.com/petitstrawberry/scarlet-sdk.git"
       },
       "original": {
-        "ref": "main",
+        "ref": "feat/cargo-cdylib-layers",
         "type": "git",
         "url": "https://github.com/petitstrawberry/scarlet-sdk.git"
       }

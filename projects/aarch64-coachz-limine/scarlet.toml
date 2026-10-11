@@ -51,6 +51,9 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-sc7180-mdss" = { path = "../../drivers/display/qcom-sc7180-mdss", enabled = true }
 "scarlet-driver-qcom-sdhci-sc7180" = { path = "../../drivers/mmc/qcom-sdhci-sc7180", enabled = true }
 
+[userspace]
+cargo-config = ".scarlet/sgfx/userspace.toml"
+
 [images]
 
 [images.initramfs]
@@ -59,11 +62,18 @@ output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-path = "../../../Scarlet/bundles/base/bundle.toml"
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "0029eddc427898c1d15c3a19cda985d1b0632afc" }
+subdir = "bundles/sgfx-native"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-path = "../../../Scarlet/bundles/cli-utils/bundle.toml"
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "0029eddc427898c1d15c3a19cda985d1b0632afc" }
+subdir = "bundles/base"
+
+[[images.initramfs.layers]]
+kind = "bundle"
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "0029eddc427898c1d15c3a19cda985d1b0632afc" }
+subdir = "bundles/cli-utils"
 
 # Kernel drivers use the global VFS, whose root remains the initramfs after
 # userspace pivots to the block root. Keep firmware available in that trusted
@@ -79,7 +89,13 @@ output = ".scarlet/images/rootfs-aarch64-coachz-full.ext2"
 
 [[images.rootfs.layers]]
 kind = "bundle"
-path = "../../../Scarlet/bundles/full/bundle.toml"
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "0029eddc427898c1d15c3a19cda985d1b0632afc" }
+subdir = "bundles/full"
+
+[[images.rootfs.layers]]
+kind = "bundle"
+source = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook", rev = "4f4d0748ebbbd8f8ae30aaa18e2a58a3952e74ec" }
+subdir = "bundles/sgfx-adreno"
 
 [[images.rootfs.layers]]
 kind = "copy"

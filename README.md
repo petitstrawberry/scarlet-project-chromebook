@@ -79,9 +79,10 @@ The development shell provides the pinned Scarlet Rust toolchain,
 `cargo-scarlet`, the Limine image plugin, AArch64 build tools, PyUSB/libusb,
 device-tree tools, `mtools`, and serial-console utilities.
 
-The CoachZ project uses a sibling `../Scarlet` checkout for its kernel,
-filesystem bundles and userspace workspace. Use Scarlet commit
-`85f0cead4cb4c9add021360f1b469f08bf0d23a9` or a compatible successor and the
+The CoachZ BSP uses a sibling `../Scarlet` checkout for its kernel.
+Userspace bundles are fetched by cargo-scarlet from pinned Git revisions.
+Use Scarlet kernel commit
+`72e68549b679f5ff471b79847675bbb5ec3dc73a` or a compatible successor and the
 published revisions in its Cargo lockfile. The standard `/init` provides USB
 `rootwait` and constructs the current boot Environment; no project-local init
 replacement is needed.
@@ -179,15 +180,24 @@ before writing RW_LEGACY.
 From the Nix development shell:
 
 ```sh
-./scripts/build-coachz-limine-image.sh
+cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
-The normal Scarlet bundles build userspace with their checked-in Cargo locks.
-SGFX, Adreno and ScarletUI are selected by published commit revisions. Update
-those references with `cargo update -p <package> --precise <commit>` and review
-all affected Git revisions in `Cargo.lock` before building a new source set.
-The image build does not inject local source patches or rebuild
-the graphics stack through a separate rootfs hook.
+The normal Scarlet bundles select SGFX `20bb5b8c` and ScarletUI `1b0f08ae`.
+The Adreno driver uses core `040dbb5c` and runtime `d3b1c051` internally.
+The loadable driver exposes SGFX ABI v2; Rust objects and allocators remain
+private to the library. Client selection follows the published SGFX backend
+policy; this bundle does not change application preferences.
+The `sgfx-native` bundle installs `/lib/sgfx` and generates the native linker
+configuration before any userspace compilation. The project selects that
+configuration for both initramfs and rootfs builds.
+
+Userspace is built by the standard Scarlet bundles with their published Git
+revisions and checked-in Cargo locks. The project does not inject local source
+patches or run a separate userspace rebuild hook. The Adreno shared driver is
+built and installed by this repository's `bundles/sgfx-adreno` bundle, using
+standard `cargo` (`lib`) and `copy` layers. The SDK records the driver selector
+and artifact hash in `scarlet.lock`.
 
 The release images are written under:
 
@@ -201,12 +211,9 @@ The image to deploy to a USB drive is:
 projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
 ```
 
-The wrapper deliberately invalidates cargo-scarlet's packaging stamps so each
-image is repackaged from the selected sources. It also verifies that the EFI
-kernel and the Scarlet graphics applications listed in the script match the
-artifacts built in the same invocation. External applications retain their own
-workspace lockfiles. Use the wrapper rather than
-invoking `cargo scarlet image` directly for development images.
+`cargo scarlet image` owns image composition and cache reuse. The compatibility
+wrapper in `scripts/` only forwards to that command. Userspace bundles are
+fetched from pinned Git sources without a sibling Scarlet checkout.
 
 It is a GPT disk image for a single USB drive with:
 
@@ -223,7 +230,7 @@ The kernel command line selects the second partition as the root filesystem:
 root=/dev/usbblk0p2 rootfstype=ext2 rootwait
 ```
 
-The project-local PID 1 honors bare `rootwait`: it waits indefinitely for the
+Scarlet's standard PID 1 honors bare `rootwait`: it waits indefinitely for the
 configured root device to become mountable, sleeping one second between
 attempts and rate-limiting diagnostics to once every 30 seconds. Once mounted,
 it continues through Scarlet's existing root transition. Without bare
@@ -250,7 +257,7 @@ have not yet been validated on hardware.
 For a debug kernel instead of the default release build:
 
 ```sh
-./scripts/build-coachz-limine-image.sh --debug
+cargo scarlet image --project projects/aarch64-coachz-limine
 ```
 
 ## Write the image to USB

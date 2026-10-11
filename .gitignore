@@ -13,6 +13,7 @@
 target/
 /.scarlet/
 .scarlet/
+.scarlet-operation.lock
 *.img
 *.cpio
 *.ext2

@@ -12,7 +12,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     scarlet-rust-toolchain.url = "github:petitstrawberry/scarlet-rust-nix";
     scarlet-sdk = {
-      url = "git+https://github.com/petitstrawberry/scarlet-sdk.git?ref=main";
+      url = "git+https://github.com/petitstrawberry/scarlet-sdk.git?ref=feat/cargo-cdylib-layers";
       flake = false;
     };
     vboot-reference = {
@@ -202,9 +202,14 @@
             shellHook = ''
               export PATH="${rustToolchain}/bin:$PWD/scripts:$PATH"
               export SCARLET_RUST_ACTIVE_BIN="${rustToolchain}/bin"
-              export CC_aarch64_unknown_scarlet=aarch64-unknown-linux-gnu-gcc
-              export AR_aarch64_unknown_scarlet=aarch64-unknown-linux-gnu-ar
-              export RANLIB_aarch64_unknown_scarlet=aarch64-unknown-linux-gnu-ranlib
+              # Native Scarlet C dependencies provide their own libc shim.
+              # Linux GCC leaks glibc headers into those builds (for example
+              # Moonlight's mbedTLS). Keep per-application compiler overrides
+              # available by using cc-rs's fallback variables, as Scarlet does.
+              export TARGET_CC="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
+              export TARGET_AR="${pkgs.llvmPackages.llvm}/bin/llvm-ar"
+              export TARGET_RANLIB="${pkgs.llvmPackages.llvm}/bin/llvm-ranlib"
+              export SCARLET_PROBE_CC="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
               export SCARLET_COACHZ_LIMINE_EFI="${coachzLimine}/share/limine/BOOTAA64.EFI"
               ${darwinLibusbFallback}
             '';
