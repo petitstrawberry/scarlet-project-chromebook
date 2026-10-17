@@ -9,8 +9,3 @@ path = "src/main.rs"
 
 [dependencies]
 scarlet_modules = { package = "scarlet-modules", path = "../.scarlet/scarlet-modules" }
-
-# Keep every module on the kernel selected by scarlet.toml so device trait
-# objects cannot be split across Git/path copies of the Scarlet package.
-[patch."https://github.com/petitstrawberry/Scarlet"]
-scarlet = { path = "../../../../Scarlet/kernel" }

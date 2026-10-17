@@ -11,7 +11,7 @@ path = "bsp"
 package = "scarlet"
 
 [bsp.kernel]
-source = { path = "../../../Scarlet/kernel" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "ecd3cd1c534af340a85e89681414a17b4969355b" }
 features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = true }
 
 [modules]
@@ -62,17 +62,17 @@ output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "87df56b6156946fc6178e0fd0d71ba87d638bfcb" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "fb5e90ef210a99bc8e2ce5997355f8af6ec41d67" }
 subdir = "bundles/sgfx-native"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "87df56b6156946fc6178e0fd0d71ba87d638bfcb" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "fb5e90ef210a99bc8e2ce5997355f8af6ec41d67" }
 subdir = "bundles/base"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "87df56b6156946fc6178e0fd0d71ba87d638bfcb" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "fb5e90ef210a99bc8e2ce5997355f8af6ec41d67" }
 subdir = "bundles/cli-utils"
 
 # Kernel drivers use the global VFS, whose root remains the initramfs after
@@ -89,12 +89,12 @@ output = ".scarlet/images/rootfs-aarch64-coachz-full.ext2"
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "87df56b6156946fc6178e0fd0d71ba87d638bfcb" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "fb5e90ef210a99bc8e2ce5997355f8af6ec41d67" }
 subdir = "bundles/full"
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook", rev = "e8e72900ae8760fb0ccc7eddfd47bd206d4ec399" }
+source = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook", rev = "570a903aa4862d959a1ed3c453de47e0bca4b09e" }
 subdir = "bundles/sgfx-adreno"
 
 [[images.rootfs.layers]]
