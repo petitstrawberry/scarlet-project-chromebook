@@ -34,7 +34,7 @@ use scarlet::{
     interrupt::{
         InterruptClaim, InterruptId, InterruptResult, InterruptSource, MaskableInterruptSource,
     },
-    mem::address::PhysAddr,
+    mem::{address::PhysAddr, page::ContiguousPages},
     println,
     sync::{IrqGuard, IrqSpinLock, Mutex, Waker},
     time,
@@ -393,6 +393,9 @@ struct FrontendMappings {
     output_len: usize,
     input: DmaMapping,
     output: DmaMapping,
+    // Keep backing pages alive until the firmware mapping is released, even
+    // after a request completes or a frontend closes its mmap.
+    _buffer_lease: Option<Arc<ContiguousPages>>,
 }
 
 impl FrontendMappings {
@@ -434,6 +437,7 @@ impl FrontendMappings {
             output_len,
             input,
             output,
+            _buffer_lease: request.buffer_lease.clone(),
         })
     }
 
@@ -553,7 +557,7 @@ struct VenusSession {
     pending: Option<PendingDecode>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingDecode {
     request: VideoBackendDecodeRequest,
     output_tag: u32,
@@ -707,7 +711,7 @@ impl VenusSession {
         // A queued output buffer cannot complete without an input access unit,
         // while the input doorbell may produce an IRQ immediately.
         self.pending = Some(PendingDecode {
-            request: *request,
+            request: request.clone(),
             output_tag,
             submitted_at: time::current_time(),
         });
@@ -890,7 +894,7 @@ impl VenusSession {
     }
 
     fn pending_expired(&self, now: u64) -> bool {
-        self.pending.is_some_and(|pending| {
+        self.pending.as_ref().is_some_and(|pending| {
             now.saturating_sub(pending.submitted_at) >= HFI_DECODE_TIMEOUT_US
         })
     }
@@ -929,11 +933,12 @@ impl VenusSession {
                 if done.stream_id == 1 {
                     let pending = self
                         .pending
+                        .as_ref()
                         .ok_or("qcom-venus-sc7180: output completed without an in-flight frame")?;
                     if done.output_tag != pending.output_tag {
                         return Err("qcom-venus-sc7180: output completed with an unknown tag");
                     }
-                    self.pending = None;
+                    let pending = self.pending.take().unwrap();
                     return self.finish_output(&pending.request, done).map(Some);
                 }
                 if done.stream_id == 0 && done.output_tag >= DPB_TAG_BASE {
@@ -963,6 +968,7 @@ impl VenusSession {
                 self.reconfigure(registers, core, dma, sequence)?;
                 let pending = self
                     .pending
+                    .as_ref()
                     .ok_or("qcom-venus-sc7180: sequence event has no in-flight frame")?;
                 let mappings = self
                     .mappings
@@ -1429,7 +1435,7 @@ impl VenusBackend {
             if state.failed {
                 completions.push(BackendCompletion {
                     stream_id: request.stream_id,
-                    result: Err("qcom-venus-sc7180: firmware is quarantined; recreate the session"),
+                    result: Err("qcom-venus-sc7180: firmware is quarantined; reboot required"),
                 });
                 continue;
             }
@@ -1787,14 +1793,7 @@ impl VideoDecodeBackend for VenusBackend {
             return Err("qcom-venus-sc7180: maximum video session count reached");
         }
         if state.failed {
-            if !state.sessions.is_empty() {
-                return Err(
-                    "qcom-venus-sc7180: firmware is quarantined; close existing sessions first",
-                );
-            }
-            state.core = None;
-            state.failed = false;
-            state.last_error = None;
+            return Err("qcom-venus-sc7180: firmware is quarantined; reboot required");
         }
         let mut next_session_id = state.next_session_id;
         let session_id = allocate_session_id(&mut next_session_id, |candidate| {
@@ -1876,11 +1875,10 @@ impl VideoDecodeBackend for VenusBackend {
         );
         if state.failed {
             self.registers.assert_arm9_reset();
-            if state.sessions.is_empty() {
-                state.core = None;
-                state.failed = false;
-                state.last_error = None;
-            }
+            // Reset assertion is not a proven DMA retirement barrier. Retain
+            // the mappings and their page leases until reboot; failed stays
+            // latched so at most the admitted sessions can be quarantined.
+            mem::forget(session);
             self.queue_worker();
             return Ok(());
         }
@@ -1890,11 +1888,9 @@ impl VideoDecodeBackend for VenusBackend {
         };
         if let Err(error) = result {
             Self::quarantine(&mut state, &self.registers, error);
-            if state.sessions.is_empty() {
-                state.core = None;
-                state.failed = false;
-                state.last_error = None;
-            }
+            // STOP failed, so firmware may still own these DMA addresses.
+            // Keep the core and session allocations quarantined until reboot.
+            mem::forget(session);
             self.queue_worker();
             return Err(error);
         }
@@ -1927,7 +1923,7 @@ impl VideoDecodeBackend for VenusBackend {
             if queued.len() >= MAX_CONCURRENT_SESSIONS {
                 return Err("qcom-venus-sc7180: decode queue is full");
             }
-            queued.push_back(*request);
+            queued.push_back(request.clone());
         }
         self.queue_worker();
         Ok(())

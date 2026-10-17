@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9#2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ecd3cd1c534af340a85e89681414a17b4969355b#ecd3cd1c534af340a85e89681414a17b4969355b"
 dependencies = [
  "chacha20",
  "fdt",
@@ -181,7 +181,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9#2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ecd3cd1c534af340a85e89681414a17b4969355b#ecd3cd1c534af340a85e89681414a17b4969355b"
 
 [[package]]
 name = "scarlet-driver-qcom-adreno-a618"

@@ -12,8 +12,9 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     scarlet-rust-toolchain.url = "github:petitstrawberry/scarlet-rust-nix";
     scarlet-sdk = {
-      url = "git+https://github.com/petitstrawberry/scarlet-sdk.git?ref=feat/cargo-cdylib-layers";
-      flake = false;
+      url = "github:petitstrawberry/scarlet-sdk/a071222231e8bbd96c1d54f38d99d1b27ec90805";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.scarlet-rust-toolchain.follows = "scarlet-rust-toolchain";
     };
     vboot-reference = {
       url = "git+https://chromium.googlesource.com/chromiumos/platform/vboot_reference?rev=c71f57be588c1ca69052e6f7208cc16437db513e";
@@ -140,24 +141,9 @@
           vbootTools = mkVbootTools pkgs;
           coachzLimine = mkCoachzLimine pkgs;
 
-          cargo-scarlet = pkgs.rustPlatform.buildRustPackage {
-            pname = "cargo-scarlet";
-            version = "0.1.0";
-            src = scarlet-sdk;
-            buildAndTestSubdir = "cargo-scarlet";
-            cargoLock.lockFile = "${scarlet-sdk}/Cargo.lock";
-            nativeBuildInputs = [ pkgs.curl ];
-            # Cache safety tests create Git repositories to check tracked files.
-            nativeCheckInputs = [ pkgs.git ];
-          };
-
-          cargo-scarlet-plugin-limine = pkgs.rustPlatform.buildRustPackage {
-            pname = "cargo-scarlet-plugin-limine";
-            version = "0.1.0";
-            src = scarlet-sdk;
-            buildAndTestSubdir = "cargo-scarlet-plugin-limine";
-            cargoLock.lockFile = "${scarlet-sdk}/Cargo.lock";
-          };
+          cargo-scarlet = scarlet-sdk.packages.${system}.cargo-scarlet;
+          cargo-scarlet-plugin-limine = scarlet-sdk.packages.${system}.cargo-scarlet-plugin-limine;
+          nativeRuntime = scarlet-sdk.packages.${system}.scarlet-native-runtime;
 
           # Current nixpkgs patches PyUSB to use libusb's absolute store path.
           # Only an unpatched/older PyUSB on Darwin should need this fallback.
@@ -202,6 +188,15 @@
             shellHook = ''
               export PATH="${rustToolchain}/bin:$PWD/scripts:$PATH"
               export SCARLET_RUST_ACTIVE_BIN="${rustToolchain}/bin"
+              export SCARLET_NATIVE_RUNTIME="${nativeRuntime}"
+              export SCARLET_LLVM_LIBC_SOURCE_DIR="${scarlet-sdk.inputs.llvm-src}/libc"
+              export SCARLET_NATIVE_CC="${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang"
+              export SCARLET_NATIVE_CXX="${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang++"
+              export SCARLET_NATIVE_AR="${pkgs.llvmPackages_21.llvm}/bin/llvm-ar"
+              export SCARLET_NATIVE_RANLIB="${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib"
+              export SCARLET_NATIVE_NM="${pkgs.llvmPackages_21.llvm}/bin/llvm-nm"
+              export LIBCLANG_PATH="${pkgs.llvmPackages_21.libclang.lib}/lib"
+              export CARGO_NET_GIT_FETCH_WITH_CLI=true
               # Native Scarlet C dependencies provide their own libc shim.
               # Linux GCC leaks glibc headers into those builds (for example
               # Moonlight's mbedTLS). Keep per-application compiler overrides
