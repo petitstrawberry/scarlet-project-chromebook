@@ -38,9 +38,8 @@ Still under development:
 - SD/eMMC support
 - onboard networking and GPU support
 
-The current Scarlet system runs entirely from its initramfs after boot. U-Boot
-can read the USB boot medium, but Scarlet does not yet mount a persistent
-root filesystem from it.
+The full image boots through its initramfs and waits for the USB root
+filesystem at `/dev/usbblk0p2`, then mounts that ext2 partition for userspace.
 
 ## Requirements
 
@@ -83,7 +82,8 @@ The CoachZ kernel, userspace bundles, and native graphics driver are selected
 from published Git revisions by cargo-scarlet. Every board driver uses the
 same pinned kernel package; no sibling Scarlet checkout is required. The
 current kernel includes firmware-managed GPU frequency registration, with
-its matching revisions recorded in `scarlet.toml` and the Cargo lockfiles. The standard `/init` provides USB
+its matching revisions recorded in `scarlet.toml` and the Cargo lockfiles.
+The standard `/init` provides USB
 `rootwait` and constructs the current boot Environment; no project-local init
 replacement is needed.
 

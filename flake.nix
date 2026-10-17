@@ -16,6 +16,10 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.scarlet-rust-toolchain.follows = "scarlet-rust-toolchain";
     };
+    vulkan-headers-src = {
+      url = "github:KhronosGroup/Vulkan-Headers/c46850864f4661461b0f6cb9922c058ffea4915e";
+      flake = false;
+    };
     vboot-reference = {
       url = "git+https://chromium.googlesource.com/chromiumos/platform/vboot_reference?rev=c71f57be588c1ca69052e6f7208cc16437db513e";
       flake = false;
@@ -27,6 +31,7 @@
       nixpkgs,
       scarlet-rust-toolchain,
       scarlet-sdk,
+      vulkan-headers-src,
       vboot-reference,
       ...
     }:
@@ -166,6 +171,9 @@
               pkgs.git
               pkgs.curl
               pkgs.gnumake
+              pkgs.cmake
+              pkgs.ninja
+              pkgs.pkg-config
               pkgs.gnutar
               pkgs.which
               pkgs.ripgrep
@@ -188,6 +196,11 @@
             shellHook = ''
               export PATH="${rustToolchain}/bin:$PWD/scripts:$PATH"
               export SCARLET_RUST_ACTIVE_BIN="${rustToolchain}/bin"
+              export CC="${pkgs.stdenv.cc}/bin/cc"
+              export CXX="${pkgs.stdenv.cc}/bin/c++"
+              export HOST_CC="$CC"
+              export HOST_CXX="$CXX"
+              export VULKAN_HEADERS_SOURCE_DIR="${vulkan-headers-src}"
               export SCARLET_NATIVE_RUNTIME="${nativeRuntime}"
               export SCARLET_LLVM_LIBC_SOURCE_DIR="${scarlet-sdk.inputs.llvm-src}/libc"
               export SCARLET_NATIVE_CC="${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang"

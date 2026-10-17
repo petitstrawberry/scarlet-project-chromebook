@@ -54,7 +54,8 @@
         "nixpkgs": "nixpkgs",
         "scarlet-rust-toolchain": "scarlet-rust-toolchain",
         "scarlet-sdk": "scarlet-sdk",
-        "vboot-reference": "vboot-reference"
+        "vboot-reference": "vboot-reference",
+        "vulkan-headers-src": "vulkan-headers-src"
       }
     },
     "rust-overlay": {
@@ -155,6 +156,23 @@
         "rev": "c71f57be588c1ca69052e6f7208cc16437db513e",
         "type": "git",
         "url": "https://chromium.googlesource.com/chromiumos/platform/vboot_reference"
+      }
+    },
+    "vulkan-headers-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790906297,
+        "narHash": "sha256-KyHdumYx8qIgQFcr+l4L9ayKpk1/6KBa3f7OyluqKbc=",
+        "owner": "KhronosGroup",
+        "repo": "Vulkan-Headers",
+        "rev": "c46850864f4661461b0f6cb9922c058ffea4915e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "KhronosGroup",
+        "repo": "Vulkan-Headers",
+        "rev": "c46850864f4661461b0f6cb9922c058ffea4915e",
+        "type": "github"
       }
     }
   },
