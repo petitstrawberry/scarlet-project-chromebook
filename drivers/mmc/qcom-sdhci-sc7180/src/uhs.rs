@@ -16,6 +16,16 @@ const TUNING: [u8; 64] = [
 ];
 
 impl Sc7180SdhciHost {
+    pub(super) fn configure_command_cdr(&self, command: u8, read: bool) {
+        if self.timing == MmcTiming::Sdr104 {
+            let config = read32(self.mmio_base, CORE_DLL_CONFIG);
+            let next = command_cdr_config(config, command, read);
+            if next != config {
+                write32(self.mmio_base, CORE_DLL_CONFIG, next);
+            }
+        }
+    }
+
     fn wait_bits(&self, offset: usize, mask: u32, expected: u32) -> MmcResult<()> {
         for _ in 0..1000 {
             if read32(self.mmio_base, offset) & mask == expected {
@@ -174,6 +184,7 @@ impl Sc7180SdhciHost {
 
     fn tuning_read(&mut self) -> MmcResult<()> {
         let mut data = [0u8; 64];
+        self.configure_command_cdr(19, true);
         let response = self.host.send_command(
             MmcCommand::new(19, 0, scarlet::device::mmc::MmcResponseType::R1),
             Some(MmcData::Read(&mut data)),

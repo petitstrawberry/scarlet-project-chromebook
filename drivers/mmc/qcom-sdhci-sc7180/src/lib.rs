@@ -292,9 +292,17 @@ impl MmcHost for Sc7180SdhciHost {
     }
 
     fn card_present(&self) -> bool {
-        self.card_detect
+        let present = self
+            .card_detect
             .as_ref()
-            .map_or_else(|| self.host.card_present(), CardDetect::present)
+            .map_or_else(|| self.host.card_present(), CardDetect::present);
+        if !present {
+            println!(
+                "[qcom-sdhci-sc7180] {:?} card detect reports absent",
+                self.kind
+            );
+        }
+        present
     }
 
     fn is_removable(&self) -> bool {
@@ -316,10 +324,23 @@ impl MmcHost for Sc7180SdhciHost {
         }
         let command_index = command.index();
         let command_argument = command.argument();
+        self.configure_command_cdr(command_index, data.as_ref().is_some_and(MmcData::is_read));
         if command_index == 8 {
             self.log_cmd8_state("pre");
         }
         let result = self.host.send_command(command, data);
+        if matches!(command_index, 17 | 18 | 24 | 25) {
+            if let Ok(response) = &result {
+                if response.word(0) & 0xfff9_a080 != 0 {
+                    println!(
+                        "[qcom-sdhci-sc7180] command index={} argument={:#010x} card status={:#010x}",
+                        command_index,
+                        command_argument,
+                        response.word(0)
+                    );
+                }
+            }
+        }
         if command_index == 8 {
             self.log_cmd8_state("post");
             if let Ok(response) = &result {

@@ -7,6 +7,56 @@ pub(crate) const SD_VMMC_MAX_UV: u32 = 3_600_000;
 
 // Qualcomm SDCC5 vendor registers are relative to the first ("hc") resource.
 pub(crate) const CORE_DLL_CONFIG: usize = 0x200;
+const CORE_CDR_EN: u32 = 1 << 17;
+const CORE_CDR_EXT_EN: u32 = 1 << 19;
+
+/// SDCC clock recovery follows ordinary reads, but must use external feedback
+/// for writes, command-only operations, and tuning (Linux sdhci-msm.c).
+pub(crate) fn command_cdr_config(config: u32, command: u8, read: bool) -> u32 {
+    if read && !matches!(command, 19 | 21) {
+        (config | CORE_CDR_EN) & !CORE_CDR_EXT_EN
+    } else {
+        (config & !CORE_CDR_EN) | CORE_CDR_EXT_EN
+    }
+}
+
+#[cfg(test)]
+mod cdr_tests {
+    use super::*;
+
+    #[test]
+    fn feedback_tracks_command_direction_and_preserves_dll_phase() {
+        let other = 0xa5f5_1234 & !(CORE_CDR_EN | CORE_CDR_EXT_EN);
+        for previous in [
+            0,
+            CORE_CDR_EN,
+            CORE_CDR_EXT_EN,
+            CORE_CDR_EN | CORE_CDR_EXT_EN,
+        ] {
+            for (command, read, internal) in [
+                (17, true, true),
+                (18, true, true),
+                (24, false, false),
+                (25, false, false),
+                (12, false, false),
+                (13, false, false),
+                (19, true, false),
+                (21, true, false),
+            ] {
+                let expected = other
+                    | if internal {
+                        CORE_CDR_EN
+                    } else {
+                        CORE_CDR_EXT_EN
+                    };
+                assert_eq!(
+                    command_cdr_config(other | previous, command, read),
+                    expected
+                );
+            }
+        }
+    }
+}
 pub(crate) const CORE_DLL_RST: u32 = 1 << 30;
 pub(crate) const CORE_DLL_PDN: u32 = 1 << 29;
 pub(crate) const CORE_VENDOR_SPEC: usize = 0x20c;

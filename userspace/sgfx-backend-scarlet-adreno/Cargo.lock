@@ -42,7 +42,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 [[package]]
 name = "gpu-raw"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=b8c996c40607e1b62c7df69eb8af9c2ea994f99d#b8c996c40607e1b62c7df69eb8af9c2ea994f99d"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=586b2c097d543a3b6ac412d7585792dffe0107e8#586b2c097d543a3b6ac412d7585792dffe0107e8"
 dependencies = [
  "scarlet-abi",
  "scarlet-os",
@@ -72,12 +72,12 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=b8c996c40607e1b62c7df69eb8af9c2ea994f99d#b8c996c40607e1b62c7df69eb8af9c2ea994f99d"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=586b2c097d543a3b6ac412d7585792dffe0107e8#586b2c097d543a3b6ac412d7585792dffe0107e8"
 
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=b8c996c40607e1b62c7df69eb8af9c2ea994f99d#b8c996c40607e1b62c7df69eb8af9c2ea994f99d"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=586b2c097d543a3b6ac412d7585792dffe0107e8#586b2c097d543a3b6ac412d7585792dffe0107e8"
 dependencies = [
  "scarlet-abi",
  "scarlet-rt",
@@ -87,7 +87,7 @@ dependencies = [
 [[package]]
 name = "scarlet-rt"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=b8c996c40607e1b62c7df69eb8af9c2ea994f99d#b8c996c40607e1b62c7df69eb8af9c2ea994f99d"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=586b2c097d543a3b6ac412d7585792dffe0107e8#586b2c097d543a3b6ac412d7585792dffe0107e8"
 dependencies = [
  "lock_api",
  "scarlet-sys",
@@ -98,7 +98,7 @@ dependencies = [
 [[package]]
 name = "scarlet-std"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=b8c996c40607e1b62c7df69eb8af9c2ea994f99d#b8c996c40607e1b62c7df69eb8af9c2ea994f99d"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=586b2c097d543a3b6ac412d7585792dffe0107e8#586b2c097d543a3b6ac412d7585792dffe0107e8"
 dependencies = [
  "hashbrown",
  "scarlet-abi",
@@ -111,7 +111,7 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=b8c996c40607e1b62c7df69eb8af9c2ea994f99d#b8c996c40607e1b62c7df69eb8af9c2ea994f99d"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=586b2c097d543a3b6ac412d7585792dffe0107e8#586b2c097d543a3b6ac412d7585792dffe0107e8"
 dependencies = [
  "scarlet-abi",
 ]
