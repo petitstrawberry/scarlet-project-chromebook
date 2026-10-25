@@ -13,10 +13,10 @@
 pub const MESA_SHA: &str = "3f1b217baffffa00cb8f53e158713a33e1bd4632";
 /// SHA256 of the generated Mesa metadata consumed by `pack_state.py`.
 pub const MESA_METADATA_SHA256: &str =
-    "84a727b282d051a97cc9a3d43c5921dbe3751845db7c2de39d8f241727e701b9";
+    "3b21730b4117fcf016a4c749a5d335d428c27ded2476b29a60b7c99bb4dfcf47";
 /// SHA256 of the generated packed-state metadata represented below.
 pub const PACKED_STATE_SHA256: &str =
-    "c4c746958a7c1dbbd2e2860299194f4ebe5a0d6e8401a1c7cc71494ed6f2de48";
+    "f4420ee7bf91a46301c803d87546b068ee42a27e61e9a55de8c37df06673ac8e";
 /// Required start alignment and fixed allocation stride of every program.
 pub const SHADER_ALIGNMENT: usize = 128;
 /// Exact byte count of every canonical program.
@@ -39,10 +39,12 @@ pub enum ShaderVariant {
     VsStride24Pos4Uv2 = 10,
     VsStride28Pos4Color3 = 11,
     FsTextureRgbIgnoreAlpha = 12,
+    FsNv12 = 13,
+    FsNv12VertexColor = 14,
 }
 
 impl ShaderVariant {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::VsStride16Pos2,
         Self::VsStride16Pos2Uv2,
         Self::VsStride40Pos4,
@@ -56,6 +58,8 @@ impl ShaderVariant {
         Self::VsStride24Pos4Uv2,
         Self::VsStride28Pos4Color3,
         Self::FsTextureRgbIgnoreAlpha,
+        Self::FsNv12,
+        Self::FsNv12VertexColor,
     ];
 
     pub const fn from_raw(raw: u16) -> Option<Self> {
@@ -71,7 +75,15 @@ impl ShaderVariant {
     }
 
     pub const fn offset(self) -> usize {
-        self as usize * SHADER_ALIGNMENT
+        if self as usize <= 13 {
+            self as usize * SHADER_ALIGNMENT
+        } else {
+            15 * SHADER_ALIGNMENT
+        }
+    }
+
+    pub const fn size(self) -> usize {
+        (self.bytes().len() + 127) & !127
     }
 
     pub const fn is_vertex(self) -> bool {
@@ -87,8 +99,10 @@ impl ShaderVariant {
         )
     }
 
-    pub const fn bytes(self) -> &'static [u8; SHADER_SIZE] {
+    pub const fn bytes(self) -> &'static [u8] {
         match self {
+            Self::FsNv12 => include_bytes!("../artifacts/a618/fs_nv12.bin"),
+            Self::FsNv12VertexColor => include_bytes!("../artifacts/a618/fs_nv12_vertex_color.bin"),
             Self::VsStride16Pos2 => include_bytes!("../artifacts/a618/vs_stride16_pos2.bin"),
             Self::VsStride16Pos2Uv2 => {
                 include_bytes!("../artifacts/a618/vs_stride16_pos2_uv2.bin")
@@ -232,6 +246,42 @@ pub const fn shader_meta(variant: ShaderVariant) -> ShaderMeta {
             vfd_dest_cntl: &[15, 71],
             vfd_cntl_1_6: VFD_CNTL_1_6_NO_SYSVALS,
         }),
+        FsNv12 => ShaderMeta::Fragment(FragmentMeta {
+            gras_cl_interp_cntl: 1,
+            rb_interp_cntl: 1025,
+            rb_ps_input_cntl: 0,
+            rb_ps_output_cntl: 0,
+            rb_ps_output_mask: 15,
+            sp_ps_cntl_0: 2169504128,
+            sp_ps_config: 131840,
+            sp_ps_const_config: 258,
+            initial_tex_load_cmd: &[566362112],
+            initial_tex_load_cntl: 1,
+            sp_ps_instr_size: 1,
+            sp_ps_output_cntl: 4244438016,
+            sp_ps_output_mask: 15,
+            sp_ps_output_reg: &[7],
+            sp_ps_wave_cntl: 3,
+            sp_reg_prog_id: [4244438268, 4244438016, 4244438268, 64764],
+        }),
+        FsNv12VertexColor => ShaderMeta::Fragment(FragmentMeta {
+            gras_cl_interp_cntl: 1,
+            rb_interp_cntl: 1025,
+            rb_ps_input_cntl: 0,
+            rb_ps_output_cntl: 0,
+            rb_ps_output_mask: 15,
+            sp_ps_cntl_0: 2169504256,
+            sp_ps_config: 131840,
+            sp_ps_const_config: 258,
+            initial_tex_load_cmd: &[566362116],
+            initial_tex_load_cntl: 1,
+            sp_ps_instr_size: 2,
+            sp_ps_output_cntl: 4244438016,
+            sp_ps_output_mask: 15,
+            sp_ps_output_reg: &[11],
+            sp_ps_wave_cntl: 3,
+            sp_reg_prog_id: [4244438268, 4244438016, 4244438268, 64764],
+        }),
         FsSolid => ShaderMeta::Fragment(FragmentMeta {
             sp_ps_cntl_0: 0x8110_0080,
             sp_ps_instr_size: 1,
@@ -315,10 +365,13 @@ pub enum PipelineVariant {
     Stride32Solid,
     Stride32VertexColor,
     Stride24TextureAlphaMask,
+    Stride16Nv12,
+    Stride24Nv12,
+    Stride40Nv12VertexColor,
 }
 
 impl PipelineVariant {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 16] = [
         Self::Stride16Solid,
         Self::Stride16TextureRgba,
         Self::Stride16TextureAlphaMask,
@@ -332,6 +385,9 @@ impl PipelineVariant {
         Self::Stride32Solid,
         Self::Stride32VertexColor,
         Self::Stride24TextureAlphaMask,
+        Self::Stride16Nv12,
+        Self::Stride24Nv12,
+        Self::Stride40Nv12VertexColor,
     ];
 }
 
@@ -361,14 +417,19 @@ pub const fn pipeline_state_meta(variant: PipelineVariant) -> PipelineStateMeta 
     const POS4_COLOR4_UV2: &[u32] = &[0xc820_0000, 1, 0xc820_0200, 1, 0xc670_0400, 1];
     match variant {
         Stride16Solid => fixed(16, POS2, false, true),
-        Stride16TextureRgba | Stride16TextureAlphaMask => fixed(16, POS2_UV2, true, true),
+        Stride16Nv12 | Stride16TextureRgba | Stride16TextureAlphaMask => {
+            fixed(16, POS2_UV2, true, true)
+        }
         Stride40Solid => fixed(40, POS4, false, true),
         Stride40VertexColor => fixed(40, POS4_COLOR4, false, true),
-        Stride40TextureVertexColorRgba => fixed(40, POS4_COLOR4_UV2, true, true),
-        Stride24Solid => fixed(24, POS4, false, true),
-        Stride24TextureRgba | Stride24TextureRgbIgnoreAlpha | Stride24TextureAlphaMask => {
-            fixed(24, POS4_UV2, true, true)
+        Stride40Nv12VertexColor | Stride40TextureVertexColorRgba => {
+            fixed(40, POS4_COLOR4_UV2, true, true)
         }
+        Stride24Solid => fixed(24, POS4, false, true),
+        Stride24Nv12
+        | Stride24TextureRgba
+        | Stride24TextureRgbIgnoreAlpha
+        | Stride24TextureAlphaMask => fixed(24, POS4_UV2, true, true),
         Stride28VertexColor => fixed(28, POS4_COLOR3, false, false),
         Stride32Solid => fixed(32, POS4, false, true),
         Stride32VertexColor => fixed(32, POS4_COLOR4, false, true),
@@ -394,6 +455,39 @@ pub const fn link_meta(variant: PipelineVariant) -> LinkMeta {
     use PipelineVariant::*;
     use ShaderVariant::*;
     match variant {
+        Stride16Nv12 => link(
+            VsStride16Pos2Uv2,
+            FsNv12,
+            &[252183298],
+            &[512],
+            16712198,
+            6,
+            2,
+            [4294967292, 4294967295, 4294967295, 4294967295],
+            4278320898,
+        ),
+        Stride24Nv12 => link(
+            VsStride24Pos4Uv2,
+            FsNv12,
+            &[252314372],
+            &[512],
+            16712198,
+            6,
+            2,
+            [4294967292, 4294967295, 4294967295, 4294967295],
+            4278320898,
+        ),
+        Stride40Nv12VertexColor => link(
+            VsStride40Pos4Color4Uv2,
+            FsNv12VertexColor,
+            &[50859780, 3854],
+            &[394240],
+            16713226,
+            10,
+            3,
+            [4294967232, 4294967295, 4294967295, 4294967295],
+            4278320902,
+        ),
         Stride16Solid => link(
             VsStride16Pos2,
             FsSolid,
@@ -565,7 +659,7 @@ const fn link(
 }
 
 /// Total byte count of the kernel-owned, 128-byte-strided pack allocation.
-pub const PACK_SIZE: usize = ShaderVariant::ALL.len() * SHADER_ALIGNMENT;
+pub const PACK_SIZE: usize = 17 * SHADER_ALIGNMENT;
 
 /// Copy all canonical programs into one aligned kernel-owned allocation.
 pub fn copy_pack(destination: &mut [u8]) -> bool {
@@ -574,7 +668,8 @@ pub fn copy_pack(destination: &mut [u8]) -> bool {
     }
     for variant in ShaderVariant::ALL {
         let start = variant.offset();
-        destination[start..start + SHADER_SIZE].copy_from_slice(variant.bytes());
+        destination[start..start + variant.size()].fill(0);
+        destination[start..start + variant.bytes().len()].copy_from_slice(variant.bytes());
     }
     true
 }
@@ -627,10 +722,10 @@ mod tests {
         for (index, variant) in ShaderVariant::ALL.into_iter().enumerate() {
             assert_eq!(variant.raw() as usize, index);
             assert_eq!(variant.offset() % SHADER_ALIGNMENT, 0);
-            assert_eq!(variant.bytes().len(), SHADER_SIZE);
+            assert!(variant.bytes().len() <= variant.size());
             assert_eq!(ShaderVariant::from_raw(index as u16), Some(variant));
         }
-        assert_eq!(ShaderVariant::from_raw(13), None);
+        assert_eq!(ShaderVariant::from_raw(15), None);
     }
 
     #[test]
@@ -668,6 +763,8 @@ mod tests {
             "vs_stride24_pos4_uv2",
             "vs_stride28_pos4_color3",
             "fs_texture_rgb_ignore_alpha",
+            "fs_nv12",
+            "fs_nv12_vertex_color",
         ];
         for (variant, name) in ShaderVariant::ALL.into_iter().zip(names) {
             let generated = object(object(generated, "variants"), name);
@@ -747,6 +844,9 @@ mod tests {
             "stride40_solid",
             "stride40_vertex_color",
             "stride24_texture_rgba",
+            "stride16_nv12",
+            "stride24_nv12",
+            "stride40_nv12_vertex_color",
         ];
         for (variant, name) in PipelineVariant::ALL.into_iter().zip(link_names) {
             let generated = object(object(generated, "links"), name);

@@ -1,0 +1,23 @@
+(rpt3)bary.f (ei)r1.y, (r)0, r0.x
+(rpt2)nop
+mul.f r3.z, c4.w, r2.x
+(sy)mad.f32 r2.y, c5.x, r0.z, c5.w
+mad.f32 r2.z, c6.x, r0.z, c6.w
+mad.f32 r0.z, c7.x, r0.z, c7.w
+mad.f32 r2.y, c5.y, r0.w, r2.y
+mad.f32 r2.z, c6.y, r0.w, r2.z
+mad.f32 r0.w, c7.y, r0.w, r0.z
+mad.f32 (sat)r2.y, c5.z, r1.x, r2.y
+mad.f32 (sat)r2.z, c6.z, r1.x, r2.z
+(nop1) mad.f32 (sat)r1.x, c7.z, r1.x, r0.w
+mul.f r2.y, r2.y, c4.x
+mul.f r2.z, r2.z, c4.y
+(nop1) mul.f r1.x, r1.x, c4.z
+mul.f r2.w, r2.y, r1.y
+mul.f r3.x, r2.z, r1.z
+mul.f r3.y, r1.x, r1.w
+end
+nop
+nop
+nop
+nop

@@ -21,17 +21,17 @@ Compiler-emitted state dependencies include merged-register mode, early
 preamble, thread size, helper/LOD flags, prefetch end-of-quad, output flags,
 clip/cull state, and output view/alias data; the packer consumes these fields or
 fails explicitly for unsupported VPC state. Each `.bin` is the
-exact `info.sizedwords * 4` instruction stream and is 128 bytes. Each `.disasm`
+exact `info.sizedwords * 4` instruction stream. The kernel pads each program to a 128-byte boundary. Each `.disasm`
 is Mesa `disasm_a3xx_stat(..., gpu_id=618)` output.
 
 ## Uniform layout
 
-Both stages receive the same five direct constant vec4s (80 bytes): matrix
+Both stages receive five direct constant vec4s (80 bytes): matrix
 columns in `c0` through `c3`, followed by color in `c4`. The matrix calculation
 is `column0*x + column1*y + column2*z + column3*w`, matching SGFX's column-major
 `Transform` and the WGPU backend. Mesa reports `constlen=12` for VS and `8` for
 FS after its own reserved constant allocations; only `c0..c4` are application
-data. `imm_count_dwords` is zero for every variant.
+data. NV12 fragment programs additionally receive three YCbCr-to-RGB rows in `c5..c7` (each row includes its range offset in W). Native planar descriptors carry Y and UV addresses and explicit chroma siting; no CPU color conversion is involved. `imm_count_dwords` is zero for every variant.
 
 Texture operations are lowered by Mesa to A6xx sampler pre-dispatch state.
 Therefore the texture shaders intentionally have no cat5 instruction in their

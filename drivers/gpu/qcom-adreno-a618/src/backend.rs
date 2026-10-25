@@ -50,7 +50,7 @@ use adreno_a6xx_layout::{
     depth32_tile6_3_layout,
 };
 use adreno_a6xx_pm4::{opcode, type4, type7};
-use adreno_a6xx_shader_pack::{PACK_SIZE, SHADER_ALIGNMENT, SHADER_SIZE, ShaderVariant, copy_pack};
+use adreno_a6xx_shader_pack::{PACK_SIZE, SHADER_ALIGNMENT, ShaderVariant, copy_pack};
 use qcom_sc7180_interconnect::GpuMemoryPath;
 
 use crate::{
@@ -707,14 +707,14 @@ impl A618Core {
 
     fn resolve_shader_at(pack_base: u64, variant: ShaderVariant) -> Option<ResolvedResource> {
         let offset = variant.offset();
-        let end = offset.checked_add(SHADER_SIZE)?;
+        let end = offset.checked_add(variant.size())?;
         if end > PACK_SIZE {
             return None;
         }
         Some(ResolvedResource {
             attachment_token: 0,
             gpu_va: pack_base.checked_add(offset as u64)?,
-            allocation_size: SHADER_SIZE as u64,
+            allocation_size: variant.size() as u64,
             allowed_access: adreno_a6xx_submit_wire::ACCESS_READ,
             linear_image: None,
         })
@@ -2145,6 +2145,103 @@ impl A618Backend {
 }
 
 impl GpuBackend for A618Backend {
+    fn import_shared_image(
+        &self,
+        image: Arc<scarlet::device::graphics::shared_image::SharedImage>,
+        color: scarlet::device::graphics::shared_image::ImageColor,
+    ) -> Result<(Arc<dyn GpuBackendImage>, GpuBackendImageLayout), &'static str> {
+        use scarlet::device::gpu::{GPU_IMAGE_FORMAT_NV12, GpuBackendImagePlaneLayout};
+        use scarlet::device::graphics::shared_image::*;
+        let d = image.descriptor();
+        d.validate()?;
+        if color.reserved != [0; 2]
+            || d.format != IMAGE_FORMAT_NV12
+            || d.modifier != 0
+            || d.buffer_count != 1
+            || d.visible.x != 0
+            || d.visible.y != 0
+            || d.visible.width != d.width
+            || d.visible.height != d.height
+            || d.width % 2 != 0
+            || d.height % 2 != 0
+            || !matches!(color.matrix, COLOR_MATRIX_BT601 | COLOR_MATRIX_BT709)
+            || !matches!(color.range, COLOR_RANGE_LIMITED | COLOR_RANGE_FULL)
+            || !matches!(color.chroma_x, CHROMA_COSITED | CHROMA_MIDPOINT)
+            || !matches!(color.chroma_y, CHROMA_COSITED | CHROMA_MIDPOINT)
+        {
+            return Err("qcom-adreno-a618: unsupported NV12 import");
+        }
+        let y = d.planes[0];
+        let uv = d.planes[1];
+        if y.buffer_index != 0
+            || uv.buffer_index != 0
+            || y.offset != 0
+            || y.row_pitch % 64 != 0
+            || uv.row_pitch != y.row_pitch
+            || y.size != u64::from(y.row_pitch) * u64::from(d.height)
+            || uv.size != u64::from(uv.row_pitch) * u64::from(d.height / 2)
+            || uv.offset < y.size
+            || uv.offset % 4096 != 0
+        {
+            return Err("qcom-adreno-a618: unsupported NV12 plane layout");
+        }
+        let total = d.buffer_sizes[0];
+        let mut planes = [GpuBackendImagePlaneLayout::EMPTY; 4];
+        for (index, (out, plane)) in planes.iter_mut().zip(d.planes.iter()).take(2).enumerate() {
+            *out = GpuBackendImagePlaneLayout {
+                offset: plane.offset,
+                row_pitch: plane.row_pitch,
+                array_pitch: plane.size as u32,
+                size: plane.size,
+                block_width: if index == 0 { 1 } else { 2 },
+                block_height: if index == 0 { 1 } else { 2 },
+                bytes_per_block: if index == 0 { 1 } else { 2 },
+            };
+        }
+        let layout = GpuBackendImageLayout {
+            modifier: 0,
+            total_size: total,
+            alignment: 4096,
+            plane_count: 2,
+            planes,
+        };
+        let backing = GpuImageBackingInfo::new_segmented(image.backing().buffer_segments(0), total);
+        let create = GpuImageCreateInfo {
+            format: GPU_IMAGE_FORMAT_NV12,
+            usage: GPU_IMAGE_USAGE_SAMPLED,
+            width: d.width,
+            height: d.height,
+            mip_levels: 1,
+            array_layers: 1,
+            cube: false,
+        };
+        let resource = self.create_image_resource(
+            &backing,
+            adreno_a6xx_submit_wire::ACCESS_READ,
+            LinearImage {
+                texture: None,
+                format: LinearImageFormat::Nv12 {
+                    uv_offset: uv.offset,
+                    uv_size: uv.size,
+                },
+                modifier: ImageModifier::Linear,
+                width: d.width,
+                height: d.height,
+                row_pitch: y.row_pitch,
+                visible_size: total,
+            },
+        )?;
+        // GpuImageResource pins the shared producer lease through accepted submissions.
+        Ok((
+            Arc::new(A618Image {
+                resource,
+                create,
+                layout,
+            }),
+            layout,
+        ))
+    }
+
     fn supports_segmented_image_backing(&self) -> bool {
         true
     }

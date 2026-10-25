@@ -7,7 +7,7 @@
 
 #![no_std]
 
-use adreno_a6xx_shader_pack::{SHADER_SIZE, ShaderVariant};
+use adreno_a6xx_shader_pack::ShaderVariant;
 
 /// Four-byte A6xx submit magic (`A6XS`) interpreted as little endian.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"A6XS");
@@ -308,9 +308,9 @@ fn validate_relocation(
                 return Err(Error::RelocationOutOfBounds);
             }
         }
-        RelocationSource::CanonicalShader(_) => {
+        RelocationSource::CanonicalShader(variant) => {
             if relocation.resource_offset != 0
-                || relocation.required_size != SHADER_SIZE as u64
+                || relocation.required_size != variant.size() as u64
                 || relocation.access != ACCESS_READ
                 || relocation.encoding != AddressEncoding::GpuVa64
             {
@@ -546,9 +546,9 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedSubmit<'_>, Error> {
                     return Err(Error::RelocationOutOfBounds);
                 }
             }
-            RelocationSource::CanonicalShader(_) => {
+            RelocationSource::CanonicalShader(variant) => {
                 if relocation.resource_offset != 0
-                    || relocation.required_size != SHADER_SIZE as u64
+                    || relocation.required_size != variant.size() as u64
                     || relocation.access != ACCESS_READ
                     || relocation.encoding != AddressEncoding::GpuVa64
                 {

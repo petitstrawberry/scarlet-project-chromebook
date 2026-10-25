@@ -839,6 +839,7 @@ fn append_image_resource(
         id,
         size: bound_size,
         kind: codegen::ResourceKind::Image(codegen::ImageMeta {
+            conversion: image.conversion,
             texture: image.texture,
             format: descriptor.format(),
             storage_format: match descriptor.format() {
@@ -846,8 +847,8 @@ fn append_image_resource(
                 ir::TextureFormat::Bgra8Unorm
                 | ir::TextureFormat::Rgba8Unorm
                 | ir::TextureFormat::R8Unorm => ir::TextureFormat::Bgra8Unorm,
+                ir::TextureFormat::Nv12 => ir::TextureFormat::Nv12,
                 ir::TextureFormat::Rg8Unorm
-                | ir::TextureFormat::Nv12
                 | ir::TextureFormat::Bgra8UnormSrgb
                 | ir::TextureFormat::Rgba8UnormSrgb => {
                     return Err(IrSubmitError::Unsupported(

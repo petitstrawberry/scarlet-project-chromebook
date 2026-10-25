@@ -186,7 +186,14 @@ const SP_WINDOW_OFFSET: u32 = 0xb4d1;
 const SP_UPDATE_CNTL: u32 = 0xbb08;
 const SP_PS_CONST_CONFIG: u32 = 0xbb10;
 
+fn is_nv12_descriptor(word: u32) -> bool {
+    word & !0x0005_0000 == 0x2380_6880
+}
+
 fn supported_texture_descriptor(word: u32) -> bool {
+    if is_nv12_descriptor(word) {
+        return true;
+    }
     matches!(
         word & !0x000f_0000,
         TEX_DESCRIPTOR_BGRA_IDENTITY | TEX_DESCRIPTOR_ALPHA_MASK | 0x0c00_6883
@@ -277,6 +284,9 @@ struct ArrayPitchExpectation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LinearImageFormat {
+    Nv12 { uv_offset: u64, uv_size: u64 },
+    Nv12Y,
+    Nv12Uv,
     Bgra8Unorm,
     Depth32Float,
 }
@@ -454,7 +464,7 @@ fn canonical_address_field(
         word_offset,
         access: ACCESS_READ,
         requires_complete_linear_image: false,
-        required_size: Some(adreno_a6xx_shader_pack::SHADER_SIZE as u64),
+        required_size: None,
         encoding: AddressEncoding::GpuVa64,
         source: AddressSource::CanonicalShader(stage),
         a2d: None,
@@ -775,8 +785,19 @@ fn validate_type7(
                 && payload[4] >> 29 == 1
                 && payload[5] & !0x007f_ffff == 0
                 && payload[7] == (1 << 17)
-                && payload[8..18] == [0; 10]
-                && supported_sampler(&payload[18..], (payload[2] >> 16) & 15) =>
+                && (if is_nv12_descriptor(payload[2]) {
+                    payload[8] == (((payload[4] >> 7) & 0x3f_ffff) << 8) && payload[9..18] == [0; 9]
+                } else {
+                    payload[8..18] == [0; 10]
+                })
+                && supported_sampler(
+                    &payload[18..],
+                    if is_nv12_descriptor(payload[2]) {
+                        0
+                    } else {
+                        (payload[2] >> 16) & 15
+                    },
+                ) =>
         {
             address_field(addresses, packet_word + 1, ACCESS_WRITE, false, Some(80))?;
             address_field_encoded(
@@ -786,7 +807,11 @@ fn validate_type7(
                 false,
                 None,
                 AddressEncoding::GpuVa49TexDescriptor,
-            )
+            )?;
+            if is_nv12_descriptor(payload[2]) {
+                address_field(addresses, packet_word + 10, ACCESS_READ, false, None)?;
+            }
+            Ok(())
         }
         (CP_LOAD_STATE6_GEOM, 3)
             if payload[0] == ((2 << 16) | (8 << 18) | (1 << 22)) && payload[1..3] == [0, 0] =>
@@ -794,12 +819,19 @@ fn validate_type7(
             canonical_address_field(addresses, packet_word + 2, ShaderStage::Vertex)
         }
         (CP_LOAD_STATE6_FRAG, 3)
-            if payload[0] == ((2 << 16) | (12 << 18) | (1 << 22)) && payload[1..3] == [0, 0] =>
+            if matches!(payload[0] >> 22, 1 | 2)
+                && payload[0] & ((1 << 22) - 1) == ((2 << 16) | (12 << 18))
+                && payload[1..3] == [0, 0] =>
         {
             canonical_address_field(addresses, packet_word + 2, ShaderStage::Fragment)
         }
         (CP_LOAD_STATE6_GEOM, 23)
             if payload[0] == ((1 << 14) | (8 << 18) | (5 << 22)) && payload[1..3] == [0, 0] =>
+        {
+            Ok(())
+        }
+        (CP_LOAD_STATE6_FRAG, 35)
+            if payload[0] == ((1 << 14) | (12 << 18) | (8 << 22)) && payload[1..3] == [0, 0] =>
         {
             Ok(())
         }
@@ -1507,8 +1539,10 @@ fn segment_matches_retained_pipeline(segment: &SegmentIndex<'_, '_, '_>) -> bool
                     && packet.payload[1..3] == [0, 0]
             }
             CP_LOAD_STATE6_FRAG => {
-                (packet.payload.len() == 23
+                ((packet.payload.len() == 23
                     && packet.payload[0] == ((1 << 14) | (12 << 18) | (5 << 22))
+                    || packet.payload.len() == 35
+                        && packet.payload[0] == ((1 << 14) | (12 << 18) | (8 << 22)))
                     && packet.payload[1..3] == [0, 0])
                     || (packet.payload.len() == 3
                         && matches!(
@@ -1683,6 +1717,7 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
                 && p.get(1..) == Some(fs.initial_tex_load_cmd)
         })
         && reg(SP_PS_TSIZE) == Some(&[u32::from(fixed.uses_sampler)])
+        && reg(SP_PS_OUTPUT_REG) == Some(fs.sp_ps_output_reg)
         && if fixed.uses_sampler {
                 reg(SP_PS_INITIAL_TEX_INDEX_CMD) == Some(&[0])
                     && reg(SP_PS_SAMPLER_BASE).is_some()
@@ -1779,6 +1814,7 @@ fn segment_may_match_pipeline(
         .is_some_and(|payload| payload.len() == 2 && payload[1] == fixed.stride)
         && reg(VFD_FETCH_INSTR) == Some(fixed.vfd_fetch)
         && reg(SP_PS_TSIZE) == Some(&[u32::from(fixed.uses_sampler)])
+        && reg(SP_PS_OUTPUT_REG) == Some(fs.sp_ps_output_reg)
         && reg(SP_PS_INITIAL_TEX_LOAD_CNTL).is_some_and(|payload| {
             payload.first() == Some(&fs.initial_tex_load_cntl)
                 && payload.get(1..) == Some(fs.initial_tex_load_cmd)
@@ -2149,14 +2185,23 @@ fn validate_texture_initialization(
                 ..
             } => {
                 let descriptor = packet.payload;
+                let nv12 = is_nv12_descriptor(descriptor[2]);
                 let width = descriptor[3] & 0x7fff;
                 let height = (descriptor[3] >> 15) & 0x7fff;
                 set_image_expectation(
                     addresses,
                     packet.word_offset + 7,
                     ImageExpectation {
-                        mip_levels: ((descriptor[2] >> 16) & 0xf) + 1,
-                        format: LinearImageFormat::Bgra8Unorm,
+                        mip_levels: if nv12 {
+                            1
+                        } else {
+                            ((descriptor[2] >> 16) & 0xf) + 1
+                        },
+                        format: if nv12 {
+                            LinearImageFormat::Nv12Y
+                        } else {
+                            LinearImageFormat::Bgra8Unorm
+                        },
                         modifier: if descriptor[2] & 3 == 3 {
                             ImageModifier::Tile6_3Color
                         } else {
@@ -2173,6 +2218,26 @@ fn validate_texture_initialization(
                         }),
                     },
                 )?;
+                if nv12 {
+                    if width % 2 != 0 || height % 2 != 0 {
+                        return Err("qcom-adreno-a618: odd NV12 extent");
+                    }
+                    set_image_expectation(
+                        addresses,
+                        packet.word_offset + 10,
+                        ImageExpectation {
+                            mip_levels: 1,
+                            format: LinearImageFormat::Nv12Uv,
+                            modifier: ImageModifier::Linear,
+                            row_pitch: descriptor[8] >> 8,
+                            width: width / 2,
+                            height: height / 2,
+                            exact_extent: true,
+                            pitch_align: None,
+                            array_pitch: None,
+                        },
+                    )?;
+                }
                 initialized.insert(location(packet.word_offset + 1, 0)?);
                 None
             }
@@ -2353,9 +2418,10 @@ fn image_footprint(image: LinearImage) -> Option<u64> {
         return Some(texture.total_size);
     }
     match (image.format, image.modifier) {
-        (LinearImageFormat::Bgra8Unorm, ImageModifier::Linear) => {
-            u64::from(image.row_pitch).checked_mul(u64::from(image.height))
-        }
+        (
+            LinearImageFormat::Bgra8Unorm | LinearImageFormat::Nv12Y | LinearImageFormat::Nv12Uv,
+            ImageModifier::Linear,
+        ) => u64::from(image.row_pitch).checked_mul(u64::from(image.height)),
         (LinearImageFormat::Depth32Float, ImageModifier::Tile6_3Depth)
         | (LinearImageFormat::Bgra8Unorm, ImageModifier::Tile6_3Color) => {
             let layout = adreno_a6xx_layout::depth32_tile6_3_layout(image.width, image.height)?;
@@ -2368,6 +2434,30 @@ fn image_footprint(image: LinearImage) -> Option<u64> {
 /// Resolve only complete canonical subresources; a byte slice cannot invent
 /// dimensions or expose padding as a render target.
 fn image_range(image: LinearImage, offset: u64, size: u64) -> Option<LinearImage> {
+    if let LinearImageFormat::Nv12 { uv_offset, uv_size } = image.format {
+        if offset == 0 && size == image.visible_size {
+            return Some(image);
+        }
+        let y_size = u64::from(image.row_pitch) * u64::from(image.height);
+        if offset == 0 && size == y_size {
+            return Some(LinearImage {
+                format: LinearImageFormat::Nv12Y,
+                visible_size: size,
+                ..image
+            });
+        }
+        if offset == uv_offset && size == uv_size {
+            return Some(LinearImage {
+                format: LinearImageFormat::Nv12Uv,
+                width: image.width / 2,
+                height: image.height / 2,
+                visible_size: size,
+                ..image
+            });
+        }
+        return None;
+    }
+
     if offset == 0 && size == image.visible_size {
         return Some(image);
     }
@@ -2540,7 +2630,7 @@ pub(crate) fn validate_and_relocate(
                 || image.row_pitch
                     < image
                         .width
-                        .checked_mul(4)
+                        .checked_mul(match image.format { LinearImageFormat::Nv12Y => 1, LinearImageFormat::Nv12Uv => 2, _ => 4 })
                         .ok_or("qcom-adreno-a618: 3D row size overflows")?
                 || layout_size != image.visible_size
                 || relocation.required_size != image.visible_size
@@ -2893,6 +2983,7 @@ mod tests {
                         return false;
                     };
                     candidate_fixed == fixed
+                        && candidate_fragment.sp_ps_output_reg == fragment.sp_ps_output_reg
                         && candidate_fragment.initial_tex_load_cntl
                             == fragment.initial_tex_load_cntl
                         && candidate_fragment.initial_tex_load_cmd == fragment.initial_tex_load_cmd
@@ -2995,6 +3086,7 @@ mod tests {
             id,
             size: 0x400,
             kind: ResourceKind::Image(ImageMeta {
+                conversion: None,
                 texture: None,
                 format: TextureFormat::Bgra8Unorm,
                 storage_format: TextureFormat::Bgra8Unorm,
@@ -3015,6 +3107,7 @@ mod tests {
             id,
             size: 0x1000,
             kind: ResourceKind::Image(ImageMeta {
+                conversion: None,
                 texture: None,
                 format: TextureFormat::Depth32Float,
                 storage_format: TextureFormat::Depth32Float,
@@ -3086,7 +3179,7 @@ mod tests {
                 Some(ResolvedResource {
                     attachment_token: 0,
                     gpu_va: 0x4_0000_0000 + variant.offset() as u64,
-                    allocation_size: adreno_a6xx_shader_pack::SHADER_SIZE as u64,
+                    allocation_size: variant.size() as u64,
                     allowed_access: ACCESS_READ,
                     linear_image: None,
                 })
@@ -4364,6 +4457,7 @@ mod tests {
                 id: TARGET,
                 size: tiled.layer_size,
                 kind: ResourceKind::Image(ImageMeta {
+                    conversion: None,
                     texture: None,
                     format: TextureFormat::Bgra8Unorm,
                     storage_format: TextureFormat::Bgra8Unorm,
@@ -4381,6 +4475,7 @@ mod tests {
                 id: SOURCE,
                 size: 256 * 17,
                 kind: ResourceKind::Image(ImageMeta {
+                    conversion: None,
                     texture: None,
                     format: TextureFormat::Bgra8Unorm,
                     storage_format: TextureFormat::Bgra8Unorm,
@@ -4507,7 +4602,7 @@ mod tests {
                     Some(ResolvedResource {
                         attachment_token: 0,
                         gpu_va: 0x4_0000_0000 + variant.offset() as u64,
-                        allocation_size: adreno_a6xx_shader_pack::SHADER_SIZE as u64,
+                        allocation_size: variant.size() as u64,
                         allowed_access: ACCESS_READ,
                         linear_image: None,
                     })
@@ -4642,6 +4737,171 @@ mod tests {
         // and texture-descriptor state backing required by A618.
         assert_eq!(artifact.words.len(), 532);
         assert!(accept_codegen(&artifact).is_ok());
+    }
+
+    #[test]
+    fn nv12_planes_are_read_only_bounded_and_use_native_shaders() {
+        const PIPELINE: PipelineId = PipelineId::new(11);
+        let mut resources = [
+            image(TARGET, TextureUsage::RENDER_ATTACHMENT),
+            image(SOURCE, TextureUsage::SAMPLED),
+            image(ALPHA, TextureUsage::SAMPLED),
+            ResourceMeta {
+                id: BUFFER,
+                size: 144,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                },
+            },
+        ];
+        let pipeline = PipelineMeta {
+            id: PIPELINE,
+            descriptor: RenderPipelineDesc::new(
+                TextureFormat::Bgra8Unorm,
+                PrimitiveTopology::TriangleList,
+                VertexBufferLayout::new(
+                    24,
+                    std::vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x2, 16),
+                    ],
+                )
+                .unwrap(),
+                FragmentProgram::Texture(TextureSampleMode::Rgba),
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        };
+        use sgfx_core::ir::{ChromaLocation, YcbcrConversion, YcbcrMatrix, YcbcrRange};
+        resources[1].size = 8192;
+        let ResourceKind::Image(source) = &mut resources[1].kind else {
+            unreachable!()
+        };
+        source.format = TextureFormat::Nv12;
+        source.storage_format = TextureFormat::Nv12;
+        source.conversion = Some(YcbcrConversion {
+            matrix: YcbcrMatrix::Bt709,
+            range: YcbcrRange::Limited,
+            chroma_x: ChromaLocation::Cosited,
+            chroma_y: ChromaLocation::Midpoint,
+        });
+        source.planes.push(PlaneLayout {
+            offset: 4096,
+            stride: 64,
+            size: 512,
+        });
+        let vertices = [0_u8; 144];
+        let operations = std::vec![
+            Operation::WriteBuffer {
+                destination: BUFFER,
+                offset: 0,
+                data: &vertices,
+            },
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: PixelRect::new(0, 0, 16, 16).unwrap(),
+                load: LoadOp::Clear(Color::rgba(0.05, 0.1, 0.2, 1.0).unwrap()),
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            },
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetTexture(SOURCE),
+            Operation::SetSampler(SamplerDesc::new(
+                FilterMode::Linear,
+                FilterMode::Linear,
+                AddressMode::ClampToEdge,
+                AddressMode::ClampToEdge,
+            )),
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::SetScissor(None),
+            Operation::Draw {
+                vertex_count: 6,
+                first_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 64 * 1024),
+            resources: &resources,
+            pipelines: core::slice::from_ref(&pipeline),
+            operations: &operations,
+        })
+        .unwrap();
+        assert!(artifact.fixups.iter().any(|r| r.object
+            == ObjectRef::CanonicalShader(adreno_a6xx_shader_pack::ShaderVariant::FsNv12)));
+        let validate = |artifact: &RelocatablePm4, uv_size| {
+            validate_and_relocate(
+                &wire_from_codegen(artifact),
+                |attachment_token| {
+                    let source = attachment_token == token(ObjectRef::External(SOURCE));
+                    let target = attachment_token == token(ObjectRef::External(TARGET));
+                    Some(ResolvedResource {
+                        attachment_token,
+                        gpu_va: 0x1_0000_0000 + attachment_token * 0x10000,
+                        allocation_size: if source { 8192 } else { 4096 },
+                        allowed_access: if source {
+                            ACCESS_READ
+                        } else {
+                            ACCESS_READ | ACCESS_WRITE
+                        },
+                        linear_image: (source || target).then_some(LinearImage {
+                            texture: None,
+                            format: if source {
+                                LinearImageFormat::Nv12 {
+                                    uv_offset: 4096,
+                                    uv_size,
+                                }
+                            } else {
+                                LinearImageFormat::Bgra8Unorm
+                            },
+                            modifier: KernelImageModifier::Linear,
+                            width: 16,
+                            height: 16,
+                            row_pitch: 64,
+                            visible_size: if source { 8192 } else { 1024 },
+                        }),
+                    })
+                },
+                |variant| {
+                    Some(ResolvedResource {
+                        attachment_token: 0,
+                        gpu_va: 0x4_0000_0000 + variant.offset() as u64,
+                        allocation_size: variant.size() as u64,
+                        allowed_access: ACCESS_READ,
+                        linear_image: None,
+                    })
+                },
+            )
+        };
+        assert!(
+            validate(&artifact, 512).is_ok(),
+            "{:?}",
+            validate(&artifact, 512)
+        );
+        assert!(validate(&artifact, 256).is_err());
+        let descriptor = Packets::new(&artifact.words)
+            .flatten()
+            .find(|p| {
+                matches!(
+                    p.header,
+                    Header::Type7 {
+                        opcode: super::CP_MEM_WRITE,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let mut bad = artifact.clone();
+        bad.words[descriptor.word_offset as usize + 9] += 64 << 8;
+        assert!(validate(&bad, 512).is_err());
     }
 
     #[test]

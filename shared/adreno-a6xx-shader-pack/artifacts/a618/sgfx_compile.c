@@ -15,7 +15,7 @@
 #include "freedreno/ir3/ir3_shader.h"
 
 enum fs_kind { FS_SOLID, FS_VERTEX_COLOR, FS_TEXTURE_RGBA, FS_TEXTURE_ALPHA_MASK,
-               FS_TEXTURE_VERTEX_COLOR_RGBA, FS_TEXTURE_RGB_IGNORE_ALPHA };
+               FS_TEXTURE_VERTEX_COLOR_RGBA, FS_TEXTURE_RGB_IGNORE_ALPHA, FS_NV12, FS_NV12_VERTEX_COLOR };
 
 struct compiled {
    const char *name;
@@ -103,17 +103,17 @@ build_fs(const char *name, enum fs_kind kind)
    nir_builder *b = &nb;
    nir_def *color = load_const(b, 16, 4);
    nir_def *vertex_color = NULL, *uv = NULL, *sample = NULL, *result = NULL;
-   if (kind == FS_VERTEX_COLOR || kind == FS_TEXTURE_VERTEX_COLOR_RGBA) {
+   if (kind == FS_VERTEX_COLOR || kind == FS_TEXTURE_VERTEX_COLOR_RGBA || kind == FS_NV12_VERTEX_COLOR) {
       nir_variable *in = io_var(b, nir_var_shader_in, VARYING_SLOT_VAR0,
                                 glsl_vec4_type());
       vertex_color = nir_load_var(b, in);
    }
    if (kind == FS_TEXTURE_RGBA || kind == FS_TEXTURE_ALPHA_MASK ||
-       kind == FS_TEXTURE_RGB_IGNORE_ALPHA) {
+       kind == FS_TEXTURE_RGB_IGNORE_ALPHA || kind == FS_NV12) {
       nir_variable *in = io_var(b, nir_var_shader_in, VARYING_SLOT_VAR0,
                                 glsl_vec2_type());
       uv = nir_load_var(b, in);
-   } else if (kind == FS_TEXTURE_VERTEX_COLOR_RGBA) {
+   } else if (kind == FS_TEXTURE_VERTEX_COLOR_RGBA || kind == FS_NV12_VERTEX_COLOR) {
       nir_variable *in = io_var(b, nir_var_shader_in, VARYING_SLOT_VAR1,
                                 glsl_vec2_type());
       uv = nir_load_var(b, in);
@@ -122,6 +122,22 @@ build_fs(const char *name, enum fs_kind kind)
       sample = sample_texture(b, uv);
 
    switch (kind) {
+   case FS_NV12:
+   case FS_NV12_VERTEX_COLOR: {
+      /* Native planar sampling returns Y, Cb, Cr. The explicit conversion
+       * rows include range offsets and are selected at image import. */
+      nir_def *rgb[3];
+      for (unsigned row = 0; row < 3; row++) {
+         nir_def *c = load_const(b, 20 + row * 4, 4);
+         nir_def *v = nir_channel(b, c, 3);
+         for (unsigned channel = 0; channel < 3; channel++)
+            v = nir_fadd(b, nir_fmul(b, nir_channel(b, c, channel), nir_channel(b, sample, channel)), v);
+         rgb[row] = nir_fsat(b, v);
+      }
+      result = nir_fmul(b, nir_vec4(b, rgb[0], rgb[1], rgb[2], nir_imm_float(b, 1.0f)), color);
+      if (kind == FS_NV12_VERTEX_COLOR) result = nir_fmul(b, result, vertex_color);
+      break;
+   }
    case FS_SOLID:
       result = color;
       break;
@@ -162,7 +178,7 @@ compile_one(struct ir3_compiler *compiler, const char *name, nir_shader *nir)
    nir_assign_io_var_locations(nir, nir_var_shader_in);
    nir_assign_io_var_locations(nir, nir_var_shader_out);
    struct ir3_const_allocations const_allocs = {};
-   ir3_const_alloc(&const_allocs, IR3_CONST_ALLOC_UBO_RANGES, 5, 1);
+   ir3_const_alloc(&const_allocs, IR3_CONST_ALLOC_UBO_RANGES, strstr(name, "nv12") ? 8 : 5, 1);
    const struct ir3_shader_options options = {
       .api_wavesize = IR3_SINGLE_OR_DOUBLE,
       .real_wavesize = IR3_SINGLE_OR_DOUBLE,
@@ -315,7 +331,7 @@ main(int argc, char **argv)
       &(struct ir3_compiler_options){ .disable_cache = true });
    if (!compiler) return 2;
 
-   struct compiled v[13]; unsigned n = 0;
+   struct compiled v[15]; unsigned n = 0;
    v[n++] = compile_one(compiler, "vs_stride16_pos2", build_vs("vs_stride16_pos2", true, false, false, false));
    v[n++] = compile_one(compiler, "vs_stride16_pos2_uv2", build_vs("vs_stride16_pos2_uv2", true, false, false, true));
    v[n++] = compile_one(compiler, "vs_stride40_pos4", build_vs("vs_stride40_pos4", false, false, false, false));
@@ -329,6 +345,8 @@ main(int argc, char **argv)
    v[n++] = compile_one(compiler, "vs_stride24_pos4_uv2", build_vs("vs_stride24_pos4_uv2", false, false, false, true));
    v[n++] = compile_one(compiler, "vs_stride28_pos4_color3", build_vs("vs_stride28_pos4_color3", false, true, true, false));
    v[n++] = compile_one(compiler, "fs_texture_rgb_ignore_alpha", build_fs("fs_texture_rgb_ignore_alpha", FS_TEXTURE_RGB_IGNORE_ALPHA));
+   v[n++] = compile_one(compiler, "fs_nv12", build_fs("fs_nv12", FS_NV12));
+   v[n++] = compile_one(compiler, "fs_nv12_vertex_color", build_fs("fs_nv12_vertex_color", FS_NV12_VERTEX_COLOR));
    for (unsigned i = 0; i < n; i++) write_binary(argv[1], &v[i]);
 
    char path[1024]; snprintf(path, sizeof(path), "%s/mesa-metadata.json", argv[1]);
@@ -347,7 +365,10 @@ main(int argc, char **argv)
    print_link_json(f, "stride24_solid", &v[2], &v[5], false);
    print_link_json(f, "stride24_texture_rgba", &v[10], &v[7], false);
    print_link_json(f, "stride24_texture_rgb_ignore_alpha", &v[10], &v[12], false);
-   print_link_json(f, "stride28_vertex_color", &v[11], &v[6], true);
+   print_link_json(f, "stride28_vertex_color", &v[11], &v[6], false);
+   print_link_json(f, "stride16_nv12", &v[1], &v[13], false);
+   print_link_json(f, "stride24_nv12", &v[10], &v[13], false);
+   print_link_json(f, "stride40_nv12_vertex_color", &v[4], &v[14], true);
    fprintf(f, "  ]\n}\n"); fclose(f);
    for (unsigned i = 0; i < n; i++) ir3_shader_destroy(v[i].shader);
    ir3_compiler_destroy(compiler);

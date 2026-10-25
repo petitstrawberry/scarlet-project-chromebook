@@ -115,6 +115,8 @@ pub struct PlaneLayout {
 /// Image metadata selected before compilation by the concrete backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageMeta {
+    /// Explicit conversion for imported NV12 images.
+    pub conversion: Option<sgfx_core::ir::YcbcrConversion>,
     /// Canonical layer-first storage for mipmapped or layered color images.
     pub texture: Option<adreno_a6xx_layout::LinearTextureLayout>,
     /// Portable SGFX pixel format visible to shaders and upload commands.

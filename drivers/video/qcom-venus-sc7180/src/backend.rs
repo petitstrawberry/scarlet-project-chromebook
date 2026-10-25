@@ -1041,6 +1041,49 @@ impl VenusSession {
             .ok_or("qcom-venus-sc7180: frame payload region is unavailable")?
             as usize;
         arch::invalidate_dcache_to_poc_range(source_vaddr, layout.linear_size as usize);
+        if request.shared_output {
+            if done.stream_id != 1
+                || (done.offset as usize)
+                    .checked_add(layout.linear_size as usize)
+                    .is_none_or(|end| end > source_capacity)
+            {
+                return Err("qcom-venus-sc7180: shared output exceeds source buffer");
+            }
+            // SAFETY: firmware completed this output, cache invalidation is
+            // complete, and the checked range belongs to the pending request.
+            arch::invalidate_dcache_to_poc_range(
+                source_vaddr + done.offset as usize,
+                layout.linear_size as usize,
+            );
+            let source = unsafe {
+                core::slice::from_raw_parts(
+                    (source_vaddr + done.offset as usize) as *const u8,
+                    layout.linear_size as usize,
+                )
+            };
+            let image = crate::shared_frame::snapshot(
+                source,
+                layout.display_width,
+                layout.display_height,
+                layout.display_x,
+                layout.display_y,
+                layout.y_stride,
+                layout.y_stride as usize * layout.y_scanlines as usize,
+            )?;
+            return Ok(VideoBackendDecodedFrame {
+                image: Some(image),
+                stream_id: self.id,
+                frame: ScarletVideoDequeuedFrame {
+                    width: layout.display_width,
+                    height: layout.display_height,
+                    pixel_format: SCARLET_VIDEO_PIXEL_FORMAT_NV12,
+                    timestamp: request.timestamp,
+                    flags: done.flags,
+                    payload_offset: 0,
+                    payload_len: 0,
+                },
+            });
+        }
         compact_nv12(
             source_vaddr,
             source_capacity,
@@ -1726,6 +1769,9 @@ fn venus_worker_entry() {
 }
 
 impl VideoDecodeBackend for VenusBackend {
+    fn supports_shared_images(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "qcom-venus-sc7180"
     }
