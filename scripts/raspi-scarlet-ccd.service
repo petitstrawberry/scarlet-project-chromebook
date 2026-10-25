@@ -1,0 +1,19 @@
+[Unit]
+Description=Scarlet CCD console and board control
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/scarlet-gadget
+ExecStart=/usr/local/sbin/scarlet-ccd serve
+RuntimeDirectory=scarlet-ccd
+RuntimeDirectoryMode=0700
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

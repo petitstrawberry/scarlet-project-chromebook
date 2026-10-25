@@ -7,24 +7,27 @@ key="${SCARLET_ALTFW_KEY:-ctrl-l}"
 device="${SCARLET_CCD_DEVICE:-18d1:5014}"
 serial="${SCARLET_CCD_SERIAL:-}"
 reset_ap=true
+backend="${SCARLET_CCD_BACKEND:-remote}"
 
 usage() {
   cat >&2 <<'EOF'
 usage: raspi-scarlet-boot.sh [options]
 
-Reset the Chromebook through the Mac's CCD EC console, then inject the
+Reset the Chromebook through the Pi's CCD service, then inject the
 selected keyboard shortcut after the Developer Mode screen has appeared.
 
 Options:
+  --backend MODE     remote (default), or local for a CCD connected to this Mac.
   --no-reset         Send the key without resetting an AP already at the boot menu.
-  --delay-ms MS       Delay after apreset before sending the key (default: 5000).
+  --delay-ms MS       Delay after apreset, 0..120000 ms (default: 5000).
   --key KEY           ctrl-l, enter, ctrl-d, or release (default: ctrl-l).
   --device VID:PID    CCD USB device (default: 18d1:5014).
   --serial SERIAL     CCD serial number passed to the EC one-shot helper.
   -h, --help          Show this help text.
 
 Environment overrides: SCARLET_ALTFW_KEY_DELAY_MS, SCARLET_ALTFW_KEY,
-SCARLET_CCD_DEVICE, SCARLET_CCD_SERIAL.
+SCARLET_CCD_DEVICE, SCARLET_CCD_SERIAL, SCARLET_CCD_BACKEND, SCARLET_RPI_HOST.
+Device/serial options apply only to the local backend; configure the Pi service separately.
 EOF
 }
 
@@ -42,6 +45,11 @@ valid_key() {
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
+    --backend)
+      [[ "$#" -ge 2 ]] || die "--backend requires remote or local"
+      backend=$2
+      shift 2
+      ;;
     --no-reset)
       reset_ap=false
       shift
@@ -74,10 +82,22 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-case "$delay_ms" in
-  ''|*[!0-9]*) die "delay must be a non-negative integer in milliseconds" ;;
-esac
+[[ "$delay_ms" =~ ^[0-9]{1,6}$ ]] || die "delay must be 0..120000 ms"
+delay_ms=$((10#$delay_ms))
+((delay_ms <= 120000)) || die "delay must be 0..120000 ms"
 valid_key "$key" || die "unknown key '$key'"
+
+case "$backend" in
+  remote)
+    if [[ "$reset_ap" == true ]]; then
+      exec "$script_dir/raspi-scarlet-control.sh" boot "$delay_ms" "$key"
+    else
+      exec "$script_dir/raspi-scarlet-control.sh" key-after "$delay_ms" "$key"
+    fi
+    ;;
+  local) ;;
+  *) die "backend must be remote or local" ;;
+esac
 
 ec_args=(--interface 2 --device "$device")
 if [[ -n "$serial" ]]; then

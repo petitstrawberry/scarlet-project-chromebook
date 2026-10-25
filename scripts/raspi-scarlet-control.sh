@@ -1,78 +1,76 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-rpi_host="${SCARLET_RPI_HOST:-192.168.77.2}"
-rpi_user="${SCARLET_RPI_USER:-pi}"
-identity_file="${SCARLET_RPI_IDENTITY:-$HOME/.ssh/id_rsa}"
-
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/raspi-ssh.sh"
 usage() {
   cat >&2 <<'EOF'
-usage: raspi-scarlet-control.sh {status|key|key-after|schedule-key} [argument...]
-
-Commands:
-  status
-  key KEY                         Send ctrl-l, enter, ctrl-d, or release.
-  key-after DELAY_MS KEY          Send one key after a delay.
-  schedule-key DELAY_MS KEY       Schedule one delayed key and return.
+usage: raspi-scarlet-control.sh COMMAND [ARGUMENTS]
+  status                          Gadget, network, and CCD status.
+  reset                           Reset AP through the Pi's CCD.
+  boot [DELAY_MS [KEY]]            Reset, wait (default 5000 ms), then Ctrl+L.
+  key KEY                         Inject an EC keyboard shortcut.
+  key-after DELAY_MS KEY           Wait, then inject a key.
+  schedule-key DELAY_MS KEY        Run delayed key over background SSH.
+  console {ap|ec|cr50}             Interactive CCD console (SSH escape: ~.).
+  log {ap|ec|cr50}                 Last 64 KiB received by the service.
+  send {ap|ec|cr50} TEXT           Send a console command plus newline.
+Keys: ctrl-l, ctrl-d, enter, release. Delay: 0..120000 ms.
+Settings: SCARLET_RPI_HOST/USER/IDENTITY, or ~/.config/scarlet/raspi.env.
 EOF
 }
-
-die() {
-  echo "raspi-scarlet-control: $*" >&2
-  exit 2
+die() { echo "raspi-scarlet-control: $*" >&2; exit 2; }
+valid_key() { case "$1" in ctrl-l|ctrl-d|enter|release) ;; *) die "invalid key: $1";; esac; }
+valid_delay() {
+  [[ "$1" =~ ^[0-9]{1,6}$ ]] || die 'delay must be 0..120000 ms'
+  ((10#$1 <= 120000)) || die 'delay must be 0..120000 ms'
 }
-
-valid_key() {
-  case "${1:-}" in
-    ctrl-l|enter|ctrl-d|release) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-command_name="${1:-}"
+valid_target() { case "$1" in ap|ec|cr50) ;; *) die "invalid target: $1";; esac; }
+command_name=${1:-}
 shift || true
 background=false
+interactive=false
 case "$command_name" in
-  status)
-    [[ "$#" -eq 0 ]] || die "status takes no arguments"
-    remote_args=(status)
+  -h|--help) usage; exit 0;;
+  status|reset)
+    [[ $# -eq 0 ]] || die "$command_name takes no arguments"
+    remote_command=(sudo -n /usr/local/sbin/scarlet-controller "$command_name")
     ;;
-  key)
-    [[ "$#" -eq 1 ]] || die "usage: key KEY"
-    valid_key "$1" || die "unknown key '$1'"
-    remote_args=(key "$1")
+  boot)
+    [[ $# -le 2 ]] || die 'usage: boot [DELAY_MS [KEY]]'
+    delay=${1:-5000}; key=${2:-ctrl-l}; valid_delay "$delay"; valid_key "$key"
+    remote_command=(sudo -n /usr/local/sbin/scarlet-ccd boot --delay-ms "$((10#$delay))" --key "$key")
     ;;
-  key-after)
-    [[ "$#" -eq 2 ]] || die "usage: key-after DELAY_MS KEY"
-    case "$1" in
-      ''|*[!0-9]*) die "delay must be a non-negative integer in milliseconds" ;;
-    esac
-    valid_key "$2" || die "unknown key '$2'"
-    remote_args=(key-after "$1" "$2")
+  key|key-after|schedule-key)
+    if [[ "$command_name" == key ]]; then
+      [[ $# -eq 1 ]] || die 'usage: key KEY'
+      delay=0; key=$1
+    else
+      [[ $# -eq 2 ]] || die "usage: $command_name DELAY_MS KEY"
+      delay=$1; key=$2
+    fi
+    valid_delay "$delay"; valid_key "$key"
+    remote_command=(sudo -n /usr/local/sbin/scarlet-ccd key --delay-ms "$((10#$delay))" --key "$key")
+    [[ "$command_name" != schedule-key ]] || background=true
     ;;
-  schedule-key)
-    [[ "$#" -eq 2 ]] || die "usage: schedule-key DELAY_MS KEY"
-    case "$1" in
-      ''|*[!0-9]*) die "delay must be a non-negative integer in milliseconds" ;;
-    esac
-    valid_key "$2" || die "unknown key '$2'"
-    remote_args=(key-after "$1" "$2")
-    background=true
+  console|log|send)
+    if [[ "$command_name" == send ]]; then
+      [[ $# -eq 2 ]] || die 'usage: send TARGET TEXT'
+    else
+      [[ $# -eq 1 ]] || die "usage: $command_name TARGET"
+    fi
+    valid_target "$1"
+    remote_command=(sudo -n /usr/local/sbin/scarlet-ccd "$command_name" --target "$1")
+    [[ "$command_name" != send ]] || remote_command+=(--text "$2")
+    [[ "$command_name" != console ]] || interactive=true
     ;;
-  *)
-    usage
-    exit 2
-    ;;
+  *) usage; exit 2;;
 esac
-
-ssh_opts=(-i "$identity_file" -o BatchMode=yes -o ConnectTimeout=10)
-remote="$rpi_user@$rpi_host"
-remote_command=(sudo /usr/local/sbin/scarlet-controller "${remote_args[@]}")
+# Raspberry Pi OS uses bash; %q preserves literal console text across SSH.
 printf -v remote_line '%q ' "${remote_command[@]}"
-if [[ "$background" == true ]]; then
-  # Keep the SSH session alive while the Pi-side controller sleeps, but return
-  # to the caller as soon as authentication and command startup succeed.
-  ssh -f -n "${ssh_opts[@]}" "$remote" "$remote_line"
+if [[ "$interactive" == true && -t 0 ]]; then
+  exec ssh -tt "${ssh_opts[@]}" "$remote" "$remote_line"
+elif [[ "$background" == true ]]; then
+  exec ssh -f -n "${ssh_opts[@]}" "$remote" "$remote_line"
 else
-  ssh "${ssh_opts[@]}" "$remote" "$remote_line"
+  exec ssh -T "${ssh_opts[@]}" "$remote" "$remote_line"
 fi

@@ -138,6 +138,10 @@ direnv allow
 
 ## Open the AP serial console
 
+For CCD attached to the Pi, use `./scripts/raspi-scarlet-control.sh console ap`
+(see [network controller setup](#raspberry-pi-network-controller)). The commands
+below apply to CCD attached directly to the development host.
+
 Connect CCD, enter the Nix development shell, and verify that PyUSB can load
 libusb and see the GSC USB device:
 
@@ -371,16 +375,29 @@ usb start
 bootflow scan -a
 ```
 
-## Raspberry Pi USB controller
+## Raspberry Pi network controller
 
-The optional Raspberry Pi 5 helper presents the Scarlet image as a composite
-USB gadget. Its default function set is `mass_storage,ncm`: Scarlet's standard
-CDC-NCM host driver registers the network interface as `usbnet0`, while the
-image remains a normal `/dev/usbblk0` mass-storage device. Keyboard input is
-injected through the Chromebook EC over CCD, so the Pi-side HID function stays
-off by default.
+The optional Raspberry Pi 5 helper provides USB storage, networking and CCD
+control over SSH. Connect the Pi's Ethernet or Wi-Fi to the LAN, its USB-C
+gadget port to the Chromebook, and CCD to a Pi USB host port. The default
+USB functions are `mass_storage,ncm`; EC/CCD injects keyboard shortcuts, so
+the Pi-side HID function stays disabled.
 
-Install or refresh the Pi-side gadget and SSH controller:
+Client scripts share SSH settings. Explicit environment values take
+precedence over the optional local file `~/.config/scarlet/raspi.env` (or
+`SCARLET_RPI_CLIENT_CONFIG`). For example:
+
+```sh
+SCARLET_RPI_HOST=usb-netboot.local
+SCARLET_RPI_USER=pi
+# Optional; otherwise SSH uses its normal agent/configuration:
+# SCARLET_RPI_IDENTITY=/path/to/private/key
+```
+
+Without a configured host, scripts use `raspberrypi.local`. Keep machine
+addresses and key paths in this local file instead of editing tracked scripts.
+
+Install or refresh the Pi-side services, then deploy an image:
 
 ```sh
 ./scripts/install-raspi-scarlet.sh
@@ -388,68 +405,78 @@ Install or refresh the Pi-side gadget and SSH controller:
 ./scripts/raspi-scarlet-control.sh status
 ```
 
-The Pi-side configuration lives in `scripts/raspi-scarlet-gadget.env`:
+The installer preserves `/etc/default/scarlet-gadget` when it already exists.
+Set `SCARLET_RPI_REPLACE_CONFIG=1` to replace it with the checked-in defaults;
+the previous configuration is kept as `/etc/default/scarlet-gadget.previous`.
+When Scarlet is already using USB storage, refresh the services without
+rebinding the active gadget:
+
+```sh
+SCARLET_RPI_RESTART_GADGET=0 ./scripts/install-raspi-scarlet.sh
+```
+
+For a Pi using the old direct Ethernet profile, stage a LAN DHCP profile:
+
+```sh
+./scripts/configure-raspi-lan.sh
+```
+
+This keeps the current connection up. Reconnect Ethernet to the router to
+activate DHCP, then use the Pi's `<hostname>.local` address. The helper
+requires NetworkManager and enables mDNS through Avahi.
+
+The Pi-side defaults live in `scripts/raspi-scarlet-gadget.env`:
 
 ```sh
 SCARLET_GADGET_FUNCTIONS=mass_storage,ncm
 SCARLET_NCM_PI_ADDRESS=192.168.88.1/30
+SCARLET_NCM_UPLINK_IFNAME=auto
+SCARLET_NCM_DNS_PROXY=1
 ```
 
-The Pi configures `usb0` as `192.168.88.1/30` and the companion
-`scarlet-ncm.service` advertises `192.168.88.2` over DHCP. The CoachZ image
-contains an exact `netcfgd` entry for `usbnet0`, so it installs the Pi as the
-default gateway. IPv4 forwarding and an nftables masquerade route the USB
-subnet through the Pi's `eth0` (`192.168.77.2`); change
-`SCARLET_NCM_UPLINK_IFNAME` when the upstream link is different. DHCP does not
-advertise a DNS server by default because this development LAN currently has
-no default route; set `SCARLET_NCM_DHCP_DNS` to a comma-separated list when the
-upstream can reach one. Set `SCARLET_NCM_CONFIGURE_NETWORK=0` when another
-network manager should own `usb0`, or set `SCARLET_NCM_ENABLE_NAT=0` when the
-upstream router provides a route instead. Future functions can be enabled by
-appending their registry name (for example `mass_storage,ncm,hid`);
-unsupported or duplicate names fail before the gadget is rebound.
+The `scarlet-ncm.service` advertises `192.168.88.2` over DHCP on `usb0`.
+Scarlet sees `usbnet0` and uses the Pi as its gateway and DNS resolver.
+Forwarding and NAT follow the Pi's routing decisions, including Ethernet or
+Wi-Fi changes. Set an explicit `SCARLET_NCM_UPLINK_IFNAME` to restrict the
+uplink; an explicit `SCARLET_NCM_UPLINK_GATEWAY` requires an explicit
+interface. `SCARLET_NCM_DHCP_DNS` can select comma-separated upstream IPv4
+resolvers. Set `SCARLET_NCM_CONFIGURE_NETWORK=0` when another manager owns
+`usb0`, or `SCARLET_NCM_ENABLE_NAT=0` when the upstream router has a route.
 
-The Pi's direct Ethernet profile uses `192.168.77.1` as its upstream gateway,
-so the route survives NetworkManager restarts. The Mac must also have IP
-forwarding/Internet Sharing enabled if traffic should continue past that
-direct link; Pi-side NAT alone cannot make a Mac forward packets while
-`net.inet.ip.forwarding` is disabled.
+`scarlet-ccd.service` owns the three CCD USB interfaces, reconnects after
+unplugging, and shares console output with multiple SSH clients. Its socket
+is root-only; the launchers use `sudo -n` on the Pi. Console history retains
+the last 64 KiB per target in memory.
 
-For a temporary development session, the repository helper loads only a
-volatile PF anchor (it does not edit `/etc/pf.conf`):
+```sh
+./scripts/raspi-scarlet-control.sh console ap
+./scripts/raspi-scarlet-control.sh log ec
+./scripts/raspi-scarlet-control.sh send ec version
+./scripts/raspi-scarlet-boot.sh
+./scripts/raspi-scarlet-boot.sh --delay-ms 12000
+```
+
+The boot helper resets only the AP, waits five seconds by default, then
+injects `Ctrl+L` through the EC keyboard matrix. It does not power-cycle the
+Pi. Control sequences are serialized with console input.
+
+When CCD is attached directly to the Mac, use the existing local helpers:
+
+```sh
+./scripts/ec-usb-console.sh --target ap --forward-ctrl-c
+./scripts/raspi-scarlet-boot.sh --backend local
+```
+
+For a direct Ethernet connection through the Mac, configure an explicit Pi
+uplink gateway and enable Mac routing:
 
 ```sh
 sudo ./scripts/mac-scarlet-routing.sh enable
 sudo ./scripts/mac-scarlet-routing.sh disable
 ```
 
-When updating the Pi while Scarlet is already booted, leave the active USB
-image attached with:
-
-```sh
-SCARLET_RPI_RESTART_GADGET=0 ./scripts/install-raspi-scarlet.sh
-```
-
-This refreshes the DHCP/routing service without interrupting the running
-mass-storage session. The normal installer restart is still useful after a
-Pi reboot or when switching the image composition.
-
-Run the reset and alternate-firmware shortcut as one sequence:
-
-```sh
-./scripts/raspi-scarlet-boot.sh
-./scripts/raspi-scarlet-boot.sh --delay-ms 12000
-```
-
-The default sequence sends `apreset` over the Mac's CCD EC console, waits
-5 seconds, then injects `Ctrl+L` through the EC keyboard matrix. Tune
-`--delay-ms` if needed; no firmware image is written by this helper.
-
-The current reset path can remain on the Mac's CCD connection. A later
-controller backend can move EC/AP reset to a CCD connection on the Pi without
-changing the storage/network function registry. The image is intentionally
-kept under `/run/scarlet` (tmpfs), so a Pi reboot requires another image
-deployment.
+Use `disable` when the direct-link session ends. A Pi reboot
+clears the image in `/run/scarlet`, so redeploy it after rebooting.
 
 ## Repository layout
 

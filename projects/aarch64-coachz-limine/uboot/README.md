@@ -68,7 +68,11 @@ behavior cannot be changed by U-Boot or `crossystem`; it requires updating the
 Depthcharge/main firmware, or accepting one `Enter` keypress in the menu.
 
 The repository never runs `flashrom` or writes firmware automatically. First
-boot should be observed over the AP UART (`./scripts/ec-usb-console.sh ap`).
+boot should be observed over the AP UART. With CCD attached to the Raspberry
+Pi, run `./scripts/raspi-scarlet-control.sh console ap` from the repository
+root; see the [network controller setup](../../../README.md#raspberry-pi-network-controller).
+For CCD attached directly to the development host, use
+`./scripts/ec-usb-console.sh ap` instead.
 The expected U-Boot command is `cls; bootflow scan -b`; if the EFI image is not
 discovered, stop at the prompt and run `usb start` followed by `bootflow scan -a`
 to inspect bootdev/method errors before changing the image layout.

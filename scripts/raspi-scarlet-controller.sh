@@ -9,6 +9,7 @@ fi
 gadget_command="${SCARLET_GADGET_COMMAND:-/usr/local/sbin/scarlet-gadget}"
 network_command="${SCARLET_NCM_COMMAND:-/usr/local/sbin/scarlet-ncm}"
 runtime_dir="${SCARLET_RUNTIME_DIR:-/run/scarlet}"
+ccd_command="${SCARLET_CCD_COMMAND:-/usr/local/sbin/scarlet-ccd}"
 current_image="${SCARLET_CURRENT_IMAGE:-$runtime_dir/current.img}"
 
 die() {
@@ -23,20 +24,14 @@ require_root() {
 send_key() {
   local key=${1:-}
   [[ -n "$key" ]] || die "key is required"
-  "$gadget_command" key "$key"
+  "$ccd_command" key --key "$key"
 }
 
 key_after() {
   local delay_ms=${1:-}
   local key=${2:-}
   [[ -n "$delay_ms" && -n "$key" ]] || die "usage: key-after DELAY_MS KEY"
-  case "$delay_ms" in
-    ''|*[!0-9]*) die "delay must be a non-negative integer in milliseconds" ;;
-  esac
-  local delay_seconds
-  delay_seconds=$(printf '%s.%03d' "$((delay_ms / 1000))" "$((delay_ms % 1000))")
-  sleep "$delay_seconds"
-  send_key "$key"
+  "$ccd_command" key --delay-ms "$delay_ms" --key "$key"
 }
 
 status() {
@@ -52,22 +47,19 @@ status() {
     printf 'image_size=missing\n'
     printf 'image_sha256=missing\n'
   fi
-  printf 'controller=ssh-command\n'
-  if [[ "${hid_enabled:-0}" == 1 ]]; then
-    printf 'keys=ctrl-l,enter,ctrl-d,release\n'
-  else
-    printf 'keys=disabled (EC keyboard injection is active on host)\n'
-  fi
+  printf 'controller=ssh+ccd-service\n'
+  "$ccd_command" status
 }
 
 usage() {
   cat >&2 <<'EOF'
-usage: scarlet-controller {status|key|key-after} [argument...]
+usage: scarlet-controller {status|reset|key|key-after} [argument...]
 
 Commands:
   status
-  key KEY                         Send one HID key report.
-  key-after DELAY_MS KEY          Sleep, then send one HID key report.
+  reset                           Reset the AP through CCD.
+  key KEY                         Send one EC key sequence.
+  key-after DELAY_MS KEY          Sleep, then send one EC key sequence.
 
 KEY is one of ctrl-l, enter, ctrl-d, or release.
 EOF
@@ -77,6 +69,9 @@ require_root
 case "${1:-}" in
   status)
     status
+    ;;
+  reset)
+    "$ccd_command" reset
     ;;
   key)
     send_key "${2:-}"
