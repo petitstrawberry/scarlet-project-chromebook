@@ -59,6 +59,29 @@ Measure device bandwidth separately from hashing with
 Use `storage-check hash-prefix /dev/mmcblk1p1 16` for a repeatable integrity
 comparison. The benchmark reports decimal MB/s and does not write the card.
 
+## Boot from the removable SD card
+
+The SD variant loads Limine, the kernel, and initramfs from the card's EFI
+partition and mounts `/dev/mmcblk1p2` as its ext2 root filesystem:
+
+```sh
+nix develop --accept-flake-config -c ./scripts/build-coachz-limine-image.sh --sd
+```
+
+The result is
+`projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-sd.img`.
+Its first partition is a 64 MiB EFI system partition and its second partition
+contains the full rootfs bundle. Insert the card before boot. U-Boot's existing
+EFI bootflow scans MMC devices; the kernel and initramfs use `boot():` paths
+so they are read from the same card that supplied Limine.
+
+Writing the whole SD image replaces the card's partition table and files.
+Confirm the card's identity and back up anything needed before installation.
+The generated image initially contains a content-sized rootfs; enlarging the
+root partition/filesystem is a separate installation step. The existing
+`scarlet-aarch64-coachz-full.img` retains its Pi USB root selector and can be
+used for recovery.
+
 ## Requirements
 
 ### Host

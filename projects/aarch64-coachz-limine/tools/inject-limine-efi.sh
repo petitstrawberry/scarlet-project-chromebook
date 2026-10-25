@@ -8,6 +8,8 @@ combined_disk="${SCARLET_COACHZ_DISK_IMAGE:-}"
 if [[ -z "$combined_disk" && -z "${SCARLET_COACHZ_ESP_IMAGE:-}" ]]; then
   combined_disk="$project_dir/.scarlet/images/scarlet-aarch64-coachz-full.img"
 fi
+sd_esp="$project_dir/.scarlet/images/esp-aarch64-coachz-sd.img"
+sd_disk="$project_dir/.scarlet/images/scarlet-aarch64-coachz-sd.img"
 uboot_build_dir="${UBOOT_BUILD_DIR:-$repo_root/.cache/u-boot/build-coachz}"
 control_dtb="${UBOOT_COACHZ_CONTROL_DTB:-$uboot_build_dir/dts/upstream/src/arm64/qcom/sc7180-trogdor-coachz-r3.dtb}"
 handoff_dtb="${SCARLET_COACHZ_OS_DTB:-$uboot_build_dir/scarlet-os-handoff.dtb}"
@@ -22,7 +24,7 @@ if [[ ! -f "$SCARLET_COACHZ_LIMINE_EFI" ]]; then
   echo "patched CoachZ Limine EFI not found: $SCARLET_COACHZ_LIMINE_EFI" >&2
   exit 1
 fi
-if [[ ! -f "$standalone_esp" && ( -z "$combined_disk" || ! -f "$combined_disk" ) ]]; then
+if [[ ! -f "$standalone_esp" && ( -z "$combined_disk" || ! -f "$combined_disk" ) && ! -f "$sd_esp" && ! -f "$sd_disk" ]]; then
   echo "Scarlet images were not produced: $standalone_esp${combined_disk:+ or $combined_disk}" >&2
   exit 1
 fi
@@ -169,4 +171,14 @@ if [[ -n "$combined_disk" && -f "$combined_disk" ]]; then
   else
     shasum -a 256 "$combined_disk"
   fi
+fi
+
+# The SD images have a distinct Limine root selector, but require the same
+# patched loader and handoff DTB as the USB images.
+if [[ -f "$sd_esp" ]]; then
+  inject_and_verify_esp "$sd_esp" "SD standalone ESP $sd_esp"
+fi
+if [[ -f "$sd_disk" ]]; then
+  sd_embedded_esp="$(combined_esp_mtools_image "$sd_disk")"
+  inject_and_verify_esp "$sd_embedded_esp" "SD GPT partition 1 $sd_disk"
 fi
