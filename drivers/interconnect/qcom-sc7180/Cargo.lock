@@ -146,7 +146,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=f8d28abdb24bca2505c0da2737e61cf24d00903c#f8d28abdb24bca2505c0da2737e61cf24d00903c"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b8c996c40607e1b62c7df69eb8af9c2ea994f99d#b8c996c40607e1b62c7df69eb8af9c2ea994f99d"
 dependencies = [
  "chacha20",
  "fdt",
@@ -162,7 +162,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=f8d28abdb24bca2505c0da2737e61cf24d00903c#f8d28abdb24bca2505c0da2737e61cf24d00903c"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b8c996c40607e1b62c7df69eb8af9c2ea994f99d#b8c996c40607e1b62c7df69eb8af9c2ea994f99d"
 
 [[package]]
 name = "scarlet-driver-qcom-cmd-db"

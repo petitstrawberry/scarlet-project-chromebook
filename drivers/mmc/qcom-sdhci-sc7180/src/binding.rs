@@ -31,7 +31,8 @@ pub(crate) const CORE_SDCC_DEBUG_REG: usize = 0x358;
 pub(crate) const CORE_MCI_DATA_CNT: usize = 0x35c;
 pub(crate) const HC_VENDOR_SPECIFIC_FUNC4: usize = 0x260;
 pub(crate) const HC_DISABLE_CRYPTO: u32 = 1 << 15;
-pub(crate) const REQUIRED_MMIO_SIZE: usize = CORE_MCI_DATA_CNT + core::mem::size_of::<u32>();
+// SDCC v5.1 DLL user control at 0x388 is the highest accessed register.
+pub(crate) const REQUIRED_MMIO_SIZE: usize = 0x388 + core::mem::size_of::<u32>();
 pub(crate) const CQHCI_CFG: usize = 0x08;
 pub(crate) const CQHCI_CTL: usize = 0x0c;
 pub(crate) const CQHCI_ENABLE: u32 = 1 << 0;
@@ -318,6 +319,43 @@ mod tests {
                 handoff_power_action(rejected, 0x0d),
                 HandoffPowerAction::Reject
             );
+        }
+    }
+}
+
+/// Linux selects the three-quarter point of the longest circular valid run.
+pub(crate) fn select_tuning_phase(valid: u16) -> Option<u8> {
+    if valid == 0 {
+        return None;
+    }
+    let mut best_start = 0;
+    let mut best_len = 0;
+    for start in 0..16 {
+        if valid != u16::MAX && valid & (1 << ((start + 15) % 16)) != 0 {
+            continue;
+        }
+        let len = (0..16)
+            .take_while(|offset| valid & (1 << ((start + offset) % 16)) != 0)
+            .count();
+        if len > best_len {
+            best_start = start;
+            best_len = len;
+        }
+    }
+    Some(((best_start + (best_len * 3 / 4).saturating_sub(1)) % 16) as u8)
+}
+
+#[cfg(test)]
+mod tuning_tests {
+    use super::select_tuning_phase;
+    #[test]
+    fn selects_within_wrapped_longest_window() {
+        assert_eq!(select_tuning_phase(0), None);
+        assert_eq!(select_tuning_phase(0xffff), Some(11));
+        assert_eq!(select_tuning_phase(0xc007), Some(0));
+        assert_eq!(select_tuning_phase(1 << 7), Some(7));
+        for mask in 1..=u16::MAX {
+            assert_ne!(mask & (1 << select_tuning_phase(mask).unwrap()), 0);
         }
     }
 }
