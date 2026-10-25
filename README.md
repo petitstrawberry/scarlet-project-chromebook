@@ -185,8 +185,10 @@ From the Nix development shell:
 cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
-The current Scarlet bundles select SGFX platform `35c1967b`, native Vulkan
-runtime `73330c2c`, and ScarletUI `8efde207`. Native clients use the published
+The kernel, standard bundles, board drivers and project-owned Adreno runtime
+all reference Scarlet `f8d28abd`. The standard bundles provide their pinned
+SGFX, native Vulkan and ScarletUI dependencies; the project's SGFX dependency
+matches the bundle's `0ee6b416` revision. Native clients use the published
 SGFX backend discovery path. The project-owned Adreno driver is installed at
 `/lib/sgfx/libsgfx_scarlet_adreno.so`; `sgfx-probe` reports the selected backend
 and linkage. The `sgfx-native` bundle generates the native userspace Cargo

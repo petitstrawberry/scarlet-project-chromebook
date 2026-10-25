@@ -9,7 +9,7 @@ hash = "sha256:5adab296729c8d8d7f79d1fc258fd46ffd61e910f6dc5d88dd31a581d2728ef0"
 layers = []
 
 [sections.initramfs]
-hash = "sha256:a462b78fe2c6754053b110eb414cd0793d3350e6b55741900f9ffdd0126c0f01"
+hash = "sha256:411cb70a57f68dda991d919fd06b23a85f9a8a4c0b2dfd1cac6a3622c4df3a7e"
 
 [[sections.initramfs.layers]]
 kind = "script"
@@ -134,7 +134,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "stemd"
 to = "/bin/stemd"
-hash = "sha256:d8445e1c58d0de93e13c2e94c9c4ac6bd5dffff8a3f0edb51628e8d37ef72ad0"
+hash = "sha256:1bdc346a1516cc60345a55cc613c3e5dad79e707ec96b63fd9aa5630aa0d1e4f"
 
 [sections.initramfs.layers.source]
 type = "path"
@@ -463,7 +463,7 @@ type = "path"
 path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [sections.rootfs]
-hash = "sha256:83d5382eb699a22acbe0046889fd2792e76a667f10d9f0eead639824432148cb"
+hash = "sha256:5c7ed2c7958cafd7fb051d0a4a907e124cd2320e6b13d0c1a7497c0259c61efb"
 
 [[sections.rootfs.layers]]
 kind = "script"
@@ -588,7 +588,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "stemd"
 to = "/bin/stemd"
-hash = "sha256:d8445e1c58d0de93e13c2e94c9c4ac6bd5dffff8a3f0edb51628e8d37ef72ad0"
+hash = "sha256:1bdc346a1516cc60345a55cc613c3e5dad79e707ec96b63fd9aa5630aa0d1e4f"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -921,7 +921,7 @@ kind = "cargo"
 package = "userprogram"
 bin = "scarlet-desktop"
 to = "/bin/scarlet-desktop"
-hash = "sha256:a2ca5a5ef2b22442e0fc1a5dac7fac05265cdcce21603ee5e0eaf10280c6c101"
+hash = "sha256:201b699fe521649805b5259b09a8cbbe1e7b0ca5bb22062bb4a1580558b7f135"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -943,7 +943,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "files"
 to = "/bin/files"
-hash = "sha256:c771944c69995e3bebdf3ab2af25f8b5b5c47942345f9863f7e86057385c2924"
+hash = "sha256:873590ac854e24aa29cb9c08494a7ef6cad0d491c13909a00fa3fc068331b4c4"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -954,7 +954,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "notepad"
 to = "/bin/notepad"
-hash = "sha256:aa120ad57525ca013c9388cf44cb44e6856d56ad4866cb4990d1d61903b118d2"
+hash = "sha256:073b3de819cd1aa5f780aeaff2fa298b21e9be100c3ad3d2421f55fefdc9c720"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -965,7 +965,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "scarlet-shell"
 to = "/bin/scarlet-shell"
-hash = "sha256:474a72a5a370bf2457bce0c8a494c1c53104ebbc04ff8b5c26fc0f52c9decb82"
+hash = "sha256:3b955d9eb144f170f5349b3a15231550cf99e22f5fd75092697789589150ef8f"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -976,7 +976,7 @@ kind = "cargo"
 package = "userprogram"
 bin = "terminal"
 to = "/bin/terminal"
-hash = "sha256:50961b7f0c3a5fd7eded524f90db13f5b56a34cdc165faa26c5c4c26588cdd4b"
+hash = "sha256:602043789221e5a151c449d0b8093ea80f4f2f3d68d92bb4ca420a94fcae84be"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -987,7 +987,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "sws"
 to = "/bin/sws"
-hash = "sha256:9182bdc3255947185d3524d0ec2c7f5bfde3187202e5ed2f3ef61d4d3c2a7529"
+hash = "sha256:be760e075da2bc32cdf9a8b101e1eb142dac0166fd48d6312d37cfb7aaa61dfc"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1030,7 +1030,7 @@ kind = "cargo"
 package = "userprogram"
 bin = "ui-demo"
 to = "/bin/ui-demo"
-hash = "sha256:70803524f10e4ba57fbc7e0e4c43fd3ab3159305705901a1ae432f62ed51b2bd"
+hash = "sha256:0ffe2c622a79b97c6b56826d5d4dbdfd544ddf27dfdcdf55b376522677f67924"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1041,7 +1041,7 @@ kind = "cargo"
 package = "userprogram"
 bin = "ui-benchmark"
 to = "/bin/ui-benchmark"
-hash = "sha256:f46aa92cf7f05a125faac5cd5fdc265b35d22e893f95cd3809b4d355309032e1"
+hash = "sha256:b47f3dcee89a42fa7aae0eae722ba0244277a7e5f4684945ab6ccf6aed3a9ac2"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1067,7 +1067,7 @@ rev = "b6a7bec8bc33b2abbf8dda1397529ab836e91ead"
 kind = "cargo"
 bin = "ui-sgfx-showcase"
 to = "/bin/ui-sgfx-showcase"
-hash = "sha256:c23e6d7a684b7f5dae7bd62775439035bb10b418a330b096a16fbfcdec10878f"
+hash = "sha256:bfca9d395a7d07a4898a315be97457480fed3955e0d222d1521de7e45805306b"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1078,7 +1078,7 @@ kind = "cargo"
 package = "userprogram"
 bin = "settings"
 to = "/bin/settings"
-hash = "sha256:0ffea8ad410ce6619f8153e00de9d5d807d9bf3e7518340d08f713be050d4dd2"
+hash = "sha256:de2cde1c91d0aa8a2ba044d0eeded051c395d71de0fd973928ae9a1b073e97e7"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1088,7 +1088,7 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/bin"
 kind = "cargo"
 bin = "task-manager"
 to = "/bin/task-manager"
-hash = "sha256:42e965dad4b23b7795a08a7f5bf210c985dd5986815db98c0e4e61d9a00a659b"
+hash = "sha256:2ffca8f5af7a32c1c5f87a4807d19986a70fd819cfde05f843d3f1f236c7a4ca"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1099,7 +1099,7 @@ kind = "cargo"
 package = "userprogram"
 bin = "scarlet-skk"
 to = "/bin/scarlet-skk"
-hash = "sha256:22b46585f48a93d86efe4a85ca117722cc3ed8445e1218a56510a843ec64b743"
+hash = "sha256:5ab30f708201577aa39c2109627db02594a4dfaddc45733224049481059cc337"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1120,7 +1120,7 @@ kind = "cargo"
 package = "userprogram"
 bin = "wayland-bridge"
 to = "/bin/wayland-bridge"
-hash = "sha256:032b3b1c1365fafaba9742ae25599208908c44eb5e21cd2b464b747f6b78ecdf"
+hash = "sha256:977628295df8ecaeaf668aeeec4989f50d3e5336213029b5d9ff070f7285cf43"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1182,7 +1182,7 @@ kind = "cargo"
 package = "vulkan-canvas-demo"
 bin = "vulkan-canvas-demo"
 to = "/bin/vulkan-canvas-demo"
-hash = "sha256:e0a2cfe2ce39800c1f2f9332100639debf6517973d0649efc79456033cff390d"
+hash = "sha256:20151eda200dd532acc4e719f99ec7a55f1b2125fe1638b8a57ca48318131efb"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1223,7 +1223,7 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 kind = "cargo"
 bin = "clock"
 to = "/bin/clock"
-hash = "sha256:74db9ea4a0aa631ca4984dc6a6e4c5578365367c83c572135ac6d35580a63a0d"
+hash = "sha256:5e5ac96440ee151bb92cf2afb5cab60fd3214062858721afc8303e282a115d3c"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1283,7 +1283,7 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 kind = "cargo"
 bin = "tabletctl"
 to = "/bin/tabletctl"
-hash = "sha256:64744b3872f77f2002bfaddde2cbbda4e54141514d3af2b863882dacd8de7aaa"
+hash = "sha256:47649e6f582f69024605e4360cbcafab1abacdf5153dbdd12a107c3cac497213"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1304,7 +1304,7 @@ kind = "cargo"
 package = "userprogram"
 bin = "scarlet-mozc"
 to = "/bin/scarlet-mozc"
-hash = "sha256:041e397f94b539ecd1a011d93a311a994c12cdb6076921678d907d2a5786b4cb"
+hash = "sha256:799400f32a1411cf7e0af8c27ab8743aca2d10f95741d0af5480b23f0ddb7cd6"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1425,7 +1425,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "soft-keyboard"
 to = "/bin/soft-keyboard"
-hash = "sha256:4111967c7cc5e98a829dcf95ca3cdcc27a3fa4e9e2f322f47389cd2fdd249b05"
+hash = "sha256:11b43230b04cff75ac8cc32d82d907cb54e41d13c12d958f9ed729582df65eb6"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1435,19 +1435,19 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 kind = "app"
 source = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/app-demo/app.toml"
 to = "/applications/app-demo.app"
-hash = "sha256:93f77fd178911719e4fafd331d4d1ede7afd62cda1becdc9933ac7f1236cb2d2"
+hash = "sha256:8aad20a3794c54fbc82d9f601fe22b75c29dc0f0154b0a15351c8e0ae2bc8455"
 
 [[sections.rootfs.layers]]
 kind = "app"
 source = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin/src/storage/app.toml"
 to = "/applications/storage.app"
-hash = "sha256:54f1f2c485f7935a1b791b2ed5b92e26e9f5be6671034d14a2cd38af4c665609"
+hash = "sha256:fb37759a52713f3c8622a31bb704930f8809c2987d59378f1c74f5b3d7c3fdd9"
 
 [[sections.rootfs.layers]]
 kind = "cargo"
 bin = "calculator"
 to = "/bin/calculator"
-hash = "sha256:60e6a003168dc2c03b6168e2443a03e0763930e23bfbbb25a96f57904e679f07"
+hash = "sha256:e59340e48b291f4e27248dbb795571c449c2b12dee3a6d81b828d2b2926a05c9"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1457,7 +1457,7 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 kind = "cargo"
 bin = "calendar"
 to = "/bin/calendar"
-hash = "sha256:3b44d47827aa47471f3020ca1b3f67e7bd983ad78465de259c938bda0479f321"
+hash = "sha256:da86274c94ecd0456004b4a50075f46d718cb4dbba05081b1b90fae8f90d56ab"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1467,7 +1467,7 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 kind = "cargo"
 bin = "characters"
 to = "/bin/characters"
-hash = "sha256:c0169f7694aaeafa34c1de79411e73d61f31ac5b985d6e821c900abe35633bc8"
+hash = "sha256:fb9a79567039ae5bb94df7e1a581839f319b78aa79f42c5d0bd8c291997e46ed"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1477,7 +1477,7 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 kind = "cargo"
 bin = "screenshot"
 to = "/bin/screenshot"
-hash = "sha256:dd5d6c7c059cdf7e8350e60395b53a0609d65789c8839e7d826012ace0dbf0cf"
+hash = "sha256:be1efc3922a3b3edb0a5cc687c8b937ae01e22739638c79e22e9bc40a595e55a"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1487,7 +1487,7 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 kind = "cargo"
 bin = "log-viewer"
 to = "/bin/log-viewer"
-hash = "sha256:576ae12ee56e5bcc717b1cf9be3bfd3d3611f7ddc4ce0aa1f449dc5cb3bb8eab"
+hash = "sha256:99dbce5d149dff1732473dd70bf8beb82a46bbc78ac020f75c31606c8dcd51fd"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1497,7 +1497,7 @@ path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 kind = "cargo"
 bin = "applications"
 to = "/bin/applications"
-hash = "sha256:71177470c1499e0bef5a3384d902b1715d6790fd4121652f4608395163d01b4c"
+hash = "sha256:8746614130438dbb59f6e032a2790aa05e6fae6b3a07faf4f3ccc311c311c4ae"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1548,7 +1548,7 @@ features = [
 ]
 default-features = false
 to = "/bin/video-player"
-hash = "sha256:371940b7e4da79df8f3773d624333b0ca0a73830240b9b696ec545077f5dc2f9"
+hash = "sha256:b461d4096fc516033f787fe6c6ca64d4c2f4892dd7ffd896f788abbe867033a0"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1698,7 +1698,7 @@ path = ".scarlet/cache/git/1d707eff8bef4cad/bundle/build-aarch64.sh"
 [[sections.rootfs.layers]]
 kind = "script"
 to = "/"
-hash = "sha256:fc5e2e6c1ba29a1221d4fee725069c42a6a3c9a6ce53b971ee58551cdc6795f1"
+hash = "sha256:30e44addf1651692869d036526d8e54cf7f96f2d18657b6765f3350324eb0991"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1733,7 +1733,7 @@ kind = "cargo"
 package = "sgfx-backend-scarlet-adreno-plugin"
 lib = "sgfx_scarlet_adreno"
 to = "/lib/sgfx/libsgfx_scarlet_adreno.so"
-hash = "sha256:378b0f7d0ae165c8acc11740297099f0f16f8718dc873208f229504496ae68a2"
+hash = "sha256:aeb9c8bef2a3d5a6eef46cfad5730217afa86fa382a5ae25063835295e9dfa40"
 
 [sections.rootfs.layers.source]
 type = "path"
