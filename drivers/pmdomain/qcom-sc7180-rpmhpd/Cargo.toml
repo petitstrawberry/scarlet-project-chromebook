@@ -8,6 +8,6 @@ license = "GPL-2.0-only"
 path = "src/lib.rs"
 
 [dependencies]
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "586b2c097d543a3b6ac412d7585792dffe0107e8", package = "scarlet", default-features = false }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "855575015f5e1ba14c288218a48eef2ee07d6edb", package = "scarlet", default-features = false }
 qcom-cmd-db = { package = "scarlet-driver-qcom-cmd-db", path = "../../soc/qcom-cmd-db" }
 qcom-rpmh-rsc = { package = "scarlet-driver-qcom-rpmh-rsc", path = "../../soc/qcom-rpmh-rsc" }

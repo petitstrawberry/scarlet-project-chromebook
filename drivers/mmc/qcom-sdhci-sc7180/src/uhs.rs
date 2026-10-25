@@ -221,8 +221,12 @@ impl Sc7180SdhciHost {
                 continue;
             };
             self.set_phase(phase)?;
-            for _ in 0..3 {
-                self.tuning_read()?;
+            if !(0..3).all(|_| self.tuning_read().is_ok()) {
+                println!(
+                    "[qcom-sdhci-sc7180] SDR104 phase={} failed validation; retrying tuning",
+                    phase
+                );
+                continue;
             }
             self.last_tuning_ms = scarlet::time::current_time_ms();
             self.retune_needed = false;
