@@ -146,7 +146,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=855575015f5e1ba14c288218a48eef2ee07d6edb#855575015f5e1ba14c288218a48eef2ee07d6edb"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=be5689a8722edfce3287fe1de3c3de2715111deb#be5689a8722edfce3287fe1de3c3de2715111deb"
 dependencies = [
  "chacha20",
  "fdt",
@@ -162,7 +162,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=855575015f5e1ba14c288218a48eef2ee07d6edb#855575015f5e1ba14c288218a48eef2ee07d6edb"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=be5689a8722edfce3287fe1de3c3de2715111deb#be5689a8722edfce3287fe1de3c3de2715111deb"
 
 [[package]]
 name = "scarlet-driver-google-cr50-tpm2-rng"

@@ -9,6 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 fdt = "0.1.5"
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "855575015f5e1ba14c288218a48eef2ee07d6edb", package = "scarlet", default-features = false, features = ["network"] }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "be5689a8722edfce3287fe1de3c3de2715111deb", package = "scarlet", default-features = false, features = ["network"] }
 scarlet-driver-qcom-spmi-pmic-arb = { path = "../../spmi/qcom-spmi-pmic-arb" }
 scarlet-driver-cros-ec-spi = { path = "../../platform/chromeos/cros-ec-spi" }
