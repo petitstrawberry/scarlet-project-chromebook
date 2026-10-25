@@ -11,8 +11,7 @@ use core::ptr;
 
 use scarlet::{fs::manager::get_global_vfs_manager_safe, object::KernelObject};
 
-pub(crate) const VENUS_FIRMWARE_PATH: &str =
-    "/system/scarlet/lib/firmware/qcom/venus-5.4/venus.mbn";
+pub(crate) const VENUS_FIRMWARE_PATH: &str = "/lib/firmware/qcom/venus-5.4/venus.mbn";
 
 const ELF32_HEADER_SIZE: usize = 52;
 const ELF32_PROGRAM_HEADER_SIZE: usize = 32;
