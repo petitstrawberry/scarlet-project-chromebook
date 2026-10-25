@@ -439,6 +439,44 @@ fn validate_image_layout(
     image: &ImageMeta,
     max_pitch: u32,
 ) -> Result<(), CompileError> {
+    if image.format == TextureFormat::Nv12 {
+        if image.storage_format != TextureFormat::Nv12
+            || image.planes.len() != 2
+            || image.modifier != ImageModifier::Linear
+            || image.texture.is_some()
+            || image.conversion.is_none()
+            || image.usage != TextureUsage::SAMPLED
+            || image.extent.width() % 2 != 0
+            || image.extent.height() % 2 != 0
+        {
+            return Err(CompileError::InvalidResource);
+        }
+        for (i, p) in image.planes.iter().enumerate() {
+            let rows = if i == 0 {
+                image.extent.height()
+            } else {
+                image.extent.height() / 2
+            };
+            if p.stride < image.extent.width()
+                || p.stride > max_pitch
+                || p.stride % 64 != 0
+                || p.size != u64::from(p.stride) * u64::from(rows)
+                || p.offset
+                    .checked_add(p.size)
+                    .is_none_or(|end| end > allocation_size)
+            {
+                return Err(CompileError::InvalidResource);
+            }
+        }
+        if image.planes[0].offset != 0
+            || image.planes[1].offset < image.planes[0].size
+            || image.planes[1].offset % 4096 != 0
+            || image.planes[1].stride != image.planes[0].stride
+        {
+            return Err(CompileError::InvalidResource);
+        }
+        return Ok(());
+    }
     if image.planes.len() != 1 {
         return Err(CompileError::UnsupportedFeature);
     }
@@ -519,7 +557,8 @@ fn require_image_surface(
         return Err(CompileError::InvalidResource);
     };
     if !image.usage.contains(required)
-        || image.storage_format != TextureFormat::Bgra8Unorm
+        || !(image.storage_format == TextureFormat::Bgra8Unorm
+            || (image.storage_format == TextureFormat::Nv12 && required == TextureUsage::SAMPLED))
         || !matches!(
             image.modifier,
             ImageModifier::Linear | ImageModifier::A6xxTile6_3Color
@@ -532,6 +571,11 @@ fn require_image_surface(
     validate_image_layout(resource.size, image, max_pitch)?;
     let plane = image.planes[0];
     Ok(Surface {
+        nv12: image.conversion.map(|conversion| crate::emit::Nv12Surface {
+            conversion,
+            uv_offset: image.planes[1].offset,
+            uv_size: image.planes[1].size,
+        }),
         object: resource.id,
         plane_offset: plane.offset,
         plane_size: plane.size,
@@ -585,6 +629,7 @@ fn require_depth_surface(
     validate_image_layout(resource.size, image, max_pitch)?;
     let plane = image.planes[0];
     Ok(Surface {
+        nv12: None,
         object: resource.id,
         plane_offset: plane.offset,
         plane_size: plane.size,
@@ -696,7 +741,7 @@ fn emit_draw(
     {
         return Err(CompileError::OutOfBounds);
     }
-    let variant = pipeline_variant(&pipeline.descriptor)?;
+    let mut variant = pipeline_variant(&pipeline.descriptor)?;
     let (attributes, source_over) = draw_fixed_state(&pipeline.descriptor)?;
     let texture = match pipeline.descriptor.fragment() {
         FragmentProgram::Texture(_) | FragmentProgram::TextureVertexColor(_) => {
@@ -710,14 +755,32 @@ fn emit_draw(
         }
         FragmentProgram::Solid | FragmentProgram::VertexColor => None,
     };
-    let mut uniform_words = [0_u32; 20];
+    if texture.is_some_and(|t| t.nv12.is_some()) {
+        variant = match (stride, pipeline.descriptor.fragment()) {
+            (16, FragmentProgram::Texture(_)) => PipelineVariant::Stride16Nv12,
+            (24, FragmentProgram::Texture(_)) => PipelineVariant::Stride24Nv12,
+            (40, FragmentProgram::TextureVertexColor(_)) => {
+                PipelineVariant::Stride40Nv12VertexColor
+            }
+            _ => return Err(CompileError::UnsupportedFeature),
+        };
+    }
+    let mut uniform_words = [0_u32; 32];
+    if let Some(nv12) = texture.and_then(|t| t.nv12) {
+        for (word, coefficient) in uniform_words[20..]
+            .iter_mut()
+            .zip(ycbcr_coefficients(nv12.conversion))
+        {
+            *word = coefficient.to_bits();
+        }
+    }
     for (destination, value) in uniform_words[..16]
         .iter_mut()
         .zip(uniforms.transform().columns())
     {
         *destination = value.to_bits();
     }
-    for (destination, value) in uniform_words[16..]
+    for (destination, value) in uniform_words[16..20]
         .iter_mut()
         .zip(uniforms.color().components())
     {
@@ -956,12 +1019,15 @@ fn validate_sample_state(
     let format_matches = match sample_mode {
         TextureSampleMode::Rgba | TextureSampleMode::RgbIgnoreAlpha => matches!(
             image.format,
-            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm | TextureFormat::Nv12
         ),
         TextureSampleMode::AlphaMask => image.format == TextureFormat::R8Unorm,
     };
     if !format_matches
-        || image.storage_format != TextureFormat::Bgra8Unorm
+        || !matches!(
+            image.storage_format,
+            TextureFormat::Bgra8Unorm | TextureFormat::Nv12
+        )
         || !image.usage.contains(TextureUsage::SAMPLED)
     {
         return Err(CompileError::InvalidResource);
@@ -1141,4 +1207,65 @@ fn rect_within(inner: PixelRect, outer: PixelRect) -> bool {
         && inner.y() >= outer.y()
         && inner.x() + inner.width() <= outer.x() + outer.width()
         && inner.y() + inner.height() <= outer.y() + outer.height()
+}
+
+/// Rows mapping normalized Y/Cb/Cr samples into RGB, with offset in W.
+fn ycbcr_coefficients(c: sgfx_core::ir::YcbcrConversion) -> [f32; 12] {
+    use sgfx_core::ir::{YcbcrMatrix, YcbcrRange};
+    let (kr, kb): (f32, f32) = match c.matrix {
+        YcbcrMatrix::Bt601 => (0.299, 0.114),
+        YcbcrMatrix::Bt709 => (0.2126, 0.0722),
+    };
+    let (ys, cs, yo) = match c.range {
+        YcbcrRange::Limited => (255.0 / 219.0, 255.0 / 224.0, 16.0 / 255.0),
+        YcbcrRange::Full => (1.0, 1.0, 0.0),
+    };
+    let rv = 2.0 * (1.0 - kr) * cs;
+    let bu = 2.0 * (1.0 - kb) * cs;
+    let gu = -2.0 * kb * (1.0 - kb) / (1.0 - kr - kb) * cs;
+    let gv = -2.0 * kr * (1.0 - kr) / (1.0 - kr - kb) * cs;
+    let co = 128.0 / 255.0;
+    [
+        ys,
+        0.0,
+        rv,
+        -ys * yo - rv * co,
+        ys,
+        gu,
+        gv,
+        -ys * yo - (gu + gv) * co,
+        ys,
+        bu,
+        0.0,
+        -ys * yo - bu * co,
+    ]
+}
+
+#[cfg(test)]
+mod nv12_tests {
+    use super::ycbcr_coefficients;
+    use sgfx_core::ir::{ChromaLocation, YcbcrConversion, YcbcrMatrix, YcbcrRange};
+    #[test]
+    fn neutral_black_and_white_respect_matrix_and_range() {
+        for matrix in [YcbcrMatrix::Bt601, YcbcrMatrix::Bt709] {
+            for range in [YcbcrRange::Limited, YcbcrRange::Full] {
+                let rows = ycbcr_coefficients(YcbcrConversion {
+                    matrix,
+                    range,
+                    chroma_x: ChromaLocation::Cosited,
+                    chroma_y: ChromaLocation::Midpoint,
+                });
+                let (black, white) = if range == YcbcrRange::Limited {
+                    (16.0 / 255.0, 235.0 / 255.0)
+                } else {
+                    (0.0, 1.0)
+                };
+                for row in rows.chunks_exact(4) {
+                    let rgb = |y| row[0] * y + (row[1] + row[2]) * (128.0 / 255.0) + row[3];
+                    assert!(rgb(black).abs() < 0.000001);
+                    assert!((rgb(white) - 1.0).abs() < 0.000001);
+                }
+            }
+        }
+    }
 }

@@ -9,13 +9,13 @@ name = "sgfx_scarlet_adreno"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-sgfx-backend-abi = { git = "https://github.com/petitstrawberry/sgfx", rev = "20bb5b8cc19445520d08c31c3971ac06244bc1d9" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", features = ["backend-abi"] }
+sgfx-backend-abi = { git = "https://github.com/petitstrawberry/sgfx", rev = "0ee6b41669904ced227f01cc435933c646a60c75" }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "0ee6b41669904ced227f01cc435933c646a60c75", features = ["backend-abi"] }
 sgfx-backend-scarlet-adreno = { path = "../sgfx-backend-scarlet-adreno", default-features = false, features = ["std"] }
 sgfx-codegen-adreno-a6xx = { path = "../sgfx-codegen-adreno-a6xx" }
 
 [dev-dependencies]
-sgfx-backend-loader = { git = "https://github.com/petitstrawberry/sgfx", rev = "20bb5b8cc19445520d08c31c3971ac06244bc1d9" }
+sgfx-backend-loader = { git = "https://github.com/petitstrawberry/sgfx", rev = "0ee6b41669904ced227f01cc435933c646a60c75" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

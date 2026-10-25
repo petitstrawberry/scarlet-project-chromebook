@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9#2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=a63841fe85231042cb0f0b176412f10a07841a50#a63841fe85231042cb0f0b176412f10a07841a50"
 dependencies = [
  "chacha20",
  "fdt",
@@ -181,7 +181,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9#2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=a63841fe85231042cb0f0b176412f10a07841a50#a63841fe85231042cb0f0b176412f10a07841a50"
 
 [[package]]
 name = "scarlet-driver-qcom-adreno-a618"
@@ -249,7 +249,7 @@ dependencies = [
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx?rev=040dbb5cf42b75489504e1765183d37f6131f54c#040dbb5cf42b75489504e1765183d37f6131f54c"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=0ee6b41669904ced227f01cc435933c646a60c75#0ee6b41669904ced227f01cc435933c646a60c75"
 
 [[package]]
 name = "sha2"

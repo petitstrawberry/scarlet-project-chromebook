@@ -104,3 +104,16 @@ The driver [hardware validation checklist](../../drivers/gpu/qcom-adreno-a618/RE
 covers real DMA fence visibility, IRQ delivery, pending close/detach, and fault
 shutdown. Those behaviors require a CoachZ/A618 boot and have not been verified
 by host tests or target compilation alone.
+
+## Shared NV12 video
+
+The dynamic driver exposes the SGFX v2 YCbCr import extension. Immutable linear
+NV12 image capabilities are sampled as native two-plane A618 textures; BT.601
+and BT.709, limited/full range, and cosited/midpoint chroma are explicit import
+parameters. The GPU performs color conversion and scaling while rendering the
+video plane. Imported memory is read-only and retained through queued work.
+
+Venus publishes an owned NV12 snapshot of each completed output (one CPU copy
+of the planar bytes). The reusable decoder mmap is never shared with the GPU,
+so decoding the next frame cannot overwrite a frame still being displayed.
+There is no CPU NV12-to-BGRA conversion or CPU resizing on this path.

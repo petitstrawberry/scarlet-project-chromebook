@@ -627,3 +627,58 @@ mod tests {
         );
     }
 }
+
+unsafe extern "C" fn import_ycbcr(p: Object, slot: u32, raw: i32, c: abi::YcbcrConversion) -> i32 {
+    status((|| {
+        let handle = unsafe { adreno::Handle::from_raw(raw) }.map_err(handle_error)?;
+        if !c.is_valid() {
+            return Err(abi::INVALID);
+        }
+        let s = unsafe { object::<Session>(p) }?;
+        let id = s.table.abi_texture(slot).map_err(|_| abi::INVALID)?.id();
+        let conversion = ir::YcbcrConversion {
+            matrix: if c.matrix == abi::YCBCR_MATRIX_BT601 {
+                ir::YcbcrMatrix::Bt601
+            } else {
+                ir::YcbcrMatrix::Bt709
+            },
+            range: if c.range == abi::YCBCR_RANGE_LIMITED {
+                ir::YcbcrRange::Limited
+            } else {
+                ir::YcbcrRange::Full
+            },
+            chroma_x: if c.chroma_x == abi::YCBCR_CHROMA_COSITED {
+                ir::ChromaLocation::Cosited
+            } else {
+                ir::ChromaLocation::Midpoint
+            },
+            chroma_y: if c.chroma_y == abi::YCBCR_CHROMA_COSITED {
+                ir::ChromaLocation::Cosited
+            } else {
+                ir::ChromaLocation::Midpoint
+            },
+        };
+        s.inner
+            .import_ycbcr_texture(id, handle, conversion)
+            .map_err(error)
+    })())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sgfx_backend_get_ycbcr_api_v2(
+    version: u32,
+    size: usize,
+    out: *mut abi::YcbcrApi,
+) -> i32 {
+    if version != abi::VERSION || size != core::mem::size_of::<abi::YcbcrApi>() || out.is_null() {
+        return abi::INVALID;
+    }
+    unsafe {
+        out.write(abi::YcbcrApi {
+            version: abi::VERSION,
+            size: core::mem::size_of::<abi::YcbcrApi>() as u32,
+            import_ycbcr,
+        });
+    }
+    abi::OK
+}

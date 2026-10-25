@@ -4,8 +4,7 @@ use alloc::vec::Vec;
 
 use adreno_a6xx_pm4::{opcode, type4, type7};
 use adreno_a6xx_shader_pack::{
-    FragmentMeta, LinkMeta, PipelineVariant, SHADER_SIZE, ShaderMeta, VertexMeta, link_meta,
-    shader_meta,
+    FragmentMeta, LinkMeta, PipelineVariant, ShaderMeta, VertexMeta, link_meta, shader_meta,
 };
 use sgfx_core::ir::{Color, CompareFunction, IndexFormat, PixelRect, Viewport};
 
@@ -205,7 +204,7 @@ pub(crate) struct DrawState {
     pub(crate) vertex_size: u64,
     pub(crate) stride: u32,
     pub(crate) attributes: &'static [(u32, u32)],
-    pub(crate) uniforms: [u32; 20],
+    pub(crate) uniforms: [u32; 32],
     pub(crate) texture: Option<Surface>,
     pub(crate) sampler: [u32; 4],
     pub(crate) source_over: bool,
@@ -245,6 +244,7 @@ pub(crate) struct IndexedDraw {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Surface {
+    pub(crate) nv12: Option<Nv12Surface>,
     pub(crate) mip_levels: u32,
     pub(crate) array_pitch: u64,
     pub(crate) object: ObjectId,
@@ -255,6 +255,13 @@ pub(crate) struct Surface {
     pub(crate) stride: u32,
     pub(crate) tile_mode: u32,
     pub(crate) alpha_mask: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Nv12Surface {
+    pub(crate) conversion: sgfx_core::ir::YcbcrConversion,
+    pub(crate) uv_offset: u64,
+    pub(crate) uv_size: u64,
 }
 
 pub(crate) struct Emitter {
@@ -446,7 +453,7 @@ impl Emitter {
         self.address_words(
             ObjectRef::CanonicalShader(variant),
             0,
-            SHADER_SIZE as u64,
+            variant.size() as u64,
             Access::READ,
         )
     }
@@ -474,6 +481,26 @@ impl Emitter {
         // identity view swizzle. Freedreno assigns explicit linear BGRA8 a
         // 64-byte minimum pitch alignment (PITCHALIGN encoding zero); a wider
         // incidental stride alignment must not change the descriptor.
+        if let Some(nv12) = texture.nv12 {
+            use sgfx_core::ir::ChromaLocation;
+            return Ok([
+                (0x8e << 22)
+                    | 0x6880
+                    | if nv12.conversion.chroma_x == ChromaLocation::Midpoint {
+                        1 << 16
+                    } else {
+                        0
+                    }
+                    | if nv12.conversion.chroma_y == ChromaLocation::Midpoint {
+                        1 << 18
+                    } else {
+                        0
+                    },
+                texture.width | (texture.height << 15),
+                (texture.stride << 7) | (1 << 29),
+                ((texture.plane_size + 4095) >> 12) as u32,
+            ]);
+        }
         Ok([
             (if texture.alpha_mask {
                 0x4c00_76d0
@@ -551,7 +578,18 @@ impl Emitter {
                 self.address_words(ObjectRef::Generated(state), 0, 80, Access::WRITE)?;
                 self.extend_words(&descriptor)?;
                 self.texture_descriptor_address(texture)?;
-                self.extend_words(&[0; 10])?;
+                if let Some(nv12) = texture.nv12 {
+                    self.push_word(texture.stride << 8)?;
+                    self.address_words(
+                        ObjectRef::External(texture.object),
+                        nv12.uv_offset,
+                        nv12.uv_size,
+                        Access::READ,
+                    )?;
+                    self.extend_words(&[0; 7])?;
+                } else {
+                    self.extend_words(&[0; 10])?;
+                }
                 self.extend_words(&sampler)?;
                 self.packet7(opcode::WAIT_MEM_WRITES, &[])
             })();
@@ -770,8 +808,19 @@ impl Emitter {
         self.emit_fs(fs)?;
         self.emit_vs_program(vs, link.vs)?;
         self.emit_fs_program(fs, link.fs)?;
-        self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms)?;
-        self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
+        self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms[..20])?;
+        let count = if draw.texture.is_some_and(|t| t.nv12.is_some()) {
+            8
+        } else {
+            5
+        };
+        self.load_direct(
+            CP_LOAD_STATE6_FRAG,
+            12,
+            1,
+            count,
+            &draw.uniforms[..count as usize * 4],
+        )?;
         if let Some(texture) = draw.texture {
             // ST6_SHADER sampler units are four dwords each. Texture
             // descriptors use sixteen dwords under ST6_CONSTANTS, but padding
@@ -881,8 +930,19 @@ impl Emitter {
         // primitive bloats both the wire authority table and CP work.  The
         // kernel accepts this omission only for a bounded retained-state delta
         // following a complete shader segment in this same submission.
-        self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms)?;
-        self.load_direct(CP_LOAD_STATE6_FRAG, 12, 1, 5, &draw.uniforms)?;
+        self.load_direct(CP_LOAD_STATE6_GEOM, 8, 1, 5, &draw.uniforms[..20])?;
+        let count = if draw.texture.is_some_and(|t| t.nv12.is_some()) {
+            8
+        } else {
+            5
+        };
+        self.load_direct(
+            CP_LOAD_STATE6_FRAG,
+            12,
+            1,
+            count,
+            &draw.uniforms[..count as usize * 4],
+        )?;
 
         let texture_changed = self.last_draw.is_none_or(|previous| {
             previous.texture != draw.texture || previous.sampler != draw.sampler
@@ -1120,7 +1180,7 @@ impl Emitter {
         self.address_words(
             ObjectRef::CanonicalShader(variant),
             0,
-            SHADER_SIZE as u64,
+            variant.size() as u64,
             Access::READ,
         )?;
         self.extend_words(&[0; 4])

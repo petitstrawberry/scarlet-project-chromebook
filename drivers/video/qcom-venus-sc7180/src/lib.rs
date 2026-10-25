@@ -19,6 +19,7 @@ mod hfi;
 mod hfi_abi;
 mod memory;
 mod registers;
+mod shared_frame;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 

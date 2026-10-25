@@ -30,6 +30,7 @@ fn image(id: ObjectId, usage: TextureUsage) -> ResourceMeta {
         id,
         size: 16 * 64,
         kind: ResourceKind::Image(ImageMeta {
+            conversion: None,
             texture: None,
             format: TextureFormat::Bgra8Unorm,
             storage_format: TextureFormat::Bgra8Unorm,
@@ -63,6 +64,7 @@ fn resources() -> Vec<ResourceMeta> {
             id: ALPHA,
             size: 16 * 64,
             kind: ResourceKind::Image(ImageMeta {
+                conversion: None,
                 texture: None,
                 format: TextureFormat::R8Unorm,
                 storage_format: TextureFormat::Bgra8Unorm,
@@ -336,6 +338,7 @@ fn depth32_clear_test_and_write_are_a_relocatable_sysmem_stream() {
         id: DEPTH,
         size: 4096,
         kind: ResourceKind::Image(ImageMeta {
+            conversion: None,
             texture: None,
             format: TextureFormat::Depth32Float,
             storage_format: TextureFormat::Depth32Float,
@@ -1218,6 +1221,7 @@ fn logical_sample_uploads_are_converted_to_physical_bgra_rows() {
             id: SOURCE,
             size: 64,
             kind: ResourceKind::Image(ImageMeta {
+                conversion: None,
                 texture: None,
                 format: logical_format,
                 storage_format: TextureFormat::Bgra8Unorm,
@@ -1502,6 +1506,7 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
             id: TARGET,
             size: TARGET_SIZE,
             kind: ResourceKind::Image(ImageMeta {
+                conversion: None,
                 texture: None,
                 format: TextureFormat::Bgra8Unorm,
                 storage_format: TextureFormat::Bgra8Unorm,
@@ -1519,6 +1524,7 @@ fn coachz_four_quad_texture_composition_is_a_well_formed_stream() {
             id: SOURCE,
             size: TEXTURE_SIZE,
             kind: ResourceKind::Image(ImageMeta {
+                conversion: None,
                 texture: None,
                 format: TextureFormat::Bgra8Unorm,
                 storage_format: TextureFormat::Bgra8Unorm,
@@ -1788,6 +1794,7 @@ fn coachz_cube_first_frame_uses_upstream_shader_program_bursts() {
             id: TARGET,
             size: u64::from(STRIDE) * u64::from(HEIGHT),
             kind: ResourceKind::Image(ImageMeta {
+                conversion: None,
                 texture: None,
                 format: TextureFormat::Bgra8Unorm,
                 storage_format: TextureFormat::Bgra8Unorm,
@@ -1929,6 +1936,7 @@ fn showcase_first_frame_compiles_as_one_complete_multipass_stream() {
                 id,
                 size: u64::from(stride) * u64::from(height),
                 kind: ResourceKind::Image(ImageMeta {
+                    conversion: None,
                     texture: None,
                     format,
                     storage_format: TextureFormat::Bgra8Unorm,

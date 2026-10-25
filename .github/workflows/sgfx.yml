@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  SCARLET_TOOLCHAIN: github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain
+  SCARLET_TOOLCHAIN: github:petitstrawberry/scarlet-rust-nix/79f356924d1a93b55904c6b2733d0b3da5ce0de5#scarlet-rust-toolchain
 
 jobs:
   portable:
@@ -62,6 +62,8 @@ jobs:
         run: |
           cargo test --locked --manifest-path tests/a618-async-queue/Cargo.toml
           cargo test --locked --manifest-path tests/a618-async-preparation/Cargo.toml
+      - name: Test EC event isolation
+        run: cargo test --locked --manifest-path tests/ec-event-drain/Cargo.toml
 
   scarlet:
     runs-on: ubuntu-latest

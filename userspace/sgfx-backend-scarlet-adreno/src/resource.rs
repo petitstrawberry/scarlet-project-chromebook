@@ -25,6 +25,7 @@ use crate::Handle;
 use crate::{ContextInner, HandleError, HandleResult, Image, IrSubmitError, ir};
 
 pub(crate) struct RawImage {
+    pub(crate) conversion: Option<ir::YcbcrConversion>,
     pub(crate) texture: Option<adreno_a6xx_layout::LinearTextureLayout>,
     pub(crate) raw: GpuImage,
     pub(crate) attachment_token: u64,
@@ -86,14 +87,51 @@ impl RawImage {
         context: &Arc<ContextInner>,
         handle: Handle,
         descriptor: ir::TextureDesc,
+        conversion: Option<ir::YcbcrConversion>,
     ) -> HandleResult<Self> {
-        if descriptor.format() != ir::TextureFormat::Bgra8Unorm
+        let logical = if conversion.is_some() {
+            ir::TextureFormat::Nv12
+        } else {
+            ir::TextureFormat::Bgra8Unorm
+        };
+        let physical = if conversion.is_some() {
+            gpu_raw::GPU_IMAGE_FORMAT_NV12
+        } else {
+            GPU_IMAGE_FORMAT_BGRA8_UNORM
+        };
+        if descriptor.format() != logical
             || !descriptor.usage().contains(ir::TextureUsage::SAMPLED)
             || descriptor.usage().contains(ir::TextureUsage::PRESENT)
         {
             return Err(HandleError::InvalidParameter);
         }
-        let raw = GpuImage::from_handle(handle)?;
+        let raw = if let Some(c) = conversion {
+            use gpu_raw::shared_image::*;
+            context.device.gpu.import_shared_image(
+                &handle,
+                ImageColor {
+                    matrix: match c.matrix {
+                        ir::YcbcrMatrix::Bt601 => COLOR_MATRIX_BT601,
+                        ir::YcbcrMatrix::Bt709 => COLOR_MATRIX_BT709,
+                    },
+                    range: match c.range {
+                        ir::YcbcrRange::Limited => COLOR_RANGE_LIMITED,
+                        ir::YcbcrRange::Full => COLOR_RANGE_FULL,
+                    },
+                    chroma_x: match c.chroma_x {
+                        ir::ChromaLocation::Cosited => CHROMA_COSITED,
+                        ir::ChromaLocation::Midpoint => CHROMA_MIDPOINT,
+                    },
+                    chroma_y: match c.chroma_y {
+                        ir::ChromaLocation::Cosited => CHROMA_COSITED,
+                        ir::ChromaLocation::Midpoint => CHROMA_MIDPOINT,
+                    },
+                    ..Default::default()
+                },
+            )?
+        } else {
+            GpuImage::from_handle(handle)?
+        };
         let info = raw.query()?;
         let shape = raw.query_texture()?;
         if shape.mip_levels != descriptor.mip_level_count()
@@ -103,14 +141,16 @@ impl RawImage {
         }
         let width = descriptor.extent().width();
         let height = descriptor.extent().height();
-        if info.format != GPU_IMAGE_FORMAT_BGRA8_UNORM
+        if info.format != physical
             || info.usage & GPU_IMAGE_USAGE_SAMPLED == 0
             || info.width != width
             || info.height != height
         {
             return Err(HandleError::InvalidParameter);
         }
-        Self::finish_create(context, raw, ir::TextureFormat::Bgra8Unorm, width, height)
+        let mut image = Self::finish_create(context, raw, logical, width, height)?;
+        image.conversion = conversion;
+        Ok(image)
     }
 
     fn finish_create(
@@ -164,6 +204,7 @@ impl RawImage {
             return Err(HandleError::InvalidParameter);
         }
         Ok(Self {
+            conversion: None,
             texture,
             raw,
             attachment_token,
@@ -421,6 +462,7 @@ impl ContextResources {
         &mut self,
         texture: ir::TextureId,
         handle: Handle,
+        conversion: Option<ir::YcbcrConversion>,
     ) -> Result<(), IrSubmitError> {
         let reference = self.resources.texture_ref(texture)?;
         let descriptor = self.resources.texture(reference)?;
@@ -433,7 +475,12 @@ impl ContextResources {
         {
             return Err(IrSubmitError::TextureAlreadyMapped);
         }
-        let image = Arc::new(RawImage::import_sampled(&self.context, handle, descriptor)?);
+        let image = Arc::new(RawImage::import_sampled(
+            &self.context,
+            handle,
+            descriptor,
+            conversion,
+        )?);
         if self
             .images
             .iter()
@@ -615,6 +662,24 @@ fn validate_image_layout(
     height: u32,
     logical_format: ir::TextureFormat,
 ) -> HandleResult<()> {
+    if logical_format == ir::TextureFormat::Nv12 {
+        if layout.plane_count != 2 || layout.modifier != 0 || width % 2 != 0 || height % 2 != 0 {
+            return Err(HandleError::Unsupported);
+        }
+        for (index, p) in layout.planes[..2].iter().enumerate() {
+            let rows = if index == 0 { height } else { height / 2 };
+            if p.row_pitch < width
+                || p.row_pitch % 64 != 0
+                || p.size != u64::from(p.row_pitch) * u64::from(rows)
+                || p.offset
+                    .checked_add(p.size)
+                    .is_none_or(|end| end > layout.total_size)
+            {
+                return Err(HandleError::InvalidParameter);
+            }
+        }
+        return Ok(());
+    }
     if layout.plane_count != 1
         || layout.total_size == 0
         || layout.alignment == 0

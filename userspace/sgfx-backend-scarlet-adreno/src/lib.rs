@@ -555,7 +555,18 @@ impl MappedTargetSession {
         texture: ir::TextureId,
         handle: Handle,
     ) -> Result<(), IrSubmitError> {
-        self.resources.import_sampled_image(texture, handle)
+        self.resources.import_sampled_image(texture, handle, None)
+    }
+
+    /// Import an immutable two-plane image without CPU color conversion.
+    pub fn import_ycbcr_texture(
+        &mut self,
+        texture: ir::TextureId,
+        handle: Handle,
+        conversion: ir::YcbcrConversion,
+    ) -> Result<(), IrSubmitError> {
+        self.resources
+            .import_sampled_image(texture, handle, Some(conversion))
     }
 
     /// Detach and release a previously imported sampled texture.

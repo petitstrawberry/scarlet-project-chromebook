@@ -397,6 +397,7 @@ mod tests {
             id,
             size,
             kind: ResourceKind::Image(ImageMeta {
+                conversion: None,
                 texture: None,
                 format,
                 storage_format: TextureFormat::Bgra8Unorm,

@@ -40,7 +40,7 @@ metadata = json.loads((PACK / "mesa-metadata.json").read_text())
 assert metadata["mesa_sha"] == EXPECTED_SHA
 assert metadata["gpu_id"] == 618
 variants = metadata["variants"]
-assert len(variants) == 13
+assert len(variants) == 15
 assert len({variant["name"] for variant in variants}) == len(variants)
 
 manifest = []
@@ -50,7 +50,7 @@ for variant in variants:
     expected_disasm = (PACK / f"{name}.disasm").read_text().splitlines()
     payload = binary.read_bytes()
     assert len(payload) == variant["binary_bytes"] == variant["sizedwords"] * 4
-    assert len(payload) % 128 == 0
+    assert len(payload) % 8 == 0  # IR3 instructions; kernel pads each program to 128 bytes
     decoded = subprocess.run(
         [str(DISASM), "-g", "FD618", str(binary)],
         check=True,
@@ -70,7 +70,7 @@ for variant in variants:
 
 links = metadata["links"]
 names = {variant["name"] for variant in variants}
-assert len(links) == 10
+assert len(links) == 13
 for link in links:
     assert link["vs"] in names and link["fs"] in names
 

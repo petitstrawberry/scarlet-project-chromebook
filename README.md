@@ -38,9 +38,8 @@ Still under development:
 - SD/eMMC support
 - onboard networking and GPU support
 
-The current Scarlet system runs entirely from its initramfs after boot. U-Boot
-can read the USB boot medium, but Scarlet does not yet mount a persistent
-root filesystem from it.
+The full image boots through its initramfs and waits for the USB root
+filesystem at `/dev/usbblk0p2`, then mounts that ext2 partition for userspace.
 
 ## Requirements
 
@@ -79,11 +78,14 @@ The development shell provides the pinned Scarlet Rust toolchain,
 `cargo-scarlet`, the Limine image plugin, AArch64 build tools, PyUSB/libusb,
 device-tree tools, `mtools`, and serial-console utilities.
 
-The CoachZ BSP uses a sibling `../Scarlet` checkout for its kernel.
-Userspace bundles are fetched by cargo-scarlet from pinned Git revisions.
-Use Scarlet kernel commit
-`72e68549b679f5ff471b79847675bbb5ec3dc73a` or a compatible successor and the
-published revisions in its Cargo lockfile. The standard `/init` provides USB
+The CoachZ kernel and userspace bundles are selected from published Git
+revisions by cargo-scarlet. Every board driver uses the same pinned kernel
+package; no sibling Scarlet checkout is required. The project-owned Adreno
+driver bundle is built from this checkout so its userspace and kernel
+dependencies stay aligned. The current kernel includes firmware-managed GPU
+frequency registration, with its matching revisions recorded in
+`scarlet.toml` and the Cargo lockfiles.
+The standard `/init` provides USB
 `rootwait` and constructs the current boot Environment; no project-local init
 replacement is needed.
 
@@ -183,15 +185,12 @@ From the Nix development shell:
 cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
-The current Scarlet bundles select SGFX `1a27c83c` and ScarletUI `5e167123`.
-Native 64-bit clients currently use the statically linked Adreno backend;
-`sgfx-probe` reports `scarlet-adreno` with `linkage: static`. This selection is
-retained while investigating the remaining GPU performance regression.
-The shared Adreno driver is also bundled at `/lib/sgfx/libsgfx_scarlet_adreno.so`
-for dynamic clients. It exposes SGFX ABI v2; Rust objects and allocators remain
-private to the library. The `sgfx-native` bundle installs `/lib/sgfx` and
-generates the native linker configuration before userspace compilation. The
-project selects that configuration for both initramfs and rootfs builds.
+The current Scarlet bundles select SGFX platform `35c1967b`, native Vulkan
+runtime `73330c2c`, and ScarletUI `8efde207`. Native clients use the published
+SGFX backend discovery path. The project-owned Adreno driver is installed at
+`/lib/sgfx/libsgfx_scarlet_adreno.so`; `sgfx-probe` reports the selected backend
+and linkage. The `sgfx-native` bundle generates the native userspace Cargo
+configuration before applications are built.
 
 Userspace is built by the standard Scarlet bundles with their published Git
 revisions and checked-in Cargo locks. The project does not inject local source
@@ -213,8 +212,9 @@ projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
 ```
 
 `cargo scarlet image` owns image composition and cache reuse. The compatibility
-wrapper in `scripts/` only forwards to that command. Userspace bundles are
-fetched from pinned Git sources without a sibling Scarlet checkout.
+wrapper in `scripts/` only forwards to that command. External sources are
+fetched from pinned Git revisions without a sibling Scarlet checkout; the
+Adreno bundle is read from this checkout.
 
 It is a GPT disk image for a single USB drive with:
 

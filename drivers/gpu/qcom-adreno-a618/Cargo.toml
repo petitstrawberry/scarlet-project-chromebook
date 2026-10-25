@@ -17,7 +17,7 @@ strict-command-validation = []
 
 [dependencies]
 fdt = "0.1.5"
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "2a6b04a1016d94c560f00cdbfe5b2d1cdbcabcd9", package = "scarlet", default-features = false }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "a63841fe85231042cb0f0b176412f10a07841a50", package = "scarlet", default-features = false }
 scarlet-driver-qcom-sc7180-gpucc = { path = "../../clk/qcom-sc7180-gpucc" }
 scarlet-driver-qcom-cmd-db = { path = "../../soc/qcom-cmd-db" }
 qcom-sc7180-interconnect = { package = "scarlet-driver-qcom-sc7180-interconnect", path = "../../interconnect/qcom-sc7180" }
@@ -28,4 +28,4 @@ adreno-a6xx-submit-wire = { path = "../../../shared/adreno-a6xx-submit-wire" }
 
 [dev-dependencies]
 sgfx-codegen-adreno-a6xx = { path = "../../../userspace/sgfx-codegen-adreno-a6xx" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "0ee6b41669904ced227f01cc435933c646a60c75", default-features = false }

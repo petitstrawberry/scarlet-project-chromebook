@@ -11,7 +11,7 @@ path = "bsp"
 package = "scarlet"
 
 [bsp.kernel]
-source = { path = "../../../Scarlet/kernel" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "a63841fe85231042cb0f0b176412f10a07841a50" }
 features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = true }
 
 [modules]
@@ -62,17 +62,17 @@ output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "87df56b6156946fc6178e0fd0d71ba87d638bfcb" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3bd29101bd26c581195396804a3bbeea0d6c21e5" }
 subdir = "bundles/sgfx-native"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "87df56b6156946fc6178e0fd0d71ba87d638bfcb" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3bd29101bd26c581195396804a3bbeea0d6c21e5" }
 subdir = "bundles/base"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "87df56b6156946fc6178e0fd0d71ba87d638bfcb" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3bd29101bd26c581195396804a3bbeea0d6c21e5" }
 subdir = "bundles/cli-utils"
 
 # Kernel drivers use the global VFS, whose root remains the initramfs after
@@ -89,13 +89,12 @@ output = ".scarlet/images/rootfs-aarch64-coachz-full.ext2"
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "87df56b6156946fc6178e0fd0d71ba87d638bfcb" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3bd29101bd26c581195396804a3bbeea0d6c21e5" }
 subdir = "bundles/full"
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook", rev = "e8e72900ae8760fb0ccc7eddfd47bd206d4ec399" }
-subdir = "bundles/sgfx-adreno"
+path = "../../bundles/sgfx-adreno/bundle.toml"
 
 [[images.rootfs.layers]]
 kind = "copy"
