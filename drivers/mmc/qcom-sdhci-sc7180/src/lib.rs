@@ -2,11 +2,12 @@
 
 #![no_std]
 
-//! Qualcomm SC7180 glue for the v5 SDHCI eMMC controller.
+//! Qualcomm SC7180 glue for the v5 SDHCI eMMC and SD controllers.
 //!
 //! The generic Scarlet SDHCI implementation supplies the polling/PIO command
 //! engine. This crate handles the SC7180 platform binding, clocks, and the v5
 //! vendor-register initialization required before the generic host reset.
+//! SDCC1 is the soldered eMMC card; SDCC2 is the removable SD slot.
 
 extern crate alloc;
 
@@ -23,6 +24,7 @@ use scarlet::{
         Device,
         clk::ClkHandle,
         fdt::FdtManager,
+        gpio::GpioController,
         manager::{DeviceManager, DriverPriority, is_probe_defer, probe_defer},
         mmc::{MmcBusWidth, MmcCommand, MmcData, MmcError, MmcHost, MmcResponse, MmcResult},
         platform::{
@@ -31,14 +33,15 @@ use scarlet::{
         },
     },
     drivers::mmc::{
-        core::EmmcBlockDevice,
+        core::MmcBlockDevice,
         sdhci::{SdhciHost, SdhciHostConfig},
     },
     println, vm,
 };
 
 const DRIVER_NAME: &str = "qcom-sdhci-sc7180";
-const DEVICE_NAME: &str = "mmcblk0";
+const EMMC_DEVICE_NAME: &str = "mmcblk0";
+const SD_DEVICE_NAME: &str = "mmcblk1";
 const PREFERRED_CORE_CLOCK_HZ: u64 = 100_000_000;
 const CLOCK_NAMES: [&str; 3] = ["iface", "core", "xo"];
 
@@ -54,17 +57,31 @@ const SDHCI_SOFTWARE_RESET: usize = 0x2f;
 const SDHCI_INTERRUPT_STATUS: usize = 0x30;
 const SDHCI_HOST_CONTROL2: usize = 0x3e;
 
-/// Host wrapper retaining platform resources for the registered eMMC lifetime.
+struct CardDetect {
+    controller: Arc<dyn GpioController>,
+    pin: u32,
+    active_low: bool,
+}
+
+impl CardDetect {
+    fn present(&self) -> bool {
+        self.controller.get_value(self.pin) != self.active_low
+    }
+}
+
+/// Host wrapper retaining platform resources for the registered card lifetime.
 struct Sc7180SdhciHost {
     host: SdhciHost,
+    kind: MediaKind,
     mmio_base: usize,
-    cqhci_base: usize,
+    cqhci_base: Option<usize>,
     clocks: Vec<ClkHandle>,
     pwr_irq: u32,
     handoff_power_control: u8,
     handoff_power_requests: u32,
     inherited_host_control: u8,
     inherited_host_control2: u16,
+    card_detect: Option<CardDetect>,
 }
 
 impl Sc7180SdhciHost {
@@ -84,6 +101,13 @@ impl Sc7180SdhciHost {
     }
 
     fn log_failure(&self, operation: &str) {
+        let (cqhci_cfg, cqhci_ctl, cqhci_crypto) = self.cqhci_base.map_or((0, 0, 0), |base| {
+            (
+                read32(base, CQHCI_CFG),
+                read32(base, CQHCI_CTL),
+                read32(base, NONCQ_CRYPTO_PARM),
+            )
+        });
         println!(
             "[qcom-sdhci-sc7180] {} failed: reset={:#04x} clock={:#06x} host={:#04x}/{:#04x} host2={:#06x}/{:#06x} block={:#010x} arg={:#010x} xfer_cmd={:#010x} present={:#010x} irq={:#010x} sdhci_pwr={:#04x} pwr_irq={} pwr={:#x}/{:#x}/{:#x} cqhci={:#x}/{:#x}/{:#x} func4={:#x}",
             operation,
@@ -103,9 +127,9 @@ impl Sc7180SdhciHost {
             read32(self.mmio_base, CORE_PWRCTL_STATUS),
             read32(self.mmio_base, CORE_PWRCTL_MASK),
             read32(self.mmio_base, CORE_PWRCTL_CTL),
-            read32(self.cqhci_base, CQHCI_CFG),
-            read32(self.cqhci_base, CQHCI_CTL),
-            read32(self.cqhci_base, NONCQ_CRYPTO_PARM),
+            cqhci_cfg,
+            cqhci_ctl,
+            cqhci_crypto,
             read32(self.mmio_base, HC_VENDOR_SPECIFIC_FUNC4),
         );
     }
@@ -116,7 +140,9 @@ impl Drop for Sc7180SdhciHost {
         for clock in self.clocks.iter().rev() {
             clock.disable_unprepare();
         }
-        vm::iounmap(self.cqhci_base);
+        if let Some(cqhci_base) = self.cqhci_base {
+            vm::iounmap(cqhci_base);
+        }
         vm::iounmap(self.mmio_base);
     }
 }
@@ -124,12 +150,42 @@ impl Drop for Sc7180SdhciHost {
 impl MmcHost for Sc7180SdhciHost {
     fn reset(&mut self) -> MmcResult<()> {
         let result = self.host.reset();
-        let power_control = read8(self.mmio_base, SDHCI_POWER_CONTROL);
-        let power_requests = read32(self.mmio_base, CORE_PWRCTL_STATUS) & CORE_PWRCTL_REQUEST_MASK;
         if result.is_err() {
             self.log_failure("host reset");
         }
         result?;
+        if self.kind == MediaKind::Sd {
+            // Match U-Boot's SDCC DLL handling: leave the DLL untouched until
+            // the controller reset completes, then disable it for the legacy
+            // (<= 100 MHz) SD clock. Programming DLL reset/power-down before
+            // the host reset can keep SDCC5 stuck in software reset.
+            let dll_config = read32(self.mmio_base, CORE_DLL_CONFIG);
+            write32(self.mmio_base, CORE_DLL_CONFIG, dll_config | CORE_DLL_RST);
+            let dll_config = read32(self.mmio_base, CORE_DLL_CONFIG);
+            write32(self.mmio_base, CORE_DLL_CONFIG, dll_config | CORE_DLL_PDN);
+        }
+        let power_control = read8(self.mmio_base, SDHCI_POWER_CONTROL);
+        if self.kind == MediaKind::Sd {
+            let power_requests =
+                read32(self.mmio_base, CORE_PWRCTL_STATUS) & CORE_PWRCTL_REQUEST_MASK;
+            if power_requests == CORE_PWRCTL_BUS_ON && power_control & 1 != 0 {
+                if let Err(error) = service_satisfied_bus_on(self.mmio_base) {
+                    println!(
+                        "[qcom-sdhci-sc7180] SD BUS_ON service failed: {} pwr={:#x}/{:#x}/{:#x}",
+                        error,
+                        read32(self.mmio_base, CORE_PWRCTL_STATUS),
+                        read32(self.mmio_base, CORE_PWRCTL_MASK),
+                        read32(self.mmio_base, CORE_PWRCTL_CTL),
+                    );
+                }
+            }
+            println!(
+                "[qcom-sdhci-sc7180] SD power after reset: SDHCI={:#04x} request={:#x}",
+                power_control, power_requests
+            );
+            return Ok(());
+        }
+        let power_requests = read32(self.mmio_base, CORE_PWRCTL_STATUS) & CORE_PWRCTL_REQUEST_MASK;
         if power_control != self.handoff_power_control
             || power_requests != self.handoff_power_requests
         {
@@ -159,7 +215,9 @@ impl MmcHost for Sc7180SdhciHost {
     }
 
     fn card_present(&self) -> bool {
-        self.host.card_present()
+        self.card_detect
+            .as_ref()
+            .map_or_else(|| self.host.card_present(), CardDetect::present)
     }
 
     fn is_removable(&self) -> bool {
@@ -202,16 +260,38 @@ impl MmcHost for Sc7180SdhciHost {
     }
 }
 
-fn validate_emmc_node(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+fn classify_node(device: &PlatformDeviceInfo) -> Result<MediaKind, &'static str> {
     let non_removable = device.property("non-removable").is_some();
     let bus_width = device
         .property("bus-width")
         .and_then(|property| property.as_usize());
-    if accepts_emmc_properties(non_removable, bus_width) {
-        Ok(())
-    } else {
-        Err("qcom-sdhci-sc7180: only non-removable 8-bit eMMC is supported")
-    }
+    let has_card_detect = device.property("cd-gpios").is_some();
+    classify_media(non_removable, bus_width, has_card_detect).ok_or(
+        "qcom-sdhci-sc7180: expected non-removable 8-bit eMMC or removable 4-bit SD with cd-gpios",
+    )
+}
+
+fn resolve_card_detect(device: &PlatformDeviceInfo) -> Result<CardDetect, &'static str> {
+    let property = device
+        .property("cd-gpios")
+        .ok_or("qcom-sdhci-sc7180: cd-gpios is missing")?;
+    let (controller_phandle, pin, active_low) =
+        gpio_spec(property.value()).ok_or("qcom-sdhci-sc7180: malformed cd-gpios specifier")?;
+    let controller = DeviceManager::get_manager()
+        .get_gpio_controller(controller_phandle)
+        .ok_or_else(|| {
+            println!(
+                "[qcom-sdhci-sc7180] card-detect GPIO controller {:#x} is not ready, deferring",
+                controller_phandle
+            );
+            scarlet::device::manager::PROBE_DEFER
+        })?;
+    controller.set_direction_input(pin);
+    Ok(CardDetect {
+        controller,
+        pin,
+        active_low,
+    })
 }
 
 fn read_be_u32(value: &[u8]) -> Option<u32> {
@@ -281,6 +361,45 @@ fn resolve_named_memory<'a>(
         .filter(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
         .nth(index)
         .ok_or("qcom-sdhci-sc7180: named memory resource index is missing")
+}
+
+fn resolve_optional_named_memory<'a>(
+    device: &'a PlatformDeviceInfo,
+    name: &str,
+) -> Result<Option<&'a PlatformDeviceResource>, &'static str> {
+    let Some(names) = device.property("reg-names") else {
+        return Ok(None);
+    };
+    let Some(index) = string_list_index(names.value(), name) else {
+        return Ok(None);
+    };
+    Ok(device
+        .get_resources()
+        .iter()
+        .filter(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
+        .nth(index))
+}
+
+/// Resolve the controller aperture.
+///
+/// SDCC1 names its two windows (`hc`, `cqhci`), while SDCC2 has a single
+/// unnamed `reg`. Select by name when available, otherwise use that sole
+/// memory resource.
+fn resolve_primary_memory<'a>(
+    device: &'a PlatformDeviceInfo,
+) -> Result<&'a PlatformDeviceResource, &'static str> {
+    let memory: Vec<_> = device
+        .get_resources()
+        .iter()
+        .filter(|resource| resource.res_type == PlatformDeviceResourceType::MEM)
+        .collect();
+    let has_reg_names = device.property("reg-names").is_some();
+    let named_hc = device
+        .property("reg-names")
+        .and_then(|names| string_list_index(names.value(), "hc"));
+    let index = primary_memory_index(has_reg_names, named_hc, memory.len())
+        .ok_or("qcom-sdhci-sc7180: host memory window is missing or ambiguous")?;
+    Ok(memory[index])
 }
 
 fn resource_size(resource: &PlatformDeviceResource) -> Option<usize> {
@@ -420,25 +539,51 @@ fn service_satisfied_bus_on(mmio_base: usize) -> Result<(), &'static str> {
 }
 
 fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
-    validate_emmc_node(device)?;
+    let kind = classify_node(device)?;
+    let card_detect = if kind == MediaKind::Sd {
+        let detect = resolve_card_detect(device)?;
+        println!(
+            "[qcom-sdhci-sc7180] SD card detect GPIO{} active_low={} present={}",
+            detect.pin,
+            detect.active_low,
+            detect.present()
+        );
+        if !detect.present() {
+            println!(
+                "[qcom-sdhci-sc7180] no SD card present; skipping {}",
+                SD_DEVICE_NAME
+            );
+            return Ok(());
+        }
+        Some(detect)
+    } else {
+        None
+    };
+
+    let (vmmc_minimum_uv, vmmc_maximum_uv) = fixed_supply_voltage_uv(device, "vmmc-supply")?;
     let (vqmmc_minimum_uv, vqmmc_maximum_uv) = fixed_supply_voltage_uv(device, "vqmmc-supply")?;
-    let vendor_spec = vendor_spec_for_fixed_1v8_supply(
+    let (supply_minimum_uv, supply_maximum_uv) = match kind {
+        MediaKind::Emmc => (vqmmc_minimum_uv, vqmmc_maximum_uv),
+        MediaKind::Sd => (vmmc_minimum_uv, vmmc_maximum_uv),
+    };
+    let vendor_spec = vendor_spec_for_media(
+        kind,
         CORE_VENDOR_SPEC_POR_VAL,
-        vqmmc_minimum_uv,
-        vqmmc_maximum_uv,
+        supply_minimum_uv,
+        supply_maximum_uv,
     )
-    .ok_or("qcom-sdhci-sc7180: only fixed 1.8 V vqmmc is currently supported")?;
+    .ok_or(match kind {
+        MediaKind::Emmc => "qcom-sdhci-sc7180: only fixed 1.8 V vqmmc is currently supported",
+        MediaKind::Sd => "qcom-sdhci-sc7180: SD vmmc must cover 2.7 V through 3.6 V",
+    })?;
     // The active CoachZ DT orders `hc_irq` before `pwr_irq`; select by the
     // firmware name rather than accidentally taking the command IRQ.
     let pwr_irq = resolve_named_irq(device, "pwr_irq")?;
-    let hc_resource = resolve_named_memory(device, "hc")?;
-    let cqhci_resource = resolve_named_memory(device, "cqhci")?;
+    let hc_resource = resolve_primary_memory(device)?;
+    let cqhci_resource = resolve_optional_named_memory(device, "cqhci")?;
     let hc_size = resource_size(hc_resource)
         .filter(|size| *size >= REQUIRED_MMIO_SIZE)
         .ok_or("qcom-sdhci-sc7180: hc memory resource is too small")?;
-    let cqhci_size = resource_size(cqhci_resource)
-        .filter(|size| *size >= REQUIRED_CQHCI_MMIO_SIZE)
-        .ok_or("qcom-sdhci-sc7180: cqhci memory resource is too small")?;
 
     let (clocks, base_clock_hz) = resolve_and_enable_clocks(device)?;
     let mmio_base = match vm::ioremap(hc_resource.start, hc_size) {
@@ -472,80 +617,119 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let post_mask_power_status = read32(mmio_base, CORE_PWRCTL_STATUS);
     let pending_power_requests = post_mask_power_status & CORE_PWRCTL_REQUEST_MASK;
     let handoff_power_control = read8(mmio_base, SDHCI_POWER_CONTROL);
-    match handoff_power_action(pending_power_requests, handoff_power_control) {
-        HandoffPowerAction::None => {}
-        HandoffPowerAction::AcknowledgeBusOn => {
-            if let Err(error) = service_satisfied_bus_on(mmio_base) {
+    let handoff_power_requests = 0;
+    if kind == MediaKind::Emmc {
+        match handoff_power_action(pending_power_requests, handoff_power_control) {
+            HandoffPowerAction::None => {}
+            HandoffPowerAction::AcknowledgeBusOn => {
+                if let Err(error) = service_satisfied_bus_on(mmio_base) {
+                    println!(
+                        "[qcom-sdhci-sc7180] BUS_ON handoff service failed: {} pwr={:#x}/{:#x}/{:#x}",
+                        error,
+                        read32(mmio_base, CORE_PWRCTL_STATUS),
+                        read32(mmio_base, CORE_PWRCTL_MASK),
+                        read32(mmio_base, CORE_PWRCTL_CTL)
+                    );
+                    vm::iounmap(mmio_base);
+                    disable_clocks(&clocks);
+                    return Err(error);
+                }
                 println!(
-                    "[qcom-sdhci-sc7180] BUS_ON handoff service failed: {} pwr={:#x}/{:#x}/{:#x}",
-                    error,
-                    read32(mmio_base, CORE_PWRCTL_STATUS),
-                    read32(mmio_base, CORE_PWRCTL_MASK),
-                    read32(mmio_base, CORE_PWRCTL_CTL)
+                    "[qcom-sdhci-sc7180] serviced already-satisfied eMMC BUS_ON handoff with mask held at zero"
+                );
+            }
+            HandoffPowerAction::Reject => {
+                println!(
+                    "[qcom-sdhci-sc7180] unsafe eMMC power handoff rejected: SDHCI={:#04x} request={:#x} mask={:#x} ctl={:#x}",
+                    handoff_power_control,
+                    pending_power_requests,
+                    initial_power_mask,
+                    initial_power_control
                 );
                 vm::iounmap(mmio_base);
                 disable_clocks(&clocks);
-                return Err(error);
+                return Err("qcom-sdhci-sc7180: firmware power handoff is not safely reusable");
             }
-            println!(
-                "[qcom-sdhci-sc7180] serviced already-satisfied BUS_ON handoff with mask held at zero"
-            );
-        }
-        HandoffPowerAction::Reject => {
-            println!(
-                "[qcom-sdhci-sc7180] unsafe power handoff rejected: SDHCI={:#04x} request={:#x} mask={:#x} ctl={:#x}",
-                handoff_power_control,
-                pending_power_requests,
-                initial_power_mask,
-                initial_power_control
-            );
-            vm::iounmap(mmio_base);
-            disable_clocks(&clocks);
-            return Err("qcom-sdhci-sc7180: firmware power handoff is not safely reusable");
         }
     }
-    let handoff_power_requests = 0;
+
+    if kind == MediaKind::Sd {
+        println!(
+            "[qcom-sdhci-sc7180] SD pwr_irq masked; inherited SDHCI={:#04x} request={:#x} mask={:#x} ctl={:#x}",
+            handoff_power_control,
+            pending_power_requests,
+            initial_power_mask,
+            initial_power_control
+        );
+    }
 
     // Shut down any high-speed DLL state inherited from firmware before the
-    // generic host starts identification at 400 kHz and legacy transfer at
-    // 26 MHz. Qualcomm requires reset and power-down as separate RMW writes.
-    let dll_config = read32(mmio_base, CORE_DLL_CONFIG);
-    write32(mmio_base, CORE_DLL_CONFIG, dll_config | CORE_DLL_RST);
-    let dll_config = read32(mmio_base, CORE_DLL_CONFIG);
-    write32(mmio_base, CORE_DLL_CONFIG, dll_config | CORE_DLL_PDN);
+    // generic eMMC host starts identification. The SD path defers this until
+    // after the SDHCI reset, matching U-Boot's SDCC5 sequence.
+    if kind == MediaKind::Emmc {
+        let dll_config = read32(mmio_base, CORE_DLL_CONFIG);
+        write32(mmio_base, CORE_DLL_CONFIG, dll_config | CORE_DLL_RST);
+        let dll_config = read32(mmio_base, CORE_DLL_CONFIG);
+        write32(mmio_base, CORE_DLL_CONFIG, dll_config | CORE_DLL_PDN);
+    }
 
     // Restore the v5 vendor POR image, then select the pad voltage that
-    // matches the fixed 1.8 V VQMMC supply before the generic software reset.
-    // Do not enable CQE, DMA, or interrupt delivery here.
+    // matches eMMC's fixed 1.8 V VQMMC or the SD slot's 3.0 V VMMC before the
+    // generic software reset. Do not enable CQE, DMA, or interrupt delivery.
     write32(mmio_base, CORE_VENDOR_SPEC, vendor_spec);
     let configured_vendor_spec = read32(mmio_base, CORE_VENDOR_SPEC);
-    if configured_vendor_spec & CORE_IO_PAD_PWR_SWITCH_MASK != CORE_IO_PAD_PWR_SWITCH_MASK {
+    let pads_selected = match kind {
+        MediaKind::Emmc => {
+            configured_vendor_spec & CORE_IO_PAD_PWR_SWITCH_MASK == CORE_IO_PAD_PWR_SWITCH_MASK
+        }
+        MediaKind::Sd => configured_vendor_spec & CORE_IO_PAD_PWR_SWITCH_MASK == 0,
+    };
+    if !pads_selected {
         vm::iounmap(mmio_base);
         disable_clocks(&clocks);
-        return Err("qcom-sdhci-sc7180: failed to select 1.8 V I/O pads");
+        return Err("qcom-sdhci-sc7180: failed to select the media I/O pad voltage");
     }
-    let cqhci_base = match vm::ioremap(cqhci_resource.start, cqhci_size) {
-        Ok(base) => base,
-        Err(_) => {
+    let cqhci_base = if kind == MediaKind::Emmc {
+        let resource =
+            cqhci_resource.ok_or("qcom-sdhci-sc7180: cqhci memory resource is missing")?;
+        let size = resource_size(resource)
+            .filter(|size| *size >= REQUIRED_CQHCI_MMIO_SIZE)
+            .ok_or("qcom-sdhci-sc7180: cqhci memory resource is too small")?;
+        Some(match vm::ioremap(resource.start, size) {
+            Ok(base) => base,
+            Err(_) => {
+                vm::iounmap(mmio_base);
+                disable_clocks(&clocks);
+                return Err("qcom-sdhci-sc7180: failed to map cqhci memory resource");
+            }
+        })
+    } else {
+        None
+    };
+    if let Some(cqhci_base) = cqhci_base {
+        if let Err(error) = isolate_legacy_pio(mmio_base, cqhci_base) {
+            vm::iounmap(cqhci_base);
             vm::iounmap(mmio_base);
             disable_clocks(&clocks);
-            return Err("qcom-sdhci-sc7180: failed to map cqhci memory resource");
+            return Err(error);
         }
-    };
-    if let Err(error) = isolate_legacy_pio(mmio_base, cqhci_base) {
-        vm::iounmap(cqhci_base);
-        vm::iounmap(mmio_base);
-        disable_clocks(&clocks);
-        return Err(error);
     }
     let inherited_host_control = read8(mmio_base, SDHCI_HOST_CONTROL);
     let inherited_host_control2 = read16(mmio_base, SDHCI_HOST_CONTROL2);
     let version = read32(mmio_base, CORE_MCI_VERSION);
+    let media = match kind {
+        MediaKind::Emmc => "eMMC",
+        MediaKind::Sd => "SD",
+    };
     println!(
-        "[qcom-sdhci-sc7180] SDCC v5 version={:#010x}, core={} Hz, vqmmc={} uV vendor={:#010x}, inherited_host={:#04x} inherited_host2={:#06x}, pwr_irq={} masked, handoff SDHCI={:#04x} pwr={:#x}/{:#x}/{:#x}",
+        "[qcom-sdhci-sc7180] {} SDCC v5 version={:#010x}, core={} Hz, vmmc={}..{} uV vqmmc={}..{} uV vendor={:#010x}, inherited_host={:#04x} inherited_host2={:#06x}, pwr_irq={} masked, handoff SDHCI={:#04x} pwr={:#x}/{:#x}/{:#x}",
+        media,
         version,
         base_clock_hz,
+        vmmc_minimum_uv,
+        vmmc_maximum_uv,
         vqmmc_minimum_uv,
+        vqmmc_maximum_uv,
         configured_vendor_spec,
         inherited_host_control,
         inherited_host_control2,
@@ -559,14 +743,20 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let host = Sc7180SdhciHost {
         host: SdhciHost::new_with_base_clock_and_config(
             mmio_base,
-            true,
+            kind == MediaKind::Emmc,
             base_clock_hz,
             SdhciHostConfig {
                 single_power_write: true,
+                // Firmware leaves both SDCC rails powered (SDHCI=0x0d). The
+                // SDCC5 reset-all path does not clear on this controller, so
+                // preserve the validated power state and reset only the
+                // command/data state machines, as the eMMC path already does.
                 preserve_power_control: true,
+                external_card_detect: kind == MediaKind::Sd,
                 ..SdhciHostConfig::default()
             },
         ),
+        kind,
         mmio_base,
         cqhci_base,
         clocks,
@@ -575,21 +765,40 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         handoff_power_requests,
         inherited_host_control,
         inherited_host_control2,
+        card_detect,
     };
-    let block_device =
-        EmmcBlockDevice::probe_with_bus_width(DEVICE_NAME, Box::new(host), MmcBusWidth::Eight)
-            .map_err(|error| {
-                println!(
-                    "[qcom-sdhci-sc7180] failed to identify {}: {}",
-                    DEVICE_NAME,
-                    error.as_str()
-                );
-                error.as_str()
-            })?;
+    let name = match kind {
+        MediaKind::Emmc => EMMC_DEVICE_NAME,
+        MediaKind::Sd => SD_DEVICE_NAME,
+    };
+    let block_device = match kind {
+        MediaKind::Emmc => {
+            MmcBlockDevice::probe_with_bus_width(name, Box::new(host), MmcBusWidth::Eight)
+        }
+        MediaKind::Sd => MmcBlockDevice::probe_sd(name, Box::new(host), MmcBusWidth::Four),
+    }
+    .map_err(|error| {
+        println!(
+            "[qcom-sdhci-sc7180] failed to identify {}: {}",
+            name,
+            error.as_str()
+        );
+        error.as_str()
+    })?;
+
+    let card = block_device.card_info();
+    println!(
+        "[qcom-sdhci-sc7180] {}: {} sectors ({} MiB), kind {:?}, media generation {}",
+        name,
+        card.sector_count(),
+        card.sector_count().saturating_mul(512) / (1024 * 1024),
+        card.kind(),
+        block_device.media_generation()
+    );
 
     let registered: Arc<dyn Device> = Arc::new(block_device);
-    DeviceManager::get_manager().register_device_with_name(String::from(DEVICE_NAME), registered);
-    println!("[qcom-sdhci-sc7180] registered {}", DEVICE_NAME);
+    DeviceManager::get_manager().register_device_with_name(String::from(name), registered);
+    println!("[qcom-sdhci-sc7180] registered {}", name);
     Ok(())
 }
 
@@ -598,7 +807,12 @@ fn remove(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 }
 
 fn register_driver() {
-    let driver = PlatformDeviceDriver::new(DRIVER_NAME, probe, remove, vec!["qcom,sc7180-sdhci"]);
+    let driver = PlatformDeviceDriver::new(
+        DRIVER_NAME,
+        probe,
+        remove,
+        vec!["qcom,sc7180-sdhci", "qcom,sdhci-msm-v5"],
+    );
     DeviceManager::get_manager().register_driver(Box::new(driver), DriverPriority::Standard);
 }
 

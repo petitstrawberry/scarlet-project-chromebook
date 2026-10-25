@@ -49,11 +49,14 @@ const GCC_USB30_PRIM_GDSCR: usize = 0x0f004;
 const GCC_USB30_PRIM_MASTER_CMD_RCGR: usize = 0x0f01c;
 const GCC_USB30_PRIM_MOCK_UTMI_CMD_RCGR: usize = 0x0f034;
 const GCC_USB3_PRIM_PHY_AUX_CMD_RCGR: usize = 0x0f060;
-// SDCC1 is the CoachZ eMMC controller.  These are branch and RCG offsets
-// from Linux's gcc-sc7180.c.
+// SDCC1 is the CoachZ eMMC controller and SDCC2 is its removable SD slot.
+// These are branch and RCG offsets from Linux's gcc-sc7180.c.
 const GCC_SDCC1_AHB_BRANCH: usize = 0x12008;
 const GCC_SDCC1_APPS_BRANCH: usize = 0x1200c;
 const GCC_SDCC1_APPS_CMD_RCGR: usize = 0x12028;
+const GCC_SDCC2_AHB_BRANCH: usize = 0x14008;
+const GCC_SDCC2_APPS_BRANCH: usize = 0x14004;
+const GCC_SDCC2_APPS_CMD_RCGR: usize = 0x1400c;
 
 const GCC_AGGRE_USB3_PRIM_AXI_CLK: u32 = 8;
 const GCC_CFG_NOC_USB3_PRIM_AXI_CLK: u32 = 17;
@@ -69,6 +72,8 @@ const GCC_QUPV3_WRAP0_S4_CLK: u32 = 66;
 const GCC_QUPV3_WRAP1_S1_CLK: u32 = 74;
 const GCC_SDCC1_AHB_CLK: u32 = 88;
 const GCC_SDCC1_APPS_CLK: u32 = 89;
+const GCC_SDCC2_AHB_CLK: u32 = 93;
+const GCC_SDCC2_APPS_CLK: u32 = 94;
 const GCC_LPASS_CFG_NOC_SWAY_CLK: u32 = 131;
 
 const LPASS_CFG_CLOCK: SimpleClockDescriptor = SimpleClockDescriptor {
@@ -201,8 +206,8 @@ const USB_MASTER_ASSIGNED_RATE: u64 = 150_000_000;
 const USB_MASTER_RATE: u64 = 200_000_000;
 const USB_MOCK_UTMI_RATE: u64 = 19_200_000;
 const QUP_SERIAL_RATE: u64 = 19_200_000;
-const SDCC1_AHB_RATE: u64 = 19_200_000;
-const SDCC1_APPS_DEFAULT_RATE: u64 = 400_000;
+const SDCC_AHB_RATE: u64 = 19_200_000;
+const SDCC_APPS_DEFAULT_RATE: u64 = 400_000;
 
 static GCC_BASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -346,11 +351,7 @@ fn prepare_display_clocks(registers: RegisterWindow) -> Result<(), &'static str>
 
     println!(
         "[qcom-sc7180-gcc] handoff inherited: vote={:#010x} disp-ahb={:#010x} hf-axi={:#010x} xo={:#010x} gpu-cfg-ahb={:#010x}",
-        inherited_vote,
-        inherited_ahb,
-        inherited_hf_axi,
-        inherited_xo,
-        inherited_gpu_cfg_ahb,
+        inherited_vote, inherited_ahb, inherited_hf_axi, inherited_xo, inherited_gpu_cfg_ahb,
     );
     println!(
         "[qcom-sc7180-gcc] GPU MISC ready: {:#010x}->{:#010x}",
@@ -561,7 +562,7 @@ impl Clk for Sc7180UsbClock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Sdcc1AppsRate {
+struct SdccAppsRate {
     rate: u64,
     source: u32,
     hid_divider: u32,
@@ -571,64 +572,64 @@ struct Sdcc1AppsRate {
 
 // This is Linux 6.6's ftbl_gcc_sdcc1_apps_clk_src table.  `hid_divider` is
 // the hardware encoding (2 * pre-divider - 1), not the arithmetic divisor.
-const SDCC1_APPS_RATES: [Sdcc1AppsRate; 9] = [
-    Sdcc1AppsRate {
+const SDCC1_APPS_RATES: [SdccAppsRate; 9] = [
+    SdccAppsRate {
         rate: 144_000,
         source: 0, // BI_TCXO
         hid_divider: 31,
         m: 3,
         n: 25,
     },
-    Sdcc1AppsRate {
+    SdccAppsRate {
         rate: 400_000,
         source: 0, // BI_TCXO
         hid_divider: 23,
         m: 1,
         n: 4,
     },
-    Sdcc1AppsRate {
+    SdccAppsRate {
         rate: 19_200_000,
         source: 0, // BI_TCXO
         hid_divider: 1,
         m: 0,
         n: 0,
     },
-    Sdcc1AppsRate {
+    SdccAppsRate {
         rate: 20_000_000,
         source: 6, // GPLL0_OUT_EVEN
         hid_divider: 9,
         m: 1,
         n: 3,
     },
-    Sdcc1AppsRate {
+    SdccAppsRate {
         rate: 25_000_000,
         source: 6, // GPLL0_OUT_EVEN
         hid_divider: 11,
         m: 1,
         n: 2,
     },
-    Sdcc1AppsRate {
+    SdccAppsRate {
         rate: 50_000_000,
         source: 6, // GPLL0_OUT_EVEN
         hid_divider: 11,
         m: 0,
         n: 0,
     },
-    Sdcc1AppsRate {
+    SdccAppsRate {
         rate: 100_000_000,
         source: 6, // GPLL0_OUT_EVEN
         hid_divider: 5,
         m: 0,
         n: 0,
     },
-    Sdcc1AppsRate {
+    SdccAppsRate {
         rate: 192_000_000,
         source: 2, // GPLL6_OUT_MAIN
         hid_divider: 3,
         m: 0,
         n: 0,
     },
-    Sdcc1AppsRate {
+    SdccAppsRate {
         rate: 384_000_000,
         source: 2, // GPLL6_OUT_MAIN
         hid_divider: 1,
@@ -637,10 +638,87 @@ const SDCC1_APPS_RATES: [Sdcc1AppsRate; 9] = [
     },
 ];
 
-fn sdcc1_apps_rate_for_request(rate: u64) -> Result<Sdcc1AppsRate, ClkError> {
-    // gcc_sdcc1_apps_clk_src uses clk_rcg2_floor_ops: a 26 MHz request, for
-    // example, selects the 25 MHz table entry instead of overclocking eMMC.
-    SDCC1_APPS_RATES
+// Linux 6.6's ftbl_gcc_sdcc2_apps_clk_src table. The SDCC2 parent map selects
+// GPLL7_OUT_MAIN (source 3) for 202 MHz and GPLL0_OUT_EVEN (source 6) below it.
+const SDCC2_APPS_RATES: [SdccAppsRate; 7] = [
+    SdccAppsRate {
+        rate: 400_000,
+        source: 0, // BI_TCXO
+        hid_divider: 23,
+        m: 1,
+        n: 4,
+    },
+    SdccAppsRate {
+        rate: 9_600_000,
+        source: 0, // BI_TCXO
+        hid_divider: 3,
+        m: 0,
+        n: 0,
+    },
+    SdccAppsRate {
+        rate: 19_200_000,
+        source: 0, // BI_TCXO
+        hid_divider: 1,
+        m: 0,
+        n: 0,
+    },
+    SdccAppsRate {
+        rate: 25_000_000,
+        source: 6, // GPLL0_OUT_EVEN
+        hid_divider: 23,
+        m: 0,
+        n: 0,
+    },
+    SdccAppsRate {
+        rate: 50_000_000,
+        source: 6, // GPLL0_OUT_EVEN
+        hid_divider: 11,
+        m: 0,
+        n: 0,
+    },
+    SdccAppsRate {
+        rate: 100_000_000,
+        source: 6, // GPLL0_OUT_EVEN
+        hid_divider: 5,
+        m: 0,
+        n: 0,
+    },
+    SdccAppsRate {
+        rate: 202_000_000,
+        source: 3, // GPLL7_OUT_MAIN
+        hid_divider: 7,
+        m: 0,
+        n: 0,
+    },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SdccGroup {
+    Sdcc1,
+    Sdcc2,
+}
+
+impl SdccGroup {
+    const fn apps_rates(self) -> &'static [SdccAppsRate] {
+        match self {
+            Self::Sdcc1 => &SDCC1_APPS_RATES,
+            Self::Sdcc2 => &SDCC2_APPS_RATES,
+        }
+    }
+
+    const fn apps_cmd_rcgr(self) -> usize {
+        match self {
+            Self::Sdcc1 => GCC_SDCC1_APPS_CMD_RCGR,
+            Self::Sdcc2 => GCC_SDCC2_APPS_CMD_RCGR,
+        }
+    }
+}
+
+fn sdcc_apps_rate_for_request(group: SdccGroup, rate: u64) -> Result<SdccAppsRate, ClkError> {
+    // Both sources use clk_rcg2_floor_ops: a 26 MHz request, for example,
+    // selects the 25 MHz table entry instead of overclocking the card.
+    group
+        .apps_rates()
         .iter()
         .rev()
         .find(|entry| entry.rate <= rate)
@@ -660,76 +738,93 @@ fn rcg_mnd_register_values(m: u32, n: u32) -> Result<(u32, u32, u32), ClkError> 
     Ok((m, !n_minus_m & RCG_MND_MASK, !d & RCG_MND_MASK))
 }
 
-fn configure_sdcc1_apps_rcg(
+fn configure_sdcc_apps_rcg(
     registers: RegisterWindow,
-    entry: Sdcc1AppsRate,
+    group: SdccGroup,
+    entry: SdccAppsRate,
 ) -> Result<(), ClkError> {
+    let command = group.apps_cmd_rcgr();
     let mode = if entry.n == 0 {
         0
     } else {
         let (m, n, d) = rcg_mnd_register_values(entry.m, entry.n)?;
-        registers.update_bits(GCC_SDCC1_APPS_CMD_RCGR + RCG_M_OFFSET, RCG_MND_MASK, m);
-        registers.update_bits(GCC_SDCC1_APPS_CMD_RCGR + RCG_N_OFFSET, RCG_MND_MASK, n);
-        registers.update_bits(GCC_SDCC1_APPS_CMD_RCGR + RCG_D_OFFSET, RCG_MND_MASK, d);
+        registers.update_bits(command + RCG_M_OFFSET, RCG_MND_MASK, m);
+        registers.update_bits(command + RCG_N_OFFSET, RCG_MND_MASK, n);
+        registers.update_bits(command + RCG_D_OFFSET, RCG_MND_MASK, d);
         RCG_MODE_DUAL_EDGE
     };
 
-    configure_rcg_with_mode(
-        registers,
-        GCC_SDCC1_APPS_CMD_RCGR,
-        entry.source,
-        entry.hid_divider,
-        mode,
-    )
+    configure_rcg_with_mode(registers, command, entry.source, entry.hid_divider, mode)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Sdcc1ClockKind {
+enum SdccClockKind {
     Ahb,
     Apps,
 }
 
 #[derive(Clone, Copy)]
-struct Sdcc1ClockDescriptor {
+struct SdccClockDescriptor {
     id: u32,
     name: &'static str,
     branch: usize,
-    kind: Sdcc1ClockKind,
+    kind: SdccClockKind,
+    group: SdccGroup,
 }
 
-const SDCC1_CLOCKS: [Sdcc1ClockDescriptor; 2] = [
-    Sdcc1ClockDescriptor {
+const SDCC1_CLOCKS: [SdccClockDescriptor; 2] = [
+    SdccClockDescriptor {
         id: GCC_SDCC1_AHB_CLK,
         name: "gcc_sdcc1_ahb_clk",
         branch: GCC_SDCC1_AHB_BRANCH,
-        kind: Sdcc1ClockKind::Ahb,
+        kind: SdccClockKind::Ahb,
+        group: SdccGroup::Sdcc1,
     },
-    Sdcc1ClockDescriptor {
+    SdccClockDescriptor {
         id: GCC_SDCC1_APPS_CLK,
         name: "gcc_sdcc1_apps_clk",
         branch: GCC_SDCC1_APPS_BRANCH,
-        kind: Sdcc1ClockKind::Apps,
+        kind: SdccClockKind::Apps,
+        group: SdccGroup::Sdcc1,
     },
 ];
 
-struct Sc7180Sdcc1Clock {
+const SDCC2_CLOCKS: [SdccClockDescriptor; 2] = [
+    SdccClockDescriptor {
+        id: GCC_SDCC2_AHB_CLK,
+        name: "gcc_sdcc2_ahb_clk",
+        branch: GCC_SDCC2_AHB_BRANCH,
+        kind: SdccClockKind::Ahb,
+        group: SdccGroup::Sdcc2,
+    },
+    SdccClockDescriptor {
+        id: GCC_SDCC2_APPS_CLK,
+        name: "gcc_sdcc2_apps_clk",
+        branch: GCC_SDCC2_APPS_BRANCH,
+        kind: SdccClockKind::Apps,
+        group: SdccGroup::Sdcc2,
+    },
+];
+
+struct Sc7180SdccClock {
     registers: RegisterWindow,
-    descriptor: Sdcc1ClockDescriptor,
+    descriptor: SdccClockDescriptor,
     apps_rate: Arc<AtomicU64>,
 }
 
-impl Clk for Sc7180Sdcc1Clock {
+impl Clk for Sc7180SdccClock {
     fn name(&self) -> &'static str {
         self.descriptor.name
     }
 
     fn enable(&self) -> Result<(), ClkError> {
-        if self.descriptor.kind == Sdcc1ClockKind::Apps {
-            // The eMMC source is owned here, rather than inherited from
-            // U-Boot's incomplete SDCC1 rate setup.  A 400 kHz default is
-            // safe for controller discovery when no consumer chose a rate.
-            let entry = sdcc1_apps_rate_for_request(self.apps_rate.load(Ordering::Relaxed))?;
-            configure_sdcc1_apps_rcg(self.registers, entry)?;
+        if self.descriptor.kind == SdccClockKind::Apps {
+            // Both card-clock sources are owned here rather than inherited
+            // from U-Boot's incomplete SDCC setup. A 400 kHz default is safe
+            // for controller discovery when no consumer chose a rate.
+            let rate = self.apps_rate.load(Ordering::Relaxed);
+            let entry = sdcc_apps_rate_for_request(self.descriptor.group, rate)?;
+            configure_sdcc_apps_rcg(self.registers, self.descriptor.group, entry)?;
         }
         enable_branch(self.registers, self.descriptor.branch, true)
     }
@@ -746,25 +841,27 @@ impl Clk for Sc7180Sdcc1Clock {
 
     fn recalc_rate(&self, _parent_rate: u64) -> u64 {
         match self.descriptor.kind {
-            Sdcc1ClockKind::Ahb => SDCC1_AHB_RATE,
-            Sdcc1ClockKind::Apps => self.apps_rate.load(Ordering::Relaxed),
+            SdccClockKind::Ahb => SDCC_AHB_RATE,
+            SdccClockKind::Apps => self.apps_rate.load(Ordering::Relaxed),
         }
     }
 
     fn round_rate(&self, rate: u64, _parent_rate: u64) -> Result<u64, ClkError> {
         match self.descriptor.kind {
-            Sdcc1ClockKind::Ahb if rate == SDCC1_AHB_RATE => Ok(rate),
-            Sdcc1ClockKind::Apps => sdcc1_apps_rate_for_request(rate).map(|entry| entry.rate),
+            SdccClockKind::Ahb if rate == SDCC_AHB_RATE => Ok(rate),
+            SdccClockKind::Apps => {
+                sdcc_apps_rate_for_request(self.descriptor.group, rate).map(|entry| entry.rate)
+            }
             _ => Err(ClkError::InvalidRate),
         }
     }
 
     fn set_rate(&self, rate: u64, _parent_rate: u64) -> Result<u64, ClkError> {
         match self.descriptor.kind {
-            Sdcc1ClockKind::Ahb => self.round_rate(rate, 0),
-            Sdcc1ClockKind::Apps => {
-                let entry = sdcc1_apps_rate_for_request(rate)?;
-                configure_sdcc1_apps_rcg(self.registers, entry)?;
+            SdccClockKind::Ahb => self.round_rate(rate, 0),
+            SdccClockKind::Apps => {
+                let entry = sdcc_apps_rate_for_request(self.descriptor.group, rate)?;
+                configure_sdcc_apps_rcg(self.registers, self.descriptor.group, entry)?;
                 self.apps_rate.store(entry.rate, Ordering::Relaxed);
                 Ok(entry.rate)
             }
@@ -776,6 +873,7 @@ struct Sc7180GccProvider {
     gpll0_out_main: ClkHandle,
     clocks: [ClkHandle; USB_CLOCKS.len()],
     sdcc1_clocks: [ClkHandle; SDCC1_CLOCKS.len()],
+    sdcc2_clocks: [ClkHandle; SDCC2_CLOCKS.len()],
     qup_serial_clocks: [ClkHandle; QUP_SERIAL_CLOCKS.len()],
     lpass_cfg_clock: ClkHandle,
     gpu_clocks: [ClkHandle; GPU_CLOCKS.len()],
@@ -793,12 +891,20 @@ impl Sc7180GccProvider {
                 mock_utmi_rate: Arc::clone(&mock_utmi_rate),
             }))
         });
-        let sdcc1_apps_rate = Arc::new(AtomicU64::new(SDCC1_APPS_DEFAULT_RATE));
+        let sdcc1_apps_rate = Arc::new(AtomicU64::new(SDCC_APPS_DEFAULT_RATE));
         let sdcc1_clocks = core::array::from_fn(|index| {
-            ClkHandle::new(Arc::new(Sc7180Sdcc1Clock {
+            ClkHandle::new(Arc::new(Sc7180SdccClock {
                 registers,
                 descriptor: SDCC1_CLOCKS[index],
                 apps_rate: Arc::clone(&sdcc1_apps_rate),
+            }))
+        });
+        let sdcc2_apps_rate = Arc::new(AtomicU64::new(SDCC_APPS_DEFAULT_RATE));
+        let sdcc2_clocks = core::array::from_fn(|index| {
+            ClkHandle::new(Arc::new(Sc7180SdccClock {
+                registers,
+                descriptor: SDCC2_CLOCKS[index],
+                apps_rate: Arc::clone(&sdcc2_apps_rate),
             }))
         });
         let qup_serial_clocks = core::array::from_fn(|index| {
@@ -821,6 +927,7 @@ impl Sc7180GccProvider {
             gpll0_out_main: ClkHandle::new(Arc::new(Sc7180Gpll0MainClock)),
             clocks,
             sdcc1_clocks,
+            sdcc2_clocks,
             qup_serial_clocks,
             lpass_cfg_clock,
             gpu_clocks,
@@ -999,6 +1106,9 @@ impl ClkProvider for Sc7180GccProvider {
         }
         if let Some(index) = SDCC1_CLOCKS.iter().position(|clock| clock.id == *id) {
             return Ok(self.sdcc1_clocks[index].clone());
+        }
+        if let Some(index) = SDCC2_CLOCKS.iter().position(|clock| clock.id == *id) {
+            return Ok(self.sdcc2_clocks[index].clone());
         }
         USB_CLOCKS
             .iter()
@@ -1185,7 +1295,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     GCC_BASE.store(base, Ordering::Release);
 
     println!(
-        "[qcom-sc7180-gcc] registered display/USB/SDCC1/QUP clocks and USB resets for phandle {:#x}",
+        "[qcom-sc7180-gcc] registered display/USB/SDCC1/SDCC2/QUP clocks and USB resets for phandle {:#x}",
         phandle
     );
     Ok(())
@@ -1241,10 +1351,26 @@ mod tests {
     }
 
     #[test]
+    fn sdcc2_clock_ids_and_registers_match_sc7180_bindings() {
+        assert_eq!(GCC_SDCC2_AHB_CLK, 93);
+        assert_eq!(GCC_SDCC2_APPS_CLK, 94);
+        assert_eq!(GCC_SDCC2_AHB_BRANCH, 0x14008);
+        assert_eq!(GCC_SDCC2_APPS_BRANCH, 0x14004);
+        assert_eq!(GCC_SDCC2_APPS_CMD_RCGR, 0x1400c);
+        assert_eq!(
+            SDCC2_CLOCKS.map(|clock| (clock.id, clock.name, clock.branch)),
+            [
+                (93, "gcc_sdcc2_ahb_clk", 0x14008),
+                (94, "gcc_sdcc2_apps_clk", 0x14004),
+            ]
+        );
+    }
+
+    #[test]
     fn sdcc1_apps_rate_requests_follow_linux_floor_table() {
         assert_eq!(
-            sdcc1_apps_rate_for_request(400_000),
-            Ok(Sdcc1AppsRate {
+            sdcc_apps_rate_for_request(SdccGroup::Sdcc1, 400_000),
+            Ok(SdccAppsRate {
                 rate: 400_000,
                 source: 0,
                 hid_divider: 23,
@@ -1253,16 +1379,42 @@ mod tests {
             })
         );
         assert_eq!(
-            sdcc1_apps_rate_for_request(26_000_000).map(|entry| entry.rate),
+            sdcc_apps_rate_for_request(SdccGroup::Sdcc1, 26_000_000).map(|entry| entry.rate),
             Ok(25_000_000)
         );
         assert_eq!(
-            sdcc1_apps_rate_for_request(200_000_000).map(|entry| entry.rate),
+            sdcc_apps_rate_for_request(SdccGroup::Sdcc1, 200_000_000).map(|entry| entry.rate),
             Ok(192_000_000)
         );
         assert_eq!(
-            sdcc1_apps_rate_for_request(100_000),
+            sdcc_apps_rate_for_request(SdccGroup::Sdcc1, 100_000),
             Err(ClkError::InvalidRate)
+        );
+    }
+
+    #[test]
+    fn sdcc2_apps_rate_requests_follow_linux_floor_table() {
+        assert_eq!(
+            sdcc_apps_rate_for_request(SdccGroup::Sdcc2, 400_000),
+            Ok(SdccAppsRate {
+                rate: 400_000,
+                source: 0,
+                hid_divider: 23,
+                m: 1,
+                n: 4,
+            })
+        );
+        assert_eq!(
+            sdcc_apps_rate_for_request(SdccGroup::Sdcc2, 26_000_000).map(|entry| entry.rate),
+            Ok(25_000_000)
+        );
+        assert_eq!(
+            sdcc_apps_rate_for_request(SdccGroup::Sdcc2, 200_000_000).map(|entry| entry.rate),
+            Ok(100_000_000)
+        );
+        assert_eq!(
+            sdcc_apps_rate_for_request(SdccGroup::Sdcc2, 203_000_000).map(|entry| entry.rate),
+            Ok(202_000_000)
         );
     }
 

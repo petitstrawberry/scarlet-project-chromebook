@@ -42,10 +42,11 @@ use scarlet::{
 const PIN_COUNT: usize = 119;
 const PIN_STRIDE: usize = 0x1000;
 
-// The SDC1 pad controls are not GPIO groups.  U-Boot's SC7180 table places
-// their shared register at 0x7a000 relative to the west TLMM tile (the first
-// `reg` entry in the DT's west/north/south resource order).
+// The SDC pad controls are not GPIO groups. U-Boot's SC7180 table places the
+// SDC1 and SDC2 shared registers at 0x7a000 and 0x7b000 relative to the west
+// TLMM tile (the first `reg` entry in the west/north/south resource order).
 const SDC1_CONFIG: usize = 0x7a000;
+const SDC2_CONFIG: usize = 0x7b000;
 const SDC_PULL_MASK: u32 = 0x3;
 const SDC_DRIVE_STRENGTH_MASK: u32 = 0x7;
 
@@ -100,22 +101,25 @@ use Tile::{North, South, West};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PinctrlPin {
     Gpio(u32),
-    Sdc1(Sdc1Pin),
+    Sdc1(SdcPin),
+    Sdc2(SdcPin),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Sdc1Pin {
+enum SdcPin {
     Rclk,
-    Clk,
+    Clk1,
+    Clk2,
     Cmd,
     Data,
 }
 
-impl Sdc1Pin {
+impl SdcPin {
     fn pull_shift(self) -> u32 {
         match self {
             Self::Rclk => 15,
-            Self::Clk => 13,
+            Self::Clk1 => 13,
+            Self::Clk2 => 14,
             Self::Cmd => 11,
             Self::Data => 9,
         }
@@ -124,7 +128,7 @@ impl Sdc1Pin {
     fn drive_strength_shift(self) -> u32 {
         match self {
             Self::Rclk | Self::Data => 0,
-            Self::Clk => 6,
+            Self::Clk1 | Self::Clk2 => 6,
             Self::Cmd => 3,
         }
     }
@@ -148,7 +152,7 @@ const PIN_TILES: [Tile; PIN_COUNT] = [
 pub struct Sc7180Tlmm {
     tiles: [usize; 3],
     summary_irq: InterruptId,
-    sdc1_update_lock: IrqSpinLock<()>,
+    sdc_update_lock: IrqSpinLock<()>,
     irq_handlers: IrqSpinLock<Vec<GpioIrqSlot>>,
 }
 
@@ -157,7 +161,7 @@ impl Sc7180Tlmm {
         Self {
             tiles,
             summary_irq,
-            sdc1_update_lock: IrqSpinLock::new(()),
+            sdc_update_lock: IrqSpinLock::new(()),
             irq_handlers: IrqSpinLock::new(
                 (0..PIN_COUNT)
                     .map(|_| GpioIrqSlot {
@@ -205,21 +209,21 @@ impl Sc7180Tlmm {
         (value & !clear) | set
     }
 
-    fn sdc1_config_register(tiles: &[usize; 3]) -> Option<usize> {
-        tiles[West as usize].checked_add(SDC1_CONFIG)
+    fn sdc_config_register(tiles: &[usize; 3], offset: usize) -> Option<usize> {
+        tiles[West as usize].checked_add(offset)
     }
 
-    fn update_sdc1(&self, clear: u32, set: u32) {
-        let Some(register) = Self::sdc1_config_register(&self.tiles) else {
+    fn update_sdc(&self, offset: usize, clear: u32, set: u32) {
+        let Some(register) = Self::sdc_config_register(&self.tiles, offset) else {
             return;
         };
-        // All SDC1 pads share this register. Keep the complete read-modify-
+        // All pads in one SDC group share a register. Keep the read-modify-
         // write sequence atomic with respect to sibling pad configuration.
-        let _guard = self.sdc1_update_lock.lock();
+        let _guard = self.sdc_update_lock.lock();
         // SAFETY: the west tile is the first mapped SC7180 TLMM resource and
-        // SDC1_CONFIG lies within its DT-declared 0x300000-byte window.
+        // both SDC registers lie within its DT-declared window.
         let value = unsafe { mmio::read32(register) };
-        // SAFETY: as above; this only modifies SDC1 pull or drive fields.
+        // SAFETY: as above; this only modifies SDC pull or drive fields.
         unsafe { mmio::write32(register, Self::updated_register_value(value, clear, set)) };
     }
 
@@ -250,14 +254,24 @@ impl Sc7180Tlmm {
 
     fn named_pin(pin: &str) -> Option<PinctrlPin> {
         let sdc1 = match pin {
-            "sdc1_rclk" => Some(Sdc1Pin::Rclk),
-            "sdc1_clk" => Some(Sdc1Pin::Clk),
-            "sdc1_cmd" => Some(Sdc1Pin::Cmd),
-            "sdc1_data" => Some(Sdc1Pin::Data),
+            "sdc1_rclk" => Some(SdcPin::Rclk),
+            "sdc1_clk" => Some(SdcPin::Clk1),
+            "sdc1_cmd" => Some(SdcPin::Cmd),
+            "sdc1_data" => Some(SdcPin::Data),
             _ => None,
         };
         if let Some(pin) = sdc1 {
             return Some(PinctrlPin::Sdc1(pin));
+        }
+
+        let sdc2 = match pin {
+            "sdc2_clk" => Some(SdcPin::Clk2),
+            "sdc2_cmd" => Some(SdcPin::Cmd),
+            "sdc2_data" => Some(SdcPin::Data),
+            _ => None,
+        };
+        if let Some(pin) = sdc2 {
+            return Some(PinctrlPin::Sdc2(pin));
         }
 
         let pin: u32 = pin.strip_prefix("gpio")?.parse().ok()?;
@@ -272,19 +286,42 @@ impl Sc7180Tlmm {
         self.update(pin, CONFIG, CONFIG_DRIVE_STRENGTH_MASK, selector << 6);
     }
 
-    fn configure_sdc1_pull(&self, pin: Sdc1Pin, pull: GpioPull) {
+    fn configure_sdc_pull(&self, offset: usize, pin: SdcPin, pull: GpioPull) {
         let value = match pull {
             GpioPull::None => 0,
             GpioPull::Down => 1,
             GpioPull::Up => 3,
         };
         let shift = pin.pull_shift();
-        self.update_sdc1(SDC_PULL_MASK << shift, value << shift);
+        self.update_sdc(offset, SDC_PULL_MASK << shift, value << shift);
     }
 
-    fn configure_sdc1_drive_strength(&self, pin: Sdc1Pin, selector: u32) {
+    fn configure_sdc_drive_strength(&self, offset: usize, pin: SdcPin, selector: u32) {
         let shift = pin.drive_strength_shift();
-        self.update_sdc1(SDC_DRIVE_STRENGTH_MASK << shift, selector << shift);
+        self.update_sdc(offset, SDC_DRIVE_STRENGTH_MASK << shift, selector << shift);
+    }
+
+    fn apply_sdc_state(
+        &self,
+        offset: usize,
+        pin: SdcPin,
+        bias: Option<PinctrlBias>,
+        drive_strength: Option<u32>,
+    ) {
+        if let Some(bias) = bias {
+            self.configure_sdc_pull(
+                offset,
+                pin,
+                match bias {
+                    PinctrlBias::Disable => GpioPull::None,
+                    PinctrlBias::PullDown => GpioPull::Down,
+                    PinctrlBias::PullUp => GpioPull::Up,
+                },
+            );
+        }
+        if let Some(selector) = drive_strength {
+            self.configure_sdc_drive_strength(offset, pin, selector);
+        }
     }
 
     fn validate_pinctrl_state(state: &PinctrlState<'_>) -> Result<(), PinctrlError> {
@@ -302,12 +339,15 @@ impl Sc7180Tlmm {
                 (PinctrlPin::Gpio(pin), Some(function)) => {
                     Self::named_function(pin, function).ok_or(PinctrlError::Unsupported)?;
                 }
-                // SDC1 pads have no GPIO mux or direction control. They only
+                // SDC pads have no GPIO mux or direction control. They only
                 // support the pull and drive-strength pinconf fields below.
-                (PinctrlPin::Sdc1(_), Some(_)) => return Err(PinctrlError::Unsupported),
+                (PinctrlPin::Sdc1(_) | PinctrlPin::Sdc2(_), Some(_)) => {
+                    return Err(PinctrlError::Unsupported);
+                }
                 (_, None) => {}
             }
-            if matches!(pin, PinctrlPin::Sdc1(_)) && (state.output.is_some() || state.input_enable)
+            if matches!(pin, PinctrlPin::Sdc1(_) | PinctrlPin::Sdc2(_))
+                && (state.output.is_some() || state.input_enable)
             {
                 return Err(PinctrlError::Unsupported);
             }
@@ -657,9 +697,11 @@ impl PinctrlController for Sc7180Tlmm {
                 (PinctrlPin::Gpio(pin), Some(function)) => {
                     Some(Self::named_function(pin, function).ok_or(PinctrlError::Unsupported)?)
                 }
-                // SDC1 pads have no GPIO mux or direction control. They only
+                // SDC pads have no GPIO mux or direction control. They only
                 // support the pull and drive-strength pinconf fields below.
-                (PinctrlPin::Sdc1(_), Some(_)) => return Err(PinctrlError::Unsupported),
+                (PinctrlPin::Sdc1(_) | PinctrlPin::Sdc2(_), Some(_)) => {
+                    return Err(PinctrlError::Unsupported);
+                }
                 (_, None) => None,
             };
             pins.push((pin, function));
@@ -691,19 +733,10 @@ impl PinctrlController for Sc7180Tlmm {
                     }
                 }
                 PinctrlPin::Sdc1(pin) => {
-                    if let Some(bias) = state.bias {
-                        self.configure_sdc1_pull(
-                            pin,
-                            match bias {
-                                PinctrlBias::Disable => GpioPull::None,
-                                PinctrlBias::PullDown => GpioPull::Down,
-                                PinctrlBias::PullUp => GpioPull::Up,
-                            },
-                        );
-                    }
-                    if let Some(selector) = drive_strength {
-                        self.configure_sdc1_drive_strength(pin, selector);
-                    }
+                    self.apply_sdc_state(SDC1_CONFIG, pin, state.bias, drive_strength)
+                }
+                PinctrlPin::Sdc2(pin) => {
+                    self.apply_sdc_state(SDC2_CONFIG, pin, state.bias, drive_strength)
                 }
             }
         }
@@ -818,64 +851,78 @@ mod tests {
     }
 
     #[test]
-    fn sdc1_pins_use_the_west_control_register_and_documented_fields() {
+    fn sdc_pins_use_the_west_control_registers_and_documented_fields() {
         assert_eq!(
-            Sc7180Tlmm::sdc1_config_register(&[0x1000, 0x2000, 0x3000]),
+            Sc7180Tlmm::sdc_config_register(&[0x1000, 0x2000, 0x3000], SDC1_CONFIG),
             Some(0x7b000)
+        );
+        assert_eq!(
+            Sc7180Tlmm::sdc_config_register(&[0x1000, 0x2000, 0x3000], SDC2_CONFIG),
+            Some(0x7c000)
         );
 
         let fields = [
-            ("sdc1_rclk", Sdc1Pin::Rclk, 15, 0),
-            ("sdc1_clk", Sdc1Pin::Clk, 13, 6),
-            ("sdc1_cmd", Sdc1Pin::Cmd, 11, 3),
-            ("sdc1_data", Sdc1Pin::Data, 9, 0),
+            ("sdc1_rclk", PinctrlPin::Sdc1(SdcPin::Rclk), 15, 0),
+            ("sdc1_clk", PinctrlPin::Sdc1(SdcPin::Clk1), 13, 6),
+            ("sdc1_cmd", PinctrlPin::Sdc1(SdcPin::Cmd), 11, 3),
+            ("sdc1_data", PinctrlPin::Sdc1(SdcPin::Data), 9, 0),
+            ("sdc2_clk", PinctrlPin::Sdc2(SdcPin::Clk2), 14, 6),
+            ("sdc2_cmd", PinctrlPin::Sdc2(SdcPin::Cmd), 11, 3),
+            ("sdc2_data", PinctrlPin::Sdc2(SdcPin::Data), 9, 0),
         ];
         for (name, expected_pin, pull_shift, drive_shift) in fields {
-            assert_eq!(
-                Sc7180Tlmm::named_pin(name),
-                Some(PinctrlPin::Sdc1(expected_pin))
-            );
-            assert_eq!(expected_pin.pull_shift(), pull_shift);
-            assert_eq!(expected_pin.drive_strength_shift(), drive_shift);
+            assert_eq!(Sc7180Tlmm::named_pin(name), Some(expected_pin));
+            let sdc_pin = match expected_pin {
+                PinctrlPin::Sdc1(pin) | PinctrlPin::Sdc2(pin) => pin,
+                PinctrlPin::Gpio(_) => unreachable!(),
+            };
+            assert_eq!(sdc_pin.pull_shift(), pull_shift);
+            assert_eq!(sdc_pin.drive_strength_shift(), drive_shift);
         }
     }
 
     #[test]
-    fn sdc1_names_do_not_alias_gpio_pins() {
+    fn sdc_names_do_not_alias_gpio_pins() {
         assert_eq!(
             Sc7180Tlmm::named_pin("gpio118"),
             Some(PinctrlPin::Gpio(118))
         );
         assert_eq!(Sc7180Tlmm::named_pin("gpio119"), None);
-        assert_eq!(Sc7180Tlmm::named_pin("sdc2_clk"), None);
+        assert_eq!(
+            Sc7180Tlmm::named_pin("sdc2_clk"),
+            Some(PinctrlPin::Sdc2(SdcPin::Clk2))
+        );
     }
 
     #[test]
     fn sdc1_field_update_preserves_sibling_pad_configuration() {
-        let rclk_pull_mask = SDC_PULL_MASK << Sdc1Pin::Rclk.pull_shift();
-        let cmd_drive_mask = SDC_DRIVE_STRENGTH_MASK << Sdc1Pin::Cmd.drive_strength_shift();
-        let data_pull_mask = SDC_PULL_MASK << Sdc1Pin::Data.pull_shift();
+        let rclk_pull_mask = SDC_PULL_MASK << SdcPin::Rclk.pull_shift();
+        let cmd_drive_mask = SDC_DRIVE_STRENGTH_MASK << SdcPin::Cmd.drive_strength_shift();
+        let data_pull_mask = SDC_PULL_MASK << SdcPin::Data.pull_shift();
         let original = rclk_pull_mask
-            | (0b101 << Sdc1Pin::Cmd.drive_strength_shift())
-            | (0b01 << Sdc1Pin::Data.pull_shift());
+            | (0b101 << SdcPin::Cmd.drive_strength_shift())
+            | (0b01 << SdcPin::Data.pull_shift());
         let updated = Sc7180Tlmm::updated_register_value(
             original,
             data_pull_mask,
-            0b11 << Sdc1Pin::Data.pull_shift(),
+            0b11 << SdcPin::Data.pull_shift(),
         );
 
         assert_eq!(updated & rclk_pull_mask, original & rclk_pull_mask);
         assert_eq!(updated & cmd_drive_mask, original & cmd_drive_mask);
-        assert_eq!(updated & data_pull_mask, 0b11 << Sdc1Pin::Data.pull_shift());
+        assert_eq!(updated & data_pull_mask, 0b11 << SdcPin::Data.pull_shift());
     }
 
     #[test]
-    fn sdc1_on_children_validate_without_a_mux_function() {
+    fn sdc_on_children_validate_without_a_mux_function() {
         for (pin, bias, drive_strength_ma) in [
             ("sdc1_clk", PinctrlBias::Disable, Some(16)),
             ("sdc1_cmd", PinctrlBias::PullUp, Some(16)),
             ("sdc1_data", PinctrlBias::PullUp, Some(16)),
             ("sdc1_rclk", PinctrlBias::PullDown, None),
+            ("sdc2_clk", PinctrlBias::Disable, Some(16)),
+            ("sdc2_cmd", PinctrlBias::PullUp, Some(10)),
+            ("sdc2_data", PinctrlBias::PullUp, Some(10)),
         ] {
             let state = PinctrlState {
                 pins: alloc::vec![pin],
@@ -890,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn sdc1_rejects_gpio_only_configuration() {
+    fn sdc_rejects_gpio_only_configuration() {
         let state = PinctrlState {
             pins: alloc::vec!["sdc1_clk"],
             function: Some("gpio"),
@@ -904,19 +951,33 @@ mod tests {
             Err(PinctrlError::Unsupported)
         );
 
-        for (output, input_enable) in [(Some(false), false), (None, true)] {
+        for pin in ["sdc1_clk", "sdc2_clk"] {
             let state = PinctrlState {
-                pins: alloc::vec!["sdc1_clk"],
-                function: None,
+                pins: alloc::vec![pin],
+                function: Some("gpio"),
                 bias: None,
                 drive_strength_ma: None,
-                output,
-                input_enable,
+                output: None,
+                input_enable: false,
             };
             assert_eq!(
                 Sc7180Tlmm::validate_pinctrl_state(&state),
                 Err(PinctrlError::Unsupported)
             );
+            for (output, input_enable) in [(Some(false), false), (None, true)] {
+                let state = PinctrlState {
+                    pins: alloc::vec![pin],
+                    function: None,
+                    bias: None,
+                    drive_strength_ma: None,
+                    output,
+                    input_enable,
+                };
+                assert_eq!(
+                    Sc7180Tlmm::validate_pinctrl_state(&state),
+                    Err(PinctrlError::Unsupported)
+                );
+            }
         }
     }
 }

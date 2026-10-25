@@ -64,6 +64,8 @@ jobs:
           cargo test --locked --manifest-path tests/a618-async-preparation/Cargo.toml
       - name: Test EC event isolation
         run: cargo test --locked --manifest-path tests/ec-event-drain/Cargo.toml
+      - name: Test CoachZ SDHCI binding helpers
+        run: cargo test --locked --manifest-path tests/mmc-support/Cargo.toml
 
   scarlet:
     runs-on: ubuntu-latest

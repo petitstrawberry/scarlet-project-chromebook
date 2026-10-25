@@ -50,7 +50,7 @@ Limine dependency は optional で、この BSP の feature graphには入りま
 次の実機milestone:
 
 - init→stemd→login/shellの実機確認
-- SC7180 USB/MMC block driverと永続rootfs
+- SC7180 eMMC block driver（実機確認済み）とSDカード（SDCC2、実機確認済み）対応、永続rootfs
 - ChromeOS kernel GPT partition の priority/tries/successful 属性 parser
 - まず read-only inspect、次に explicit output file への image composition
 
