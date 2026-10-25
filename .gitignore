@@ -39,3 +39,10 @@ __pycache__/
 .omo
 /kernel
 /scripts/.evidence/
+
+# Local-only image layers (contents are included in locally built images).
+/projects/aarch64-coachz-limine/layers/private/**
+!/projects/aarch64-coachz-limine/layers/private/common/
+!/projects/aarch64-coachz-limine/layers/private/rootfs/
+!/projects/aarch64-coachz-limine/layers/private/common/.gitkeep
+!/projects/aarch64-coachz-limine/layers/private/rootfs/.gitkeep

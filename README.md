@@ -242,6 +242,12 @@ built and installed by this repository's `bundles/sgfx-adreno` bundle, using
 standard `cargo` (`lib`) and `copy` layers. The SDK records the driver selector
 and artifact hash in `scarlet.lock`.
 
+Board firmware binaries are stored in `projects/aarch64-coachz-limine/firmware/`.
+Settings and other filesystem additions use the separate
+[file layers](projects/aarch64-coachz-limine/layers/README.md): `layers/common/`
+and `layers/rootfs/` are tracked, while `layers/private/common/` and
+`layers/private/rootfs/` are ignored by Git and applied last in local builds.
+
 The release images are written under:
 
 ```text

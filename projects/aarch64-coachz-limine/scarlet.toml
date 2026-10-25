@@ -80,8 +80,19 @@ subdir = "bundles/cli-utils"
 # namespace as well as in the persistent rootfs below.
 [[images.initramfs.layers]]
 kind = "copy"
-source = "firmware/rootfs"
-to = "/system/scarlet"
+source = "firmware/qcom"
+to = "/lib/firmware/qcom"
+
+[[images.initramfs.layers]]
+kind = "copy"
+source = "layers/common"
+to = "/"
+
+# Local-only additions override the shared layer when present.
+[[images.initramfs.layers]]
+kind = "copy"
+source = "layers/private/common"
+to = "/"
 
 [images.rootfs]
 format = "ext2"
@@ -98,8 +109,29 @@ path = "../../bundles/sgfx-adreno/bundle.toml"
 
 [[images.rootfs.layers]]
 kind = "copy"
-source = "firmware/rootfs"
-to = "/system/scarlet"
+source = "firmware/qcom"
+to = "/lib/firmware/qcom"
+
+[[images.rootfs.layers]]
+kind = "copy"
+source = "layers/common"
+to = "/"
+
+[[images.rootfs.layers]]
+kind = "copy"
+source = "layers/rootfs"
+to = "/"
+
+# Keep private overrides after all tracked layers.
+[[images.rootfs.layers]]
+kind = "copy"
+source = "layers/private/common"
+to = "/"
+
+[[images.rootfs.layers]]
+kind = "copy"
+source = "layers/private/rootfs"
+to = "/"
 
 [images.boot]
 format = "limine-uefi"
