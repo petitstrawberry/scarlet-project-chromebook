@@ -146,7 +146,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4640dea64350b6954addf2ec0a990db9a919acc6#4640dea64350b6954addf2ec0a990db9a919acc6"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=a63841fe85231042cb0f0b176412f10a07841a50#a63841fe85231042cb0f0b176412f10a07841a50"
 dependencies = [
  "chacha20",
  "fdt",
@@ -162,7 +162,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4640dea64350b6954addf2ec0a990db9a919acc6#4640dea64350b6954addf2ec0a990db9a919acc6"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=a63841fe85231042cb0f0b176412f10a07841a50#a63841fe85231042cb0f0b176412f10a07841a50"
 
 [[package]]
 name = "scarlet-driver-qcom-sc7180-tlmm"
