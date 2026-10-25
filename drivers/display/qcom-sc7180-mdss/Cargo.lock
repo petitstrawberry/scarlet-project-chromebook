@@ -146,7 +146,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=a63841fe85231042cb0f0b176412f10a07841a50#a63841fe85231042cb0f0b176412f10a07841a50"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=f8d28abdb24bca2505c0da2737e61cf24d00903c#f8d28abdb24bca2505c0da2737e61cf24d00903c"
 dependencies = [
  "chacha20",
  "fdt",
@@ -162,7 +162,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=a63841fe85231042cb0f0b176412f10a07841a50#a63841fe85231042cb0f0b176412f10a07841a50"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=f8d28abdb24bca2505c0da2737e61cf24d00903c#f8d28abdb24bca2505c0da2737e61cf24d00903c"
 
 [[package]]
 name = "scarlet-driver-cros-ec-spi"
