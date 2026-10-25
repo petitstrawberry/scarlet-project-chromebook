@@ -29,17 +29,20 @@ Working on CoachZ rev3:
 - Scarlet kernel boot through Limine
 - Qualcomm GENI UART output and interrupt-driven input
 - Scarlet initramfs, `stemd`, login, and an interactive shell
+- SC7180 eMMC root storage and removable SD card support (`mmcblk0`/`mmcblk1`)
 
 Still under development:
 
 - framebuffer and display output
 - Scarlet-side SC7180 USB host, USB mass-storage, and CDC-NCM support
 - persistent USB root filesystem
-- SD/eMMC support
 - onboard networking and GPU support
 
 The full image boots through its initramfs and waits for the USB root
 filesystem at `/dev/usbblk0p2`, then mounts that ext2 partition for userspace.
+CoachZ publishes its soldered eMMC as `/dev/mmcblk0` and an inserted SD card
+as `/dev/mmcblk1`. The SD slot is probed during boot; a card inserted later
+needs a reboot until hotplug is implemented.
 
 ## Requirements
 

@@ -1,6 +1,9 @@
 //! Pure SC7180 SDHCI binding data and property helpers.
 
-pub(crate) const REQUIRED_BUS_WIDTH: usize = 8;
+pub(crate) const EMMC_BUS_WIDTH: usize = 8;
+pub(crate) const SD_BUS_WIDTH: usize = 4;
+pub(crate) const SD_VMMC_MIN_UV: u32 = 2_700_000;
+pub(crate) const SD_VMMC_MAX_UV: u32 = 3_600_000;
 
 // Qualcomm SDCC5 vendor registers are relative to the first ("hc") resource.
 pub(crate) const CORE_DLL_CONFIG: usize = 0x200;
@@ -42,17 +45,70 @@ const SDHCI_POWER_1V8: u8 = 0x0a;
 const SDHCI_POWER_3V0: u8 = 0x0c;
 const SDHCI_POWER_3V3: u8 = 0x0e;
 
-pub(crate) fn accepts_emmc_properties(non_removable: bool, bus_width: Option<usize>) -> bool {
-    non_removable && bus_width == Some(REQUIRED_BUS_WIDTH)
+/// Card protocol selected by the controller's firmware description.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MediaKind {
+    Emmc,
+    Sd,
 }
 
-pub(crate) const fn vendor_spec_for_fixed_1v8_supply(
+/// Classify an SC7180 SDCC node from its physical wiring properties.
+///
+/// CoachZ uses SDCC1 for soldered eight-bit eMMC and SDCC2 for a removable
+/// four-bit SD slot with a card-detect GPIO. Rejecting other combinations
+/// keeps unsupported wiring from being driven with a guessed bus width.
+pub(crate) fn classify_media(
+    non_removable: bool,
+    bus_width: Option<usize>,
+    has_card_detect: bool,
+) -> Option<MediaKind> {
+    match (non_removable, bus_width, has_card_detect) {
+        (true, Some(EMMC_BUS_WIDTH), _) => Some(MediaKind::Emmc),
+        (false, Some(SD_BUS_WIDTH), true) => Some(MediaKind::Sd),
+        _ => None,
+    }
+}
+
+pub(crate) const fn sd_supply_voltage_supported(minimum_uv: u32, maximum_uv: u32) -> bool {
+    maximum_uv >= SD_VMMC_MIN_UV && minimum_uv <= SD_VMMC_MAX_UV
+}
+
+pub(crate) const fn vendor_spec_for_media(
+    kind: MediaKind,
     vendor_spec: u32,
     minimum_uv: u32,
     maximum_uv: u32,
 ) -> Option<u32> {
-    if minimum_uv == EMMC_IO_VOLTAGE_UV && maximum_uv == EMMC_IO_VOLTAGE_UV {
-        Some(vendor_spec | CORE_IO_PAD_PWR_SWITCH_MASK)
+    match kind {
+        MediaKind::Emmc if minimum_uv == EMMC_IO_VOLTAGE_UV && maximum_uv == EMMC_IO_VOLTAGE_UV => {
+            Some(vendor_spec | CORE_IO_PAD_PWR_SWITCH_MASK)
+        }
+        MediaKind::Sd if sd_supply_voltage_supported(minimum_uv, maximum_uv) => Some(vendor_spec),
+        _ => None,
+    }
+}
+
+/// Decode one two-cell GPIO specifier plus flags from a device-tree property.
+pub(crate) fn gpio_spec(value: &[u8]) -> Option<(u32, u32, bool)> {
+    let controller = u32::from_be_bytes(value.get(..4)?.try_into().ok()?);
+    let pin = u32::from_be_bytes(value.get(4..8)?.try_into().ok()?);
+    let flags = u32::from_be_bytes(value.get(8..12)?.try_into().ok()?);
+    Some((controller, pin, flags & 1 != 0))
+}
+
+/// Select the SDHCI host aperture from the device's memory resources.
+///
+/// SDCC1 names two windows (`hc`, `cqhci`). SDCC2 describes its single host
+/// window without `reg-names`, so the sole memory resource is unambiguous.
+pub(crate) fn primary_memory_index(
+    has_reg_names: bool,
+    named_hc: Option<usize>,
+    memory_count: usize,
+) -> Option<usize> {
+    if has_reg_names {
+        named_hc.filter(|index| *index < memory_count)
+    } else if memory_count == 1 {
+        Some(0)
     } else {
         None
     }
@@ -105,11 +161,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_only_non_removable_eight_bit_emmc() {
-        assert!(accepts_emmc_properties(true, Some(8)));
-        assert!(!accepts_emmc_properties(false, Some(8)));
-        assert!(!accepts_emmc_properties(true, Some(4)));
-        assert!(!accepts_emmc_properties(true, None));
+    fn classifies_coachz_emmc_and_sd_wiring_only() {
+        assert_eq!(classify_media(true, Some(8), false), Some(MediaKind::Emmc));
+        assert_eq!(classify_media(false, Some(4), true), Some(MediaKind::Sd));
+        assert_eq!(classify_media(false, Some(8), true), None);
+        assert_eq!(classify_media(true, Some(4), true), None);
+        assert_eq!(classify_media(false, Some(4), false), None);
+        assert_eq!(classify_media(true, None, false), None);
     }
 
     #[test]
@@ -145,9 +203,10 @@ mod tests {
     }
 
     #[test]
-    fn fixed_1v8_supply_selects_low_voltage_io_pads() {
+    fn media_supply_selects_the_matching_io_pad_voltage() {
         assert_eq!(
-            vendor_spec_for_fixed_1v8_supply(
+            vendor_spec_for_media(
+                MediaKind::Emmc,
                 CORE_VENDOR_SPEC_POR_VAL,
                 EMMC_IO_VOLTAGE_UV,
                 EMMC_IO_VOLTAGE_UV,
@@ -155,13 +214,61 @@ mod tests {
             Some(0x0001_8a9c)
         );
         assert_eq!(
-            vendor_spec_for_fixed_1v8_supply(CORE_VENDOR_SPEC_POR_VAL, 1_700_000, 1_950_000),
+            vendor_spec_for_media(
+                MediaKind::Emmc,
+                CORE_VENDOR_SPEC_POR_VAL,
+                1_700_000,
+                1_950_000,
+            ),
             None
         );
         assert_eq!(
-            vendor_spec_for_fixed_1v8_supply(CORE_VENDOR_SPEC_POR_VAL, 3_000_000, 3_000_000),
+            vendor_spec_for_media(
+                MediaKind::Emmc,
+                CORE_VENDOR_SPEC_POR_VAL,
+                3_000_000,
+                3_000_000,
+            ),
             None
         );
+        assert_eq!(
+            vendor_spec_for_media(
+                MediaKind::Sd,
+                CORE_VENDOR_SPEC_POR_VAL,
+                2_952_000,
+                2_952_000,
+            ),
+            Some(CORE_VENDOR_SPEC_POR_VAL)
+        );
+        assert_eq!(
+            vendor_spec_for_media(
+                MediaKind::Sd,
+                CORE_VENDOR_SPEC_POR_VAL,
+                1_800_000,
+                1_800_000,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn decodes_active_low_card_detect_specifier() {
+        let mut value = [0u8; 12];
+        value[..4].copy_from_slice(&0x36u32.to_be_bytes());
+        value[4..8].copy_from_slice(&69u32.to_be_bytes());
+        value[8..12].copy_from_slice(&1u32.to_be_bytes());
+        assert_eq!(gpio_spec(&value), Some((0x36, 69, true)));
+        assert_eq!(gpio_spec(&value[..8]), None);
+    }
+
+    #[test]
+    fn sd_single_unnamed_window_and_named_emmc_window_are_selected() {
+        assert_eq!(primary_memory_index(false, None, 1), Some(0));
+        assert_eq!(primary_memory_index(true, Some(0), 2), Some(0));
+        assert_eq!(primary_memory_index(true, Some(1), 2), Some(1));
+        assert_eq!(primary_memory_index(true, None, 2), None);
+        assert_eq!(primary_memory_index(true, Some(2), 2), None);
+        assert_eq!(primary_memory_index(false, Some(0), 2), None);
     }
 
     #[test]
