@@ -11,7 +11,7 @@ runtime_dir="${SCARLET_RUNTIME_DIR:-/run/scarlet}"
 ifname="${SCARLET_NCM_IFNAME:-usb0}"
 pi_address="${SCARLET_NCM_PI_ADDRESS:-192.168.88.1/30}"
 network_cidr="${SCARLET_NCM_NETWORK:-192.168.88.0/30}"
-uplink_ifname="${SCARLET_NCM_UPLINK_IFNAME:-eth0}"
+uplink_ifname="${SCARLET_NCM_UPLINK_IFNAME:-auto}"
 uplink_gateway="${SCARLET_NCM_UPLINK_GATEWAY:-}"
 uplink_route_metric="${SCARLET_NCM_UPLINK_ROUTE_METRIC:-100}"
 enable_routing="${SCARLET_NCM_ENABLE_ROUTING:-1}"
@@ -92,6 +92,7 @@ validate_config() {
   valid_ipv4 "$pi_ip" || die "invalid Pi NCM address: $pi_address"
   valid_cidr "$network_cidr" || die "invalid NCM network: $network_cidr"
   if [[ -n "$uplink_gateway" ]]; then
+    [[ "$uplink_ifname" != auto ]] || die "an explicit gateway requires an explicit uplink interface"
     valid_ipv4 "$uplink_gateway" || die "invalid uplink gateway: $uplink_gateway"
     [[ "$uplink_route_metric" =~ ^[0-9]+$ ]] || die "invalid uplink route metric: $uplink_route_metric"
     ((10#$uplink_route_metric <= 4294967295)) || die "uplink route metric is too large: $uplink_route_metric"
@@ -159,18 +160,27 @@ disable_forwarding() {
 
 apply_nft_rules() {
   [[ "$enable_nat" == 1 ]] || return 0
-  [[ -e "/sys/class/net/$uplink_ifname" ]] || die "uplink interface is unavailable: $uplink_ifname"
+  local outbound inbound
+  if [[ "$uplink_ifname" == auto ]]; then
+    # Follow routing decisions on every packet, including LAN/Wi-Fi failover.
+    outbound="oifname != { \"$ifname\", \"lo\" }"
+    inbound="iifname != { \"$ifname\", \"lo\" }"
+  else
+    [[ -e "/sys/class/net/$uplink_ifname" ]] || die "uplink interface is unavailable: $uplink_ifname"
+    outbound="oifname \"$uplink_ifname\""
+    inbound="iifname \"$uplink_ifname\""
+  fi
   install -d -m 0755 "$runtime_dir"
   cat >"$nft_config" <<EOF
 table ip $nft_table {
   chain forward {
     type filter hook forward priority filter; policy accept;
-    iifname "$ifname" oifname "$uplink_ifname" accept
-    iifname "$uplink_ifname" oifname "$ifname" ct state established,related accept
+    iifname "$ifname" $outbound accept
+    $inbound oifname "$ifname" ct state established,related accept
   }
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
-    oifname "$uplink_ifname" ip saddr $network_cidr masquerade
+    $outbound ip saddr $network_cidr masquerade
   }
 }
 EOF
@@ -214,9 +224,7 @@ write_dnsmasq_config() {
         done
       fi
     else
-      # This Pi is commonly connected to an isolated host LAN without a
-      # default route. Run DHCP-only unless an operator explicitly enables a
-      # DNS proxy, so clients are never advertised a dead resolver.
+      # DHCP-only mode omits the resolver when DNS proxying is disabled.
       echo 'port=0'
     fi
     echo "dhcp-leasefile=$dnsmasq_leasefile"

@@ -5,6 +5,12 @@
 - Nix の `python3.withPackages` による PyUSB + libusb shell
 - pinned ChromiumOS EC checkout
 - Cr50/AP/EC interface wrapper と backend diagnostics
+- Raspberry Pi の Ethernet DHCP + mDNS（`usb-netboot.local`）を実機確認
+- Pi 常駐 CCD サービスと SSH 経由の EC/Cr50 コマンド、複数コンソール同時利用を実機確認
+- Pi 経由の reset / boot / EC キー入力 helper を実装（自動 boot sequence の実機再検証は未実施）
+
+通常の操作は [Raspberry Pi network controller](README.md#raspberry-pi-network-controller)
+を参照。CCD と USB gadget は Pi に接続し、Mac は同じ LAN から SSH で操作します。
 
 ## 2. Linux arm64 boot protocol — QEMU milestone complete
 
