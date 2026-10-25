@@ -42,13 +42,13 @@ dependencies = [
 
 [[package]]
 name = "scarlet-abi"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c576e77989a99689adfc13f000b37dd99f25dae1"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=4640dea64350b6954addf2ec0a990db9a919acc6#4640dea64350b6954addf2ec0a990db9a919acc6"
 
 [[package]]
 name = "scarlet-os"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c576e77989a99689adfc13f000b37dd99f25dae1"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=4640dea64350b6954addf2ec0a990db9a919acc6#4640dea64350b6954addf2ec0a990db9a919acc6"
 dependencies = [
  "scarlet-abi",
  "scarlet-rt",
@@ -64,8 +64,8 @@ dependencies = [
 
 [[package]]
 name = "scarlet-rt"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c576e77989a99689adfc13f000b37dd99f25dae1"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=4640dea64350b6954addf2ec0a990db9a919acc6#4640dea64350b6954addf2ec0a990db9a919acc6"
 dependencies = [
  "lock_api",
  "scarlet-sys",
@@ -75,8 +75,8 @@ dependencies = [
 
 [[package]]
 name = "scarlet-std"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c576e77989a99689adfc13f000b37dd99f25dae1"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=4640dea64350b6954addf2ec0a990db9a919acc6#4640dea64350b6954addf2ec0a990db9a919acc6"
 dependencies = [
  "hashbrown",
  "scarlet-abi",
@@ -88,8 +88,8 @@ dependencies = [
 
 [[package]]
 name = "scarlet-sys"
-version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c576e77989a99689adfc13f000b37dd99f25dae1"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=4640dea64350b6954addf2ec0a990db9a919acc6#4640dea64350b6954addf2ec0a990db9a919acc6"
 dependencies = [
  "scarlet-abi",
 ]

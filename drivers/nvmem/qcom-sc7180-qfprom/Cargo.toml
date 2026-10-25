@@ -9,4 +9,4 @@ path = "src/lib.rs"
 
 [dependencies]
 fdt = "0.1.5"
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "ecd3cd1c534af340a85e89681414a17b4969355b", package = "scarlet", default-features = false, features = ["network"] }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4640dea64350b6954addf2ec0a990db9a919acc6", package = "scarlet", default-features = false, features = ["network"] }

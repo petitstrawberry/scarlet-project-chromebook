@@ -78,11 +78,13 @@ The development shell provides the pinned Scarlet Rust toolchain,
 `cargo-scarlet`, the Limine image plugin, AArch64 build tools, PyUSB/libusb,
 device-tree tools, `mtools`, and serial-console utilities.
 
-The CoachZ kernel, userspace bundles, and native graphics driver are selected
-from published Git revisions by cargo-scarlet. Every board driver uses the
-same pinned kernel package; no sibling Scarlet checkout is required. The
-current kernel includes firmware-managed GPU frequency registration, with
-its matching revisions recorded in `scarlet.toml` and the Cargo lockfiles.
+The CoachZ kernel and userspace bundles are selected from published Git
+revisions by cargo-scarlet. Every board driver uses the same pinned kernel
+package; no sibling Scarlet checkout is required. The project-owned Adreno
+driver bundle is built from this checkout so its userspace and kernel
+dependencies stay aligned. The current kernel includes firmware-managed GPU
+frequency registration, with its matching revisions recorded in
+`scarlet.toml` and the Cargo lockfiles.
 The standard `/init` provides USB
 `rootwait` and constructs the current boot Environment; no project-local init
 replacement is needed.
@@ -183,8 +185,8 @@ From the Nix development shell:
 cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
-The current Scarlet bundles select SGFX frontend `20bb5b8c`, native Vulkan
-runtime `22c0ce20`, and ScarletUI `961db59e`. Native clients use the published
+The current Scarlet bundles select SGFX platform `35c1967b`, native Vulkan
+runtime `73330c2c`, and ScarletUI `8efde207`. Native clients use the published
 SGFX backend discovery path. The project-owned Adreno driver is installed at
 `/lib/sgfx/libsgfx_scarlet_adreno.so`; `sgfx-probe` reports the selected backend
 and linkage. The `sgfx-native` bundle generates the native userspace Cargo
@@ -210,7 +212,9 @@ projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-full.img
 ```
 
 `cargo scarlet image` owns image composition and cache reuse. The compatibility
-wrapper in `scripts/` only forwards to that command. All sources are fetched from pinned Git revisions without a sibling Scarlet checkout.
+wrapper in `scripts/` only forwards to that command. External sources are
+fetched from pinned Git revisions without a sibling Scarlet checkout; the
+Adreno bundle is read from this checkout.
 
 It is a GPT disk image for a single USB drive with:
 

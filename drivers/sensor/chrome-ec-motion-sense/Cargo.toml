@@ -8,5 +8,5 @@ license = "GPL-2.0-only"
 path = "src/lib.rs"
 
 [target.'cfg(target_os = "none")'.dependencies]
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "ecd3cd1c534af340a85e89681414a17b4969355b", package = "scarlet", default-features = false, features = ["network"] }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4640dea64350b6954addf2ec0a990db9a919acc6", package = "scarlet", default-features = false, features = ["network"] }
 scarlet-driver-cros-ec-spi = { path = "../../platform/chromeos/cros-ec-spi" }

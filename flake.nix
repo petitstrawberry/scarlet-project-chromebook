@@ -173,6 +173,9 @@
               pkgs.gnumake
               pkgs.cmake
               pkgs.ninja
+              pkgs.meson
+              pkgs.gperf
+              pkgs.perl
               pkgs.pkg-config
               pkgs.gnutar
               pkgs.which
