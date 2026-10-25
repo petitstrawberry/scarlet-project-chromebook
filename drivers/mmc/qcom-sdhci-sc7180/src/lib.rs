@@ -4,7 +4,7 @@
 
 //! Qualcomm SC7180 glue for the v5 SDHCI eMMC and SD controllers.
 //!
-//! The generic Scarlet SDHCI implementation supplies the polling/PIO command
+//! The generic Scarlet SDHCI implementation supplies the PIO/ADMA2 command
 //! engine. This crate handles the SC7180 platform binding, clocks, and the v5
 //! vendor-register initialization required before the generic host reset.
 //! SDCC1 is the soldered eMMC card; SDCC2 is the removable SD slot.
@@ -12,6 +12,8 @@
 extern crate alloc;
 
 mod binding;
+mod supply;
+mod uhs;
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::ptr::{read_volatile, write_volatile};
@@ -25,8 +27,11 @@ use scarlet::{
         clk::ClkHandle,
         fdt::FdtManager,
         gpio::GpioController,
+        iommu::{IommuDomainConfig, IommuDomainType, Iova},
         manager::{DeviceManager, DriverPriority, is_probe_defer, probe_defer},
-        mmc::{MmcBusWidth, MmcCommand, MmcData, MmcError, MmcHost, MmcResponse, MmcResult},
+        mmc::{
+            MmcBusWidth, MmcCommand, MmcData, MmcError, MmcHost, MmcResponse, MmcResult, MmcTiming,
+        },
         platform::{
             PlatformDeviceDriver, PlatformDeviceInfo,
             resource::{PlatformDeviceResource, PlatformDeviceResourceType},
@@ -82,6 +87,10 @@ struct Sc7180SdhciHost {
     inherited_host_control: u8,
     inherited_host_control2: u16,
     card_detect: Option<CardDetect>,
+    supplies: Option<supply::SdSupplies>,
+    timing: MmcTiming,
+    last_tuning_ms: u64,
+    retune_needed: bool,
 }
 
 impl Sc7180SdhciHost {
@@ -148,7 +157,56 @@ impl Drop for Sc7180SdhciHost {
 }
 
 impl MmcHost for Sc7180SdhciHost {
+    fn max_blocks_per_transfer(&self) -> usize {
+        self.host.max_blocks_per_transfer()
+    }
+
+    fn set_timing(&mut self, timing: MmcTiming) -> MmcResult<()> {
+        self.timing = timing;
+        self.host.set_timing(timing)
+    }
+
+    fn sd_uhs_modes(&self) -> u8 {
+        if self.supplies.is_none() {
+            return 0;
+        }
+        let caps = read32(self.mmio_base, 0x44);
+        // SDR12/25 are mandatory with 1.8 V support; gate faster modes on
+        // the controller's advertised capabilities.
+        3 | if caps & 1 != 0 { 4 } else { 0 } | if caps & 2 != 0 { 8 } else { 0 }
+    }
+
+    fn switch_signal_voltage_1v8(&mut self) -> MmcResult<()> {
+        self.switch_1v8()
+    }
+
+    fn execute_sd_tuning(&mut self) -> MmcResult<()> {
+        self.tune_sd()
+    }
+
     fn reset(&mut self) -> MmcResult<()> {
+        if let Some(supplies) = &self.supplies {
+            self.host.set_clock(0)?;
+            supplies.power_cycle().map_err(|_| MmcError::Command)?;
+            write32(
+                self.mmio_base,
+                CORE_VENDOR_SPEC,
+                read32(self.mmio_base, CORE_VENDOR_SPEC) & !CORE_IO_PAD_PWR_SWITCH_MASK,
+            );
+            write16(
+                self.mmio_base,
+                SDHCI_HOST_CONTROL2,
+                read16(self.mmio_base, SDHCI_HOST_CONTROL2) & !0xf,
+            );
+            let pending = read32(self.mmio_base, CORE_PWRCTL_STATUS) & CORE_PWRCTL_REQUEST_MASK;
+            write32(self.mmio_base, CORE_PWRCTL_CLEAR, pending);
+            write32(
+                self.mmio_base,
+                CORE_PWRCTL_CTL,
+                1 | if pending & 4 != 0 { 8 } else { 4 },
+            );
+            self.timing = MmcTiming::Legacy;
+        }
         let result = self.host.reset();
         if result.is_err() {
             self.log_failure("host reset");
@@ -203,7 +261,26 @@ impl MmcHost for Sc7180SdhciHost {
     }
 
     fn set_clock(&mut self, frequency_hz: u32) -> MmcResult<()> {
+        if self.kind == MediaKind::Sd {
+            let source = if frequency_hz > 100_000_000 {
+                202_000_000
+            } else {
+                100_000_000
+            };
+            if u64::from(self.host.base_clock_hz()) != source {
+                self.host.set_clock(0)?;
+                let rate = self.clocks[1]
+                    .set_rate(source)
+                    .map_err(|_| MmcError::Command)?;
+                println!("[qcom-sdhci-sc7180] SD core clock={} Hz", rate);
+                self.host
+                    .set_base_clock_hz(u32::try_from(rate).map_err(|_| MmcError::Unsupported)?)?;
+            }
+        }
         let result = self.host.set_clock(frequency_hz);
+        if result.is_ok() {
+            self.host.set_timing(self.timing)?;
+        }
         if result.is_err() {
             self.log_failure("clock setup");
         }
@@ -229,6 +306,14 @@ impl MmcHost for Sc7180SdhciHost {
         command: MmcCommand,
         data: Option<MmcData<'_>>,
     ) -> MmcResult<MmcResponse> {
+        let payload = data.as_ref().is_some_and(|data| data.len() >= 512);
+        if payload
+            && self.timing == MmcTiming::Sdr104
+            && (self.retune_needed
+                || scarlet::time::current_time_ms().saturating_sub(self.last_tuning_ms) >= 60_000)
+        {
+            self.tune_sd()?;
+        }
         let command_index = command.index();
         let command_argument = command.argument();
         if command_index == 8 {
@@ -248,6 +333,9 @@ impl MmcHost for Sc7180SdhciHost {
             }
         }
         if let Err(error) = &result {
+            if payload && self.timing == MmcTiming::Sdr104 {
+                self.retune_needed = true;
+            }
             self.log_failure("command");
             println!(
                 "[qcom-sdhci-sc7180] command index={} argument={:#010x} error={}",
@@ -445,6 +533,11 @@ fn disable_clocks(clocks: &[ClkHandle]) {
     }
 }
 
+fn write16(base: usize, offset: usize, value: u16) {
+    // SAFETY: native-width access in the mapped SDHCI register aperture.
+    unsafe { write_volatile((base + offset) as *mut u16, value) }
+}
+
 fn read32(base: usize, offset: usize) -> u32 {
     // SAFETY: The caller supplies a mapped controller aperture, and every
     // offset used here is aligned and validated to lie within that aperture.
@@ -560,6 +653,12 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         None
     };
 
+    let supplies = if kind == MediaKind::Sd {
+        Some(supply::SdSupplies::resolve(device)?)
+    } else {
+        None
+    };
+
     let (vmmc_minimum_uv, vmmc_maximum_uv) = fixed_supply_voltage_uv(device, "vmmc-supply")?;
     let (vqmmc_minimum_uv, vqmmc_maximum_uv) = fixed_supply_voltage_uv(device, "vqmmc-supply")?;
     let (supply_minimum_uv, supply_maximum_uv) = match kind {
@@ -598,8 +697,8 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let initial_power_control = read32(mmio_base, CORE_PWRCTL_CTL);
     // Linux services pwr_irq only after switching VMMC/VQMMC and pinctrl to
     // the requested physical state. Scarlet applies the default pinctrl state
-    // before probe but has no regulator-consumer API, so it cannot perform or
-    // verify BUS_OFF or IO_LOW/HIGH transitions. Mask the dedicated IRQ before
+    // before probe. eMMC retains firmware rail ownership; SD handles its own
+    // PM6150L transitions synchronously. Mask the dedicated IRQ before
     // further programming. The synchronous handoff below may acknowledge only
     // BUS_ON when the inherited SDHCI register confirms power is already on;
     // every request requiring a physical transition is rejected. This keeps
@@ -675,7 +774,8 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     // Restore the v5 vendor POR image, then select the pad voltage that
     // matches eMMC's fixed 1.8 V VQMMC or the SD slot's 3.0 V VMMC before the
-    // generic software reset. Do not enable CQE, DMA, or interrupt delivery.
+    // generic software reset. CQE remains disabled; owned ADMA2 is enabled
+    // only after the platform DMA context is attached below.
     write32(mmio_base, CORE_VENDOR_SPEC, vendor_spec);
     let configured_vendor_spec = read32(mmio_base, CORE_VENDOR_SPEC);
     let pads_selected = match kind {
@@ -740,7 +840,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         initial_power_control
     );
 
-    let host = Sc7180SdhciHost {
+    let mut host = Sc7180SdhciHost {
         host: SdhciHost::new_with_base_clock_and_config(
             mmio_base,
             kind == MediaKind::Emmc,
@@ -766,7 +866,36 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         inherited_host_control,
         inherited_host_control2,
         card_detect,
+        supplies,
+        timing: MmcTiming::Legacy,
+        last_tuning_ms: 0,
+        retune_needed: false,
     };
+    // Resolve the firmware stream ID rather than assuming identity DMA.
+    let dma = DeviceManager::get_manager().resolve_platform_dma_context(
+        device,
+        IommuDomainConfig {
+            domain_type: IommuDomainType::Dma,
+            iova_base: Iova::new(0x1000_0000),
+            iova_size: 0x1000_0000,
+        },
+    )?;
+    let transfer = match host.host.enable_adma2(&dma) {
+        Ok(()) => "ADMA2",
+        Err(error) => {
+            println!(
+                "[qcom-sdhci-sc7180] ADMA2 unavailable: {}; using PIO",
+                error
+            );
+            "PIO"
+        }
+    };
+    println!(
+        "[qcom-sdhci-sc7180] {} transfer={} max_blocks={}",
+        media,
+        transfer,
+        host.max_blocks_per_transfer()
+    );
     let name = match kind {
         MediaKind::Emmc => EMMC_DEVICE_NAME,
         MediaKind::Sd => SD_DEVICE_NAME,

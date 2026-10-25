@@ -44,6 +44,21 @@ CoachZ publishes its soldered eMMC as `/dev/mmcblk0` and an inserted SD card
 as `/dev/mmcblk1`. The SD slot is probed during boot; a card inserted later
 needs a reboot until hotplug is implemented.
 
+SDCC uses owned ADMA2 buffers through the firmware-described SMMU stream,
+with multi-sector transfers up to 256 KiB (64 KiB if allocation is limited).
+The SD slot negotiates High Speed or UHS-I SDR12/25/50/104. UHS requires the
+CoachZ PM6150L VMMC/VQMMC rails: CMD11 switches signaling to 1.8 V, and
+SDR104 validates CMD19 across the 16 CM DLL phases at the 202 MHz source
+clock. Failed UHS initialization power-cycles the SD card and retries at
+3.3 V; the eMMC rails retain firmware ownership. SDR104 retunes before I/O
+after 60 seconds or a transfer error. Existing SD-card contents are preserved
+by read-only validation; hotplug is still pending.
+
+Measure device bandwidth separately from hashing with
+`storage-check read-bench /dev/mmcblk1 1024 256` (1 GiB, 256 KiB requests).
+Use `storage-check hash-prefix /dev/mmcblk1p1 16` for a repeatable integrity
+comparison. The benchmark reports decimal MB/s and does not write the card.
+
 ## Requirements
 
 ### Host
