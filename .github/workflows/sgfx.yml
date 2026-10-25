@@ -62,6 +62,8 @@ jobs:
         run: |
           cargo test --locked --manifest-path tests/a618-async-queue/Cargo.toml
           cargo test --locked --manifest-path tests/a618-async-preparation/Cargo.toml
+      - name: Test EC event isolation
+        run: cargo test --locked --manifest-path tests/ec-event-drain/Cargo.toml
 
   scarlet:
     runs-on: ubuntu-latest

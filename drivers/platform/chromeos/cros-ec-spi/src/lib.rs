@@ -14,6 +14,8 @@
 
 extern crate alloc;
 
+mod event_drain;
+
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
@@ -121,10 +123,10 @@ pub trait CrosEcEventListener: Send + Sync {
     ///
     /// # Returns
     ///
-    /// `true` when the event was consumed successfully. Returning `false`
-    /// keeps the EC IRQ masked and makes the worker retry with bounded
-    /// backoff, so a level-triggered source cannot turn a broken listener into
-    /// a kernel busy loop.
+    /// `true` when the listener handled the event successfully. The EC has
+    /// already dequeued it: a listener failure must not delay unrelated button
+    /// releases on this shared IRQ. Listeners report and recover their own
+    /// failures; only transport failures back off the shared event reader.
     fn on_cros_ec_event(&self, event_type: u8, data: &[u8]) -> bool;
 }
 
@@ -173,8 +175,6 @@ pub enum CrosEcError {
     EcResult(u16),
     /// A caller supplied a value outside the command's valid range.
     InvalidArgument,
-    /// A registered MKBP listener could not consume an event.
-    EventListenerFailed,
 }
 
 /// Summary returned by the Chrome EC motion-sense `DUMP` command.
@@ -1069,22 +1069,25 @@ impl CrosEcSpi {
         consumed
     }
 
-    fn drain_events(&self) -> Result<(), CrosEcError> {
-        for _ in 0..MAX_EVENTS_PER_DRAIN {
-            let response = match self.command(COMMAND_GET_NEXT_EVENT, GET_NEXT_EVENT_VERSION, &[]) {
-                Ok(response) => response,
-                Err(CrosEcError::EcResult(EC_RESULT_UNAVAILABLE)) => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            let event = parse_mkbp_event(&response)?;
-            if !self.dispatch_event(event.event_type, event.data) {
-                return Err(CrosEcError::EventListenerFailed);
-            }
-            if !event.more {
-                return Ok(());
-            }
-        }
-        Err(CrosEcError::InvalidResponse)
+    fn drain_events(&self) -> Result<bool, CrosEcError> {
+        event_drain::drain_batch(
+            MAX_EVENTS_PER_DRAIN,
+            || {
+                let response =
+                    match self.command(COMMAND_GET_NEXT_EVENT, GET_NEXT_EVENT_VERSION, &[]) {
+                        Ok(response) => response,
+                        Err(CrosEcError::EcResult(EC_RESULT_UNAVAILABLE)) => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                let more = parse_mkbp_event(&response)?.more;
+                Ok(Some((response, more)))
+            },
+            |response| {
+                // The reader validated the envelope before invoking listeners.
+                let event = parse_mkbp_event(&response).unwrap();
+                self.dispatch_event(event.event_type, event.data)
+            },
+        )
     }
 
     fn finish_event_drain(&self) {
@@ -1143,12 +1146,19 @@ fn event_worker_entry() {
                 continue;
             }
             match controller.drain_events() {
-                Ok(()) => {
+                Ok(complete) => {
                     controller.event_drain_errors.store(0, Ordering::Relaxed);
                     controller
                         .event_retry_not_before_ns
                         .store(0, Ordering::Release);
-                    controller.finish_event_drain();
+                    if complete {
+                        controller.finish_event_drain();
+                    } else {
+                        // Yield a full batch without treating traffic as a fault.
+                        controller.event_work_pending.store(true, Ordering::Release);
+                        next_wait_ns =
+                            Some(next_wait_ns.map_or(1_000_000, |wait| wait.min(1_000_000)));
+                    }
                 }
                 Err(error) => {
                     let error_count = controller
@@ -1157,8 +1167,10 @@ fn event_worker_entry() {
                         + 1;
                     if error_count.is_power_of_two() {
                         println!(
-                            "[cros-ec-spi] event drain failed: {:?} (count={})",
-                            error, error_count
+                            "[cros-ec-spi] event drain failed: {:?} (count={} phandle={:#x})",
+                            error,
+                            error_count,
+                            controller.phandle()
                         );
                     }
                     if controller.active.load(Ordering::Acquire) {

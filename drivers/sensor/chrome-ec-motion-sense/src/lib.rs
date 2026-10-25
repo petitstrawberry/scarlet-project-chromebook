@@ -506,7 +506,12 @@ mod runtime {
                 return self
                     .ec
                     .motion_fifo_info_for_sensor_count(self.sensor_count)
-                    .map_err(|_| "FIFO_INFO command failed");
+                    .map_err(|error| {
+                        if (self.consecutive_errors.load(Ordering::Relaxed) + 1).is_power_of_two() {
+                            println!("[chrome-ec-motion-sense] FIFO_INFO transport: {:?}", error);
+                        }
+                        "FIFO_INFO command failed"
+                    });
             }
             info.lost_per_sensor = vec![0; usize::from(self.sensor_count)];
             Ok(info)
