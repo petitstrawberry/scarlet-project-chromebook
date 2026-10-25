@@ -463,7 +463,7 @@ type = "path"
 path = ".scarlet/cache/git/3a6ec0c32bdfd41b/user/std-bin"
 
 [sections.rootfs]
-hash = "sha256:7af1d9b15eb700dd8d64ae5fe774e00d1ad042ea0d1aa64cab502318cc523b0b"
+hash = "sha256:83d5382eb699a22acbe0046889fd2792e76a667f10d9f0eead639824432148cb"
 
 [[sections.rootfs.layers]]
 kind = "script"
@@ -965,7 +965,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "scarlet-shell"
 to = "/bin/scarlet-shell"
-hash = "sha256:a1a6119aff8e0a8246c79f92678189bca8af0608bc905480690751e94f3b2d4d"
+hash = "sha256:474a72a5a370bf2457bce0c8a494c1c53104ebbc04ff8b5c26fc0f52c9decb82"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -987,7 +987,7 @@ kind = "cargo"
 package = "scarlet-std-bin"
 bin = "sws"
 to = "/bin/sws"
-hash = "sha256:0d7a6317dcc7ce718bbfdc585bbe782b2f7361a0ed25058c909f31c00a430862"
+hash = "sha256:9182bdc3255947185d3524d0ec2c7f5bfde3187202e5ed2f3ef61d4d3c2a7529"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1548,7 +1548,7 @@ features = [
 ]
 default-features = false
 to = "/bin/video-player"
-hash = "sha256:21f4caa183fd5bbfd2f037f94bc7cc09e433e3098c2f613187e6fba598a0a55e"
+hash = "sha256:371940b7e4da79df8f3773d624333b0ca0a73830240b9b696ec545077f5dc2f9"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1698,7 +1698,7 @@ path = ".scarlet/cache/git/1d707eff8bef4cad/bundle/build-aarch64.sh"
 [[sections.rootfs.layers]]
 kind = "script"
 to = "/"
-hash = "sha256:5a14b3930e3bd1a404a451ce9114471f911f0ac6fdd6a683c7e638aa0e8ec5e9"
+hash = "sha256:fc5e2e6c1ba29a1221d4fee725069c42a6a3c9a6ce53b971ee58551cdc6795f1"
 
 [sections.rootfs.layers.source]
 type = "path"
@@ -1733,7 +1733,7 @@ kind = "cargo"
 package = "sgfx-backend-scarlet-adreno-plugin"
 lib = "sgfx_scarlet_adreno"
 to = "/lib/sgfx/libsgfx_scarlet_adreno.so"
-hash = "sha256:79bd8e1134916728ebe73b07cc3dd00e22f74ffbe1363b1bc31a1884c561b42a"
+hash = "sha256:378b0f7d0ae165c8acc11740297099f0f16f8718dc873208f229504496ae68a2"
 
 [sections.rootfs.layers.source]
 type = "path"
