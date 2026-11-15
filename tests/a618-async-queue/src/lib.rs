@@ -10,6 +10,9 @@ extern crate alloc;
 #[path = "../../../drivers/gpu/qcom-adreno-a618/src/pending.rs"]
 mod pending;
 
+#[path = "../../../drivers/gpu/qcom-adreno-a618/src/activity.rs"]
+mod activity;
+
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;

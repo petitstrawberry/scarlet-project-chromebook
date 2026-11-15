@@ -15,6 +15,8 @@
 extern crate alloc;
 
 mod event_drain;
+mod power;
+mod power_decode;
 
 use alloc::{
     boxed::Box,
@@ -1302,6 +1304,9 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         return Err("cros-ec-spi: failed to request EC GPIO IRQ");
     }
     CONTROLLERS.lock().push(controller.clone());
+    if primary {
+        power::register();
+    }
     ensure_event_worker_started();
     // Preserve a level already asserted between request_irq() and publication.
     if !irq_gpio.get_value(irq_pin) {

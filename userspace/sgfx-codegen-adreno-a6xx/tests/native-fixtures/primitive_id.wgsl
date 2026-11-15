@@ -1,0 +1,1 @@
+@fragment fn main(@builtin(primitive_index) i:u32)->@location(0) vec4<f32>{return vec4<f32>(f32(i),0.5,0.25,1.0);}

@@ -1,0 +1,26 @@
+[
+  {
+    "group": 0,
+    "binding": 0,
+    "slot": 0,
+    "kind": "UniformBuffer",
+    "writable": false,
+    "minimum_size": 1120
+  },
+  {
+    "group": 0,
+    "binding": 1,
+    "slot": 1,
+    "kind": "Texture",
+    "writable": false,
+    "minimum_size": 0
+  },
+  {
+    "group": 0,
+    "binding": 2,
+    "slot": 2,
+    "kind": "Sampler",
+    "writable": false,
+    "minimum_size": 0
+  }
+]

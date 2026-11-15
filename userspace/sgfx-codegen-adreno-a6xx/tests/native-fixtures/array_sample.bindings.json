@@ -1,0 +1,18 @@
+[
+  {
+    "group": 0,
+    "binding": 2,
+    "slot": 2,
+    "kind": "Texture",
+    "writable": false,
+    "minimum_size": 0
+  },
+  {
+    "group": 0,
+    "binding": 3,
+    "slot": 3,
+    "kind": "Sampler",
+    "writable": false,
+    "minimum_size": 0
+  }
+]

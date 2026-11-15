@@ -96,6 +96,10 @@ impl<T> PendingQueue<T> {
         Some(value)
     }
 
+    pub(crate) fn queued_count_where(&self, predicate: impl Fn(&T) -> bool) -> usize {
+        self.queued.iter().filter(|entry| predicate(entry)).count()
+    }
+
     /// Ends the active scheduling turn. Only proven DMA retirement releases
     /// capacity; an unretired operation permanently occupies its slot until
     /// this queue is replaced after a safe hardware reset or shutdown.

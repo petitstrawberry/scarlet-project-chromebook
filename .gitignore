@@ -11,6 +11,8 @@
 # Rust / Scarlet generated output
 /target/
 target/
+# cargo-scarlet may link the BSP target directory to a shared build output.
+/projects/*/bsp/target
 /.scarlet/
 .scarlet/
 .scarlet-operation.lock

@@ -1,0 +1,10 @@
+[
+  {
+    "group": 3,
+    "binding": 9,
+    "slot": 0,
+    "kind": "StorageBuffer",
+    "writable": true,
+    "minimum_size": 4
+  }
+]

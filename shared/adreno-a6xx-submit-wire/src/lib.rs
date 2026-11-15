@@ -16,7 +16,15 @@ pub const VERSION_MAJOR: u16 = 1;
 /// Wire ABI minor version.
 /// Minor 1 assigns relocation byte 30 to `RelocationSource`; minor 0 required
 /// it to be zero and therefore supports attachment sources only.
-pub const VERSION_MINOR: u16 = 1;
+/// Minor 2 adds native shader attachment authority (source kind 2).
+pub const VERSION_MINOR: u16 = 2;
+/// Scarlet dialect negotiation token: A6XX family, wire major, wire minor.
+/// Query this token from the kernel; the local library version is not evidence
+/// that a running kernel supports isolated native execution. Within major 1,
+/// minor 2 and later promise ShaderAttachment execution in a private domain.
+/// The kernel still requires the exact queried token when creating a context.
+pub const DIALECT_TOKEN: u64 =
+    0x4136_5858_0000_0000 | ((VERSION_MAJOR as u64) << 16) | VERSION_MINOR as u64;
 /// Fixed v1 header size.
 pub const HEADER_SIZE: usize = 64;
 /// Fixed v1 resource record size.
@@ -87,6 +95,9 @@ pub enum AddressEncoding {
     /// A6xx TEX_MEMOBJ address bits (word 0 bits 5..31 and word 1 bits
     /// 0..16), preserving non-address descriptor fields.
     GpuVa49TexDescriptor = 3,
+    /// A6xx UBO descriptor: address low32 and high17; preserve vec4 size in
+    /// the upper 15 bits of the second word. Available starting at minor 2.
+    GpuVa49UboDescriptor = 4,
 }
 
 impl AddressEncoding {
@@ -94,6 +105,7 @@ impl AddressEncoding {
         match value {
             1 => Ok(Self::GpuVa64),
             3 => Ok(Self::GpuVa49TexDescriptor),
+            4 => Ok(Self::GpuVa49UboDescriptor),
             _ => Err(Error::InvalidField),
         }
     }
@@ -101,14 +113,14 @@ impl AddressEncoding {
     /// Number of PM4 dwords occupied by this address.
     pub const fn word_count(self) -> u32 {
         match self {
-            Self::GpuVa64 | Self::GpuVa49TexDescriptor => 2,
+            Self::GpuVa64 | Self::GpuVa49TexDescriptor | Self::GpuVa49UboDescriptor => 2,
         }
     }
 
     fn placeholder_is_valid(self, words: &[u32]) -> bool {
         match self {
             Self::GpuVa64 => words == [0, 0],
-            Self::GpuVa49TexDescriptor => {
+            Self::GpuVa49TexDescriptor | Self::GpuVa49UboDescriptor => {
                 words.len() == 2 && words[0] == 0 && words[1] & 0x1ffff == 0
             }
         }
@@ -139,6 +151,10 @@ pub enum RelocationSource {
     Attachment(u32),
     /// An immutable program in the kernel-owned canonical shader pack.
     CanonicalShader(ShaderVariant),
+    /// Native ISA in an attached buffer. This source MUST execute in an
+    /// isolated domain containing only this submission's authorized pages.
+    /// Neither this tag nor PM4 validation verifies the shader instructions.
+    ShaderAttachment(u32),
 }
 
 /// Borrowed data to encode as one canonical v1 payload.
@@ -282,6 +298,25 @@ fn validate_resource(resource: Resource) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_shader_attachment(relocation: Relocation, resource: Resource) -> Result<(), Error> {
+    if matches!(relocation.source, RelocationSource::ShaderAttachment(_))
+        && (relocation.access != ACCESS_READ
+            || resource.access != ACCESS_READ
+            || relocation.encoding != AddressEncoding::GpuVa64
+            || (resource
+                .range_offset
+                .checked_add(relocation.resource_offset)
+                .ok_or(Error::Overflow)?
+                & 127)
+                != 0
+            || relocation.required_size == 0
+            || relocation.required_size & 127 != 0)
+    {
+        return Err(Error::InvalidField);
+    }
+    Ok(())
+}
+
 fn validate_relocation(
     relocation: Relocation,
     previous_end: Option<u32>,
@@ -293,7 +328,8 @@ fn validate_relocation(
         return Err(Error::RelocationsNotSorted);
     }
     match relocation.source {
-        RelocationSource::Attachment(resource_index) => {
+        RelocationSource::Attachment(resource_index)
+        | RelocationSource::ShaderAttachment(resource_index) => {
             let resource = resources
                 .get(resource_index as usize)
                 .ok_or(Error::RelocationOutOfBounds)?;
@@ -304,6 +340,7 @@ fn validate_relocation(
                 .resource_offset
                 .checked_add(relocation.required_size)
                 .ok_or(Error::Overflow)?;
+            validate_shader_attachment(relocation, *resource)?;
             if range_end > resource.range_size {
                 return Err(Error::RelocationOutOfBounds);
             }
@@ -386,6 +423,7 @@ pub fn encode(submit: Submit<'_>, output: &mut [u8]) -> Result<(), Error> {
         let offset = layout.relocations_offset + index * RELOCATION_SIZE;
         let (source_kind, source_index) = match relocation.source {
             RelocationSource::Attachment(index) => (0_u16, index),
+            RelocationSource::ShaderAttachment(index) => (2, index),
             RelocationSource::CanonicalShader(variant) => (1, u32::from(variant.raw())),
         };
         put_u32(output, offset, relocation.pm4_word_offset);
@@ -410,6 +448,14 @@ pub struct DecodedSubmit<'a> {
 }
 
 impl<'a> DecodedSubmit<'a> {
+    /// Native shader bytes are untrusted ISA, requiring per-submit DMA isolation.
+    pub fn requires_isolation(&self) -> bool {
+        (0..self.relocation_count).any(|index| {
+            self.relocation(index)
+                .is_some_and(|r| matches!(r.source, RelocationSource::ShaderAttachment(_)))
+        })
+    }
+
     /// Number of inline PM4 dwords.
     pub const fn pm4_len(&self) -> usize {
         self.pm4_count
@@ -455,8 +501,14 @@ impl<'a> DecodedSubmit<'a> {
             1 if get_u16(self.bytes, 6) >= 1 => RelocationSource::CanonicalShader(
                 ShaderVariant::from_raw(u16::try_from(get_u32(self.bytes, offset + 4)).ok()?)?,
             ),
+            2 if get_u16(self.bytes, 6) >= 2 => {
+                RelocationSource::ShaderAttachment(get_u32(self.bytes, offset + 4))
+            }
             _ => return None,
         };
+        if get_u16(self.bytes, offset + 28) == 4 && get_u16(self.bytes, 6) < 2 {
+            return None;
+        }
         Some(Relocation {
             pm4_word_offset: get_u32(self.bytes, offset),
             source,
@@ -531,7 +583,8 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedSubmit<'_>, Error> {
             return Err(Error::RelocationsNotSorted);
         }
         match relocation.source {
-            RelocationSource::Attachment(resource_index) => {
+            RelocationSource::Attachment(resource_index)
+            | RelocationSource::ShaderAttachment(resource_index) => {
                 let resource = decoded
                     .resource(resource_index as usize)
                     .ok_or(Error::RelocationOutOfBounds)?;
@@ -542,6 +595,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedSubmit<'_>, Error> {
                     .resource_offset
                     .checked_add(relocation.required_size)
                     .ok_or(Error::Overflow)?;
+                validate_shader_attachment(relocation, resource)?;
                 if range_end > resource.range_size {
                     return Err(Error::RelocationOutOfBounds);
                 }
@@ -585,6 +639,12 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedSubmit<'_>, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dialect_token_reports_native_isolation_wire_version() {
+        assert_eq!(super::DIALECT_TOKEN, 0x4136_5858_0001_0002);
+        assert_eq!((super::DIALECT_TOKEN >> 16) as u16, super::VERSION_MAJOR);
+        assert_eq!(super::DIALECT_TOKEN as u16, super::VERSION_MINOR);
+    }
     extern crate std;
 
     use adreno_a6xx_shader_pack::ShaderVariant;
@@ -604,6 +664,98 @@ mod tests {
             pm4,
             resources,
             relocations: relocs,
+        }
+    }
+
+    #[test]
+    fn native_shader_and_ubo_tags_require_minor_two() {
+        for (source, encoding, high) in [
+            (
+                RelocationSource::ShaderAttachment(0),
+                AddressEncoding::GpuVa64,
+                0,
+            ),
+            (
+                RelocationSource::Attachment(0),
+                AddressEncoding::GpuVa49UboDescriptor,
+                8 << 17,
+            ),
+        ] {
+            let pm4 = [0, high];
+            let resources = [Resource {
+                attachment_token: 1,
+                range_offset: 0,
+                range_size: 128,
+                access: ACCESS_READ,
+            }];
+            let relocations = [Relocation {
+                pm4_word_offset: 0,
+                source,
+                resource_offset: 0,
+                required_size: 128,
+                access: ACCESS_READ,
+                encoding,
+            }];
+            let submit = sample(&pm4, &resources, &relocations);
+            let mut bytes = vec![0; encoded_len(submit).unwrap()];
+            encode(submit, &mut bytes).unwrap();
+            let decoded = decode(&bytes).unwrap();
+            assert_eq!(decoded.relocation(0), Some(relocations[0]));
+            assert_eq!(
+                decoded.requires_isolation(),
+                matches!(source, RelocationSource::ShaderAttachment(_))
+            );
+            for minor in [0u16, 1] {
+                bytes[6..8].copy_from_slice(&minor.to_le_bytes());
+                assert!(decode(&bytes).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn native_shader_authority_is_read_only_and_instruction_aligned() {
+        let pm4 = [0, 0];
+        for (offset, size, resource_access, relocation_access, encoding) in [
+            (4, 128, ACCESS_READ, ACCESS_READ, AddressEncoding::GpuVa64),
+            (0, 8, ACCESS_READ, ACCESS_READ, AddressEncoding::GpuVa64),
+            (
+                0,
+                128,
+                ACCESS_READ | ACCESS_WRITE,
+                ACCESS_READ,
+                AddressEncoding::GpuVa64,
+            ),
+            (
+                0,
+                128,
+                ACCESS_READ | ACCESS_WRITE,
+                ACCESS_WRITE,
+                AddressEncoding::GpuVa64,
+            ),
+            (
+                0,
+                128,
+                ACCESS_READ,
+                ACCESS_READ,
+                AddressEncoding::GpuVa49UboDescriptor,
+            ),
+        ] {
+            let resources = [Resource {
+                attachment_token: 1,
+                range_offset: offset,
+                range_size: 256,
+                access: resource_access,
+            }];
+            let relocations = [Relocation {
+                pm4_word_offset: 0,
+                source: RelocationSource::ShaderAttachment(0),
+                resource_offset: 0,
+                required_size: size,
+                access: relocation_access,
+                encoding,
+            }];
+            let submit = sample(&pm4, &resources, &relocations);
+            assert!(encode(submit, &mut vec![0; encoded_len(submit).unwrap()]).is_err());
         }
     }
 

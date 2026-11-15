@@ -1,0 +1,1 @@
+@group(0) @binding(0) var t:texture_depth_2d;@group(0) @binding(1) var s:sampler;@fragment fn main()->@location(0) vec4<f32>{return textureGather(t,s,vec2<f32>(0.5));}

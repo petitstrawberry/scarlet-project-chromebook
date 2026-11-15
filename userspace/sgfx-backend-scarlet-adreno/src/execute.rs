@@ -31,6 +31,66 @@ struct GeneratedProgress {
 }
 
 impl ContextResources {
+    pub(crate) fn normalize_render_pass<'data>(
+        &mut self,
+        pass: ir::RenderPassDesc<'_>,
+        resources: &mut Vec<codegen::ResourceMeta>,
+        bindings: &mut Vec<BoundObject>,
+    ) -> Result<codegen::Operation<'data>, IrSubmitError> {
+        let format = self.resources.texture(pass.target())?.format();
+        let extended = pass.color_attachments().count() > 1
+            || matches!(
+                format,
+                ir::TextureFormat::Rgba16Float | ir::TextureFormat::Rgba32Float
+            );
+        #[cfg(not(feature = "programmable"))]
+        if extended {
+            return Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::ProgrammableExecution,
+            ));
+        }
+        let depth = if let Some(depth) = pass.depth_attachment() {
+            Some(codegen::DepthAttachment {
+                target: self.ensure_image(depth.target(), resources, bindings)?,
+                load: depth.load(),
+                store: depth.store(),
+            })
+        } else {
+            None
+        };
+        #[cfg(feature = "programmable")]
+        if extended {
+            let mut colors = Vec::new();
+            for color in pass.color_attachments() {
+                colors.push(codegen::NativeColorAttachment {
+                    target: self.ensure_image_subresource(
+                        color.target(),
+                        0,
+                        0,
+                        resources,
+                        bindings,
+                    )?,
+                    load: color.load(),
+                    store: color.store(),
+                });
+            }
+            return Ok(codegen::Operation::BeginNativeRenderPass(
+                codegen::NativeRenderPass {
+                    colors,
+                    area: pass.area(),
+                    depth,
+                },
+            ));
+        }
+        Ok(codegen::Operation::BeginRenderPass(codegen::RenderPass {
+            target: self.ensure_image_subresource(pass.target(), 0, 0, resources, bindings)?,
+            area: pass.area(),
+            load: pass.load(),
+            store: pass.store(),
+            depth,
+        }))
+    }
+
     pub(crate) fn execute<'r, 'data>(
         &mut self,
         context: &ContextInner,
@@ -46,259 +106,284 @@ impl ContextResources {
             return Err(IrSubmitError::ResourceTableMismatch);
         }
 
-        let mut resources = Vec::new();
-        let mut pipelines = Vec::new();
-        let mut operations = Vec::new();
-        let mut external_bindings = Vec::new();
-        resources
-            .try_reserve(commands.commands().len())
-            .map_err(|_| IrSubmitError::OutOfMemory)?;
-        operations
-            .try_reserve(commands.commands().len())
-            .map_err(|_| IrSubmitError::OutOfMemory)?;
-        external_bindings
-            .try_reserve(commands.commands().len())
-            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        let publication = self.prepare_buffer_publication(commands)?;
+        let execution = (|| {
+            let mut resources = Vec::new();
+            let mut pipelines = Vec::new();
+            let mut operations = Vec::new();
+            let mut external_bindings = Vec::new();
+            resources
+                .try_reserve(commands.commands().len())
+                .map_err(|_| IrSubmitError::OutOfMemory)?;
+            operations
+                .try_reserve(commands.commands().len())
+                .map_err(|_| IrSubmitError::OutOfMemory)?;
+            external_bindings
+                .try_reserve(commands.commands().len())
+                .map_err(|_| IrSubmitError::OutOfMemory)?;
 
-        for command in commands.commands() {
-            match command {
-                ir::Command::WriteBuffer {
-                    buffer,
-                    offset,
-                    data,
-                } => {
-                    // Every A618 SGFX buffer is CPU-visible and mapped into
-                    // the GPU SMMU domain with the coherent attribute. Drain
-                    // earlier GPU work to preserve IR ordering, then update the
-                    // retained shared mapping directly. Encoding CP_MEMCPY for
-                    // dynamic UI data duplicated the host copy and generated
-                    // thousands of relocation/authority records per frame.
-                    self.submit_operations(
-                        context,
-                        queue,
-                        &resources,
-                        &pipelines,
-                        &mut operations,
-                        &external_bindings,
-                    )?;
-                    self.write_buffer(*buffer, *offset, data)?;
-                }
-                ir::Command::WriteTexture { texture, write } => {
-                    let descriptor = self.resources.texture(*texture)?;
-                    require_texture_upload_format(descriptor.format())?;
-                    if descriptor.mip_level_count() > 1 || descriptor.array_layer_count() > 1 {
-                        let destination = self.ensure_image_subresource(
-                            *texture,
-                            write.mip_level(),
-                            write.array_layer(),
+            for command in commands.commands() {
+                match command {
+                    ir::Command::CopyBufferToBuffer {
+                        source,
+                        source_offset,
+                        destination,
+                        destination_offset,
+                        size,
+                    } => {
+                        let source =
+                            self.ensure_buffer(*source, &mut resources, &mut external_bindings)?;
+                        let destination = self.ensure_buffer(
+                            *destination,
                             &mut resources,
                             &mut external_bindings,
                         )?;
-                        operations.push(codegen::Operation::WriteTexture {
+                        operations.push(codegen::Operation::CopyBufferToBuffer {
+                            source,
+                            source_offset: *source_offset,
                             destination,
-                            area: write.destination(),
-                            bytes_per_row: write.bytes_per_row(),
-                            data: write.data(),
+                            destination_offset: *destination_offset,
+                            size: *size,
                         });
-                    } else {
-                        self.ensure_image(*texture, &mut resources, &mut external_bindings)?;
+                    }
+                    ir::Command::WriteBuffer {
+                        buffer,
+                        offset,
+                        data,
+                    } => {
+                        // Every A618 SGFX buffer is CPU-visible and mapped into
+                        // the GPU SMMU domain with the coherent attribute. Drain
+                        // earlier GPU work to preserve IR ordering, then update the
+                        // retained shared mapping directly. Encoding CP_MEMCPY for
+                        // dynamic UI data duplicated the host copy and generated
+                        // thousands of relocation/authority records per frame.
                         self.submit_operations(
                             context,
                             queue,
-                            &resources,
-                            &pipelines,
+                            &mut resources,
+                            &mut pipelines,
                             &mut operations,
-                            &external_bindings,
+                            &mut external_bindings,
                         )?;
-                        self.upload_texture_bgra(context, *texture, *write)?;
+                        self.write_buffer(*buffer, *offset, data)?;
                     }
-                }
-                ir::Command::BlitTexture {
-                    source,
-                    source_mip,
-                    destination,
-                    destination_mip,
-                    source_rect,
-                    destination_rect,
-                    filter,
-                    flips,
-                } => {
-                    let source = self.ensure_image_subresource(
-                        *source,
-                        *source_mip,
-                        0,
-                        &mut resources,
-                        &mut external_bindings,
-                    )?;
-                    let destination = self.ensure_image_subresource(
-                        *destination,
-                        *destination_mip,
-                        0,
-                        &mut resources,
-                        &mut external_bindings,
-                    )?;
-                    operations.push(codegen::Operation::BlitTexture {
-                        source,
-                        destination,
-                        source_rect: *source_rect,
-                        destination_rect: *destination_rect,
-                        filter: *filter,
-                        flips: *flips,
-                    });
-                }
-                // Each transfer and render pass retires its CCUs and the next
-                // begins by invalidating them. The ordered queue therefore
-                // already enforces the explicit IR dependency.
-                ir::Command::ResourceBarrier(_) => {}
-                ir::Command::CopyTextureToTexture {
-                    source,
-                    source_rect,
-                    destination,
-                    destination_rect,
-                } => {
-                    let source = self.ensure_image_subresource(
-                        *source,
-                        0,
-                        0,
-                        &mut resources,
-                        &mut external_bindings,
-                    )?;
-                    let destination = self.ensure_image_subresource(
-                        *destination,
-                        0,
-                        0,
-                        &mut resources,
-                        &mut external_bindings,
-                    )?;
-                    operations.push(codegen::Operation::CopyTextureToTexture {
-                        source,
-                        source_rect: *source_rect,
-                        destination,
-                        destination_rect: *destination_rect,
-                    });
-                }
-                ir::Command::BeginRenderPass(pass) => {
-                    let target = self.ensure_image_subresource(
-                        pass.target(),
-                        0,
-                        0,
-                        &mut resources,
-                        &mut external_bindings,
-                    )?;
-                    let depth = if let Some(depth) = pass.depth_attachment() {
-                        Some(codegen::DepthAttachment {
-                            target: self.ensure_image(
-                                depth.target(),
+                    ir::Command::WriteTexture { texture, write } => {
+                        let descriptor = self.resources.texture(*texture)?;
+                        require_texture_upload_format(descriptor.format())?;
+                        if descriptor.mip_level_count() > 1
+                            || descriptor.array_layer_count() > 1
+                            || matches!(
+                                descriptor.format(),
+                                ir::TextureFormat::Depth32Float
+                                    | ir::TextureFormat::Rgba16Float
+                                    | ir::TextureFormat::Rgba32Float
+                            )
+                        {
+                            let destination = self.ensure_image_subresource(
+                                *texture,
+                                write.mip_level(),
+                                write.array_layer(),
                                 &mut resources,
                                 &mut external_bindings,
-                            )?,
-                            load: depth.load(),
-                            store: depth.store(),
-                        })
-                    } else {
-                        None
-                    };
-                    operations.push(codegen::Operation::BeginRenderPass(codegen::RenderPass {
-                        target,
-                        area: pass.area(),
-                        load: pass.load(),
-                        store: pass.store(),
-                        depth,
-                    }));
-                }
-                ir::Command::EndRenderPass => operations.push(codegen::Operation::EndRenderPass),
-                ir::Command::SetPipeline(pipeline) => {
-                    let pipeline = self.ensure_pipeline(*pipeline, &mut pipelines)?;
-                    operations.push(codegen::Operation::SetPipeline(pipeline));
-                }
-                ir::Command::SetVertexBuffer { buffer, offset } => {
-                    let buffer =
-                        self.ensure_buffer(*buffer, &mut resources, &mut external_bindings)?;
-                    operations.push(codegen::Operation::SetVertexBuffer {
+                            )?;
+                            operations.push(codegen::Operation::WriteTexture {
+                                destination,
+                                area: write.destination(),
+                                bytes_per_row: write.bytes_per_row(),
+                                data: write.data(),
+                            });
+                        } else {
+                            self.ensure_image(*texture, &mut resources, &mut external_bindings)?;
+                            self.submit_operations(
+                                context,
+                                queue,
+                                &mut resources,
+                                &mut pipelines,
+                                &mut operations,
+                                &mut external_bindings,
+                            )?;
+                            self.upload_texture_bgra(context, *texture, *write)?;
+                        }
+                    }
+                    ir::Command::BlitTexture {
+                        source,
+                        source_mip,
+                        destination,
+                        destination_mip,
+                        source_rect,
+                        destination_rect,
+                        filter,
+                        flips,
+                    } => {
+                        let source = self.ensure_image_subresource(
+                            *source,
+                            *source_mip,
+                            0,
+                            &mut resources,
+                            &mut external_bindings,
+                        )?;
+                        let destination = self.ensure_image_subresource(
+                            *destination,
+                            *destination_mip,
+                            0,
+                            &mut resources,
+                            &mut external_bindings,
+                        )?;
+                        operations.push(codegen::Operation::BlitTexture {
+                            source,
+                            destination,
+                            source_rect: *source_rect,
+                            destination_rect: *destination_rect,
+                            filter: *filter,
+                            flips: *flips,
+                        });
+                    }
+                    // Flush both CCUs and order CP writes, including global
+                    // barriers introduced by the current SGFX wire format.
+                    ir::Command::ResourceBarrier(_) => {
+                        operations.push(codegen::Operation::ResourceBarrier)
+                    }
+                    ir::Command::CopyTextureToTexture {
+                        source,
+                        source_rect,
+                        destination,
+                        destination_rect,
+                    } => {
+                        let source = self.ensure_image_subresource(
+                            *source,
+                            0,
+                            0,
+                            &mut resources,
+                            &mut external_bindings,
+                        )?;
+                        let destination = self.ensure_image_subresource(
+                            *destination,
+                            0,
+                            0,
+                            &mut resources,
+                            &mut external_bindings,
+                        )?;
+                        operations.push(codegen::Operation::CopyTextureToTexture {
+                            source,
+                            source_rect: *source_rect,
+                            destination,
+                            destination_rect: *destination_rect,
+                        });
+                    }
+                    ir::Command::BeginRenderPass(pass) => {
+                        operations.push(self.normalize_render_pass(
+                            *pass,
+                            &mut resources,
+                            &mut external_bindings,
+                        )?);
+                    }
+                    ir::Command::EndRenderPass => {
+                        operations.push(codegen::Operation::EndRenderPass)
+                    }
+                    ir::Command::SetPipeline(pipeline) => {
+                        let pipeline = self.ensure_pipeline(*pipeline, &mut pipelines)?;
+                        operations.push(codegen::Operation::SetPipeline(pipeline));
+                    }
+                    ir::Command::SetVertexBuffer { buffer, offset } => {
+                        let buffer =
+                            self.ensure_buffer(*buffer, &mut resources, &mut external_bindings)?;
+                        operations.push(codegen::Operation::SetVertexBuffer {
+                            buffer,
+                            offset: *offset,
+                        });
+                    }
+                    ir::Command::SetIndexBuffer {
                         buffer,
-                        offset: *offset,
-                    });
-                }
-                ir::Command::SetIndexBuffer {
-                    buffer,
-                    offset,
-                    format,
-                } => {
-                    let buffer =
-                        self.ensure_buffer(*buffer, &mut resources, &mut external_bindings)?;
-                    operations.push(codegen::Operation::SetIndexBuffer {
-                        buffer,
-                        offset: *offset,
-                        format: *format,
-                    });
-                }
-                ir::Command::SetTexture(texture) => {
-                    let texture =
-                        self.ensure_image(*texture, &mut resources, &mut external_bindings)?;
-                    operations.push(codegen::Operation::SetTexture(texture));
-                }
-                ir::Command::SetSampler(sampler) => {
-                    let descriptor = self.resources.sampler(*sampler)?;
-                    operations.push(codegen::Operation::SetSampler(descriptor));
-                }
-                ir::Command::SetUniforms(uniforms) => {
-                    operations.push(codegen::Operation::SetUniforms(*uniforms));
-                }
-                ir::Command::SetViewport(viewport) => {
-                    operations.push(codegen::Operation::SetViewport(*viewport));
-                }
-                ir::Command::SetScissor(scissor) => {
-                    operations.push(codegen::Operation::SetScissor(*scissor));
-                }
-                ir::Command::Draw {
-                    vertex_count,
-                    first_vertex,
-                } => operations.push(codegen::Operation::Draw {
-                    vertex_count: *vertex_count,
-                    first_vertex: *first_vertex,
-                }),
-                ir::Command::DrawIndexed {
-                    index_count,
-                    first_index,
-                    base_vertex,
-                } => operations.push(codegen::Operation::DrawIndexed {
-                    index_count: *index_count,
-                    first_index: *first_index,
-                    base_vertex: *base_vertex,
-                }),
-                // Keep the published fixed-only 1.0 core and development
-                // programmable IR compatible with the same explicit rejection.
-                #[allow(unreachable_patterns)]
-                _ => {
-                    return Err(IrSubmitError::Unsupported(
-                        UnsupportedIrFeature::ProgrammableExecution,
-                    ));
+                        offset,
+                        format,
+                    } => {
+                        let buffer =
+                            self.ensure_buffer(*buffer, &mut resources, &mut external_bindings)?;
+                        operations.push(codegen::Operation::SetIndexBuffer {
+                            buffer,
+                            offset: *offset,
+                            format: *format,
+                        });
+                    }
+                    ir::Command::SetTexture(texture) => {
+                        let texture =
+                            self.ensure_image(*texture, &mut resources, &mut external_bindings)?;
+                        operations.push(codegen::Operation::SetTexture(texture));
+                    }
+                    ir::Command::SetSampler(sampler) => {
+                        let descriptor = self.resources.sampler(*sampler)?;
+                        operations.push(codegen::Operation::SetSampler(descriptor));
+                    }
+                    ir::Command::SetUniforms(uniforms) => {
+                        operations.push(codegen::Operation::SetUniforms(*uniforms));
+                    }
+                    ir::Command::SetViewport(viewport) => {
+                        operations.push(codegen::Operation::SetViewport(*viewport));
+                    }
+                    ir::Command::SetScissor(scissor) => {
+                        operations.push(codegen::Operation::SetScissor(*scissor));
+                    }
+                    ir::Command::Draw {
+                        vertex_count,
+                        first_vertex,
+                    } => operations.push(codegen::Operation::Draw {
+                        vertex_count: *vertex_count,
+                        first_vertex: *first_vertex,
+                    }),
+                    ir::Command::DrawIndexed {
+                        index_count,
+                        first_index,
+                        base_vertex,
+                    } => operations.push(codegen::Operation::DrawIndexed {
+                        index_count: *index_count,
+                        first_index: *first_index,
+                        base_vertex: *base_vertex,
+                    }),
+                    // Keep the published fixed-only 1.0 core and development
+                    // programmable IR compatible with the same explicit rejection.
+                    #[allow(unreachable_patterns)]
+                    _ => {
+                        #[cfg(feature = "programmable")]
+                        operations.push(self.programmable_operation(
+                            command,
+                            &mut resources,
+                            &mut external_bindings,
+                        )?);
+                        #[cfg(not(feature = "programmable"))]
+                        return Err(IrSubmitError::Unsupported(
+                            UnsupportedIrFeature::ProgrammableExecution,
+                        ));
+                    }
                 }
             }
-        }
 
-        self.submit_operations(
-            context,
-            queue,
-            &resources,
-            &pipelines,
-            &mut operations,
-            &external_bindings,
-        )
+            self.submit_operations(
+                context,
+                queue,
+                &mut resources,
+                &mut pipelines,
+                &mut operations,
+                &mut external_bindings,
+            )
+        })();
+        self.finish_buffer_execution(publication, execution)
     }
 
     fn submit_operations<'data>(
         &mut self,
         context: &ContextInner,
         queue: &gpu_raw::GpuQueue,
-        resources: &[codegen::ResourceMeta],
-        pipelines: &[codegen::PipelineMeta],
+        resources: &mut Vec<codegen::ResourceMeta>,
+        pipelines: &mut Vec<codegen::PipelineMeta>,
         operations: &mut Vec<codegen::Operation<'data>>,
-        external_bindings: &[BoundObject],
+        external_bindings: &mut Vec<BoundObject>,
     ) -> Result<(), IrSubmitError> {
         if operations.is_empty() {
             return Ok(());
         }
+        #[cfg(feature = "programmable")]
+        {self.lower_programmable_nv12(resources,external_bindings,operations)?;
+        self.lower_fixed(pipelines,resources,external_bindings,operations)?;}
         let chunks = crate::preparation::split_async_operations(operations)?;
         let mut pending = Vec::new();
         pending
@@ -321,13 +406,7 @@ impl ContextResources {
                 ) => {
                     let draw_count = chunk
                         .iter()
-                        .filter(|operation| {
-                            matches!(
-                                operation,
-                                codegen::Operation::Draw { .. }
-                                    | codegen::Operation::DrawIndexed { .. }
-                            )
-                        })
+                        .filter(|operation| crate::preparation::is_draw(operation))
                         .count();
                     if draw_count <= 1 {
                         return Err(error);
@@ -644,7 +723,7 @@ impl ContextResources {
     }
 }
 
-/// Reject extended IR before an upload, native submission, or cold mapping.
+/// Reject unavailable commands before an upload, native submission, or cold mapping.
 pub(crate) fn validate_fixed_command_subset(
     commands: &ir::CommandBuffer<'_, '_>,
 ) -> Result<(), IrSubmitError> {
@@ -652,6 +731,7 @@ pub(crate) fn validate_fixed_command_subset(
         if !matches!(
             command,
             ir::Command::WriteBuffer { .. }
+                | ir::Command::CopyBufferToBuffer { .. }
                 | ir::Command::WriteTexture { .. }
                 | ir::Command::CopyTextureToTexture { .. }
                 | ir::Command::BlitTexture { .. }
@@ -669,6 +749,23 @@ pub(crate) fn validate_fixed_command_subset(
                 | ir::Command::Draw { .. }
                 | ir::Command::DrawIndexed { .. }
         ) {
+            #[cfg(feature = "programmable")]
+            if matches!(
+                command,
+                ir::Command::SetProgrammablePipeline(_)
+                    | ir::Command::SetBindGroup { .. }
+                    | ir::Command::BeginComputePass
+                    | ir::Command::EndComputePass
+                    | ir::Command::SetComputePipeline(_)
+                    | ir::Command::Dispatch { .. }
+                    | ir::Command::SetVertexBufferSlot { .. }
+                    | ir::Command::SetPushConstants { .. }
+                    | ir::Command::SetDrawIndex(_)
+                    | ir::Command::DrawInstanced { .. }
+                    | ir::Command::DrawIndexedInstanced { .. }
+            ) {
+                continue;
+            }
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::ProgrammableExecution,
             ));
@@ -686,7 +783,10 @@ fn prepare_bgra_upload<'data>(
     format: ir::TextureFormat,
     write: ir::TextureWrite<'data>,
 ) -> Result<PreparedBgraUpload<'data>, IrSubmitError> {
-    if format == ir::TextureFormat::Bgra8Unorm {
+    if matches!(
+        format,
+        ir::TextureFormat::Bgra8Unorm | ir::TextureFormat::Bgra8UnormSrgb
+    ) {
         return Ok(PreparedBgraUpload {
             pixels: Cow::Borrowed(write.data()),
             bytes_per_row: write.bytes_per_row(),
@@ -694,7 +794,10 @@ fn prepare_bgra_upload<'data>(
     }
     if !matches!(
         format,
-        ir::TextureFormat::Rgba8Unorm | ir::TextureFormat::R8Unorm
+        ir::TextureFormat::Rgba8Unorm
+            | ir::TextureFormat::Rgba8UnormSrgb
+            | ir::TextureFormat::R8Unorm
+            | ir::TextureFormat::Rg8Unorm
     ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::TextureUpload,
@@ -743,7 +846,7 @@ fn prepare_bgra_upload<'data>(
         let destination =
             &mut pixels[destination_start..destination_start + destination_stride as usize];
         match format {
-            ir::TextureFormat::Rgba8Unorm => {
+            ir::TextureFormat::Rgba8Unorm | ir::TextureFormat::Rgba8UnormSrgb => {
                 for (source, destination) in
                     source.chunks_exact(4).zip(destination.chunks_exact_mut(4))
                 {
@@ -753,6 +856,13 @@ fn prepare_bgra_upload<'data>(
             ir::TextureFormat::R8Unorm => {
                 for (&alpha, destination) in source.iter().zip(destination.chunks_exact_mut(4)) {
                     destination.copy_from_slice(&[0, 0, 0, alpha]);
+                }
+            }
+            ir::TextureFormat::Rg8Unorm => {
+                for (source, destination) in
+                    source.chunks_exact(2).zip(destination.chunks_exact_mut(4))
+                {
+                    destination.copy_from_slice(&[0, source[1], source[0], 255]);
                 }
             }
             _ => unreachable!(),
@@ -843,18 +953,16 @@ fn append_image_resource(
             texture: image.texture,
             format: descriptor.format(),
             storage_format: match descriptor.format() {
-                ir::TextureFormat::Depth32Float => ir::TextureFormat::Depth32Float,
+                ir::TextureFormat::Depth32Float
+                | ir::TextureFormat::Rgba16Float
+                | ir::TextureFormat::Rgba32Float => descriptor.format(),
                 ir::TextureFormat::Bgra8Unorm
                 | ir::TextureFormat::Rgba8Unorm
-                | ir::TextureFormat::R8Unorm => ir::TextureFormat::Bgra8Unorm,
-                ir::TextureFormat::Nv12 => ir::TextureFormat::Nv12,
-                ir::TextureFormat::Rg8Unorm
+                | ir::TextureFormat::R8Unorm
+                | ir::TextureFormat::Rg8Unorm
                 | ir::TextureFormat::Bgra8UnormSrgb
-                | ir::TextureFormat::Rgba8UnormSrgb => {
-                    return Err(IrSubmitError::Unsupported(
-                        UnsupportedIrFeature::ResourceState,
-                    ));
-                }
+                | ir::TextureFormat::Rgba8UnormSrgb => ir::TextureFormat::Bgra8Unorm,
+                ir::TextureFormat::Nv12 => ir::TextureFormat::Nv12,
             },
             extent: descriptor.extent(),
             usage,
@@ -891,14 +999,25 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, IrSubmitError> {
 }
 
 fn require_texture_upload_format(format: ir::TextureFormat) -> Result<(), IrSubmitError> {
+    #[cfg(feature = "programmable")]
+    if matches!(
+        format,
+        ir::TextureFormat::Depth32Float
+            | ir::TextureFormat::Rgba16Float
+            | ir::TextureFormat::Rgba32Float
+    ) {
+        return Ok(());
+    }
     match format {
         ir::TextureFormat::Bgra8Unorm
         | ir::TextureFormat::Rgba8Unorm
-        | ir::TextureFormat::R8Unorm => Ok(()),
-        ir::TextureFormat::Rg8Unorm
-        | ir::TextureFormat::Nv12
+        | ir::TextureFormat::R8Unorm
+        | ir::TextureFormat::Rg8Unorm
         | ir::TextureFormat::Bgra8UnormSrgb
-        | ir::TextureFormat::Rgba8UnormSrgb
+        | ir::TextureFormat::Rgba8UnormSrgb => Ok(()),
+        ir::TextureFormat::Rgba16Float
+        | ir::TextureFormat::Rgba32Float
+        | ir::TextureFormat::Nv12
         | ir::TextureFormat::Depth32Float => Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::TextureUpload,
         )),
@@ -913,7 +1032,9 @@ mod tests {
         MAX_DRAWS_PER_SUBMIT, MAX_TEXTURED_DRAWS_PER_SUBMIT, prepare_bgra_upload,
         require_texture_upload_format, split_submission_operations,
     };
-    use crate::{IrSubmitError, UnsupportedIrFeature, ir};
+    use crate::ir;
+    #[cfg(not(feature = "programmable"))]
+    use crate::{IrSubmitError, UnsupportedIrFeature};
 
     #[test]
     fn oversized_render_pass_is_split_with_store_load_and_state_replay() {
@@ -1079,15 +1200,27 @@ mod tests {
             ir::TextureFormat::Bgra8Unorm,
             ir::TextureFormat::Rgba8Unorm,
             ir::TextureFormat::R8Unorm,
+            ir::TextureFormat::Rg8Unorm,
+            ir::TextureFormat::Bgra8UnormSrgb,
+            ir::TextureFormat::Rgba8UnormSrgb,
         ] {
             assert!(require_texture_upload_format(format).is_ok());
         }
+        #[cfg(not(feature = "programmable"))]
         assert!(matches!(
             require_texture_upload_format(ir::TextureFormat::Depth32Float),
             Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::TextureUpload
             ))
         ));
+        #[cfg(feature = "programmable")]
+        for format in [
+            ir::TextureFormat::Depth32Float,
+            ir::TextureFormat::Rgba16Float,
+            ir::TextureFormat::Rgba32Float,
+        ] {
+            assert!(require_texture_upload_format(format).is_ok());
+        }
     }
 
     #[test]
@@ -1117,6 +1250,29 @@ mod tests {
             upload.pixels.as_ref(),
             &[3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12, 15, 14, 13, 16]
         );
+    }
+
+    #[test]
+    fn rg_and_srgb_uploads_preserve_logical_components() {
+        let area = ir::PixelRect::new(0, 0, 2, 1).unwrap();
+        let rg = [17, 19, 231, 213];
+        let upload = prepare_bgra_upload(
+            ir::TextureFormat::Rg8Unorm,
+            ir::TextureWrite::new(area, 4, &rg).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(upload.pixels.as_ref(), &[0, 19, 17, 255, 0, 213, 231, 255]);
+        let rgba = [17, 19, 23, 255, 231, 213, 123, 128];
+        let write = ir::TextureWrite::new(area, 8, &rgba).unwrap();
+        let upload = prepare_bgra_upload(ir::TextureFormat::Rgba8UnormSrgb, write).unwrap();
+        assert_eq!(
+            upload.pixels.as_ref(),
+            &[23, 19, 17, 255, 123, 213, 231, 128]
+        );
+        let write = ir::TextureWrite::new(area, 8, &rgba).unwrap();
+        let upload = prepare_bgra_upload(ir::TextureFormat::Bgra8UnormSrgb, write).unwrap();
+        assert!(matches!(upload.pixels, Cow::Borrowed(_)));
+        assert_eq!(upload.pixels.as_ref(), &rgba);
     }
 
     #[test]

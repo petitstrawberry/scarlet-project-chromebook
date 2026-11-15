@@ -72,6 +72,12 @@ pub(crate) fn encode(
                 access: wire_access(fixup.access)?,
                 encoding: match fixup.encoding {
                     CodegenAddressEncoding::GpuVa64 => submit_wire::AddressEncoding::GpuVa64,
+                    #[cfg(feature = "programmable")]
+                    CodegenAddressEncoding::GpuVa49UboDescriptor => {
+                        return Err(IrSubmitError::Unsupported(
+                            UnsupportedIrFeature::ResourceState,
+                        ));
+                    }
                     CodegenAddressEncoding::GpuVa49TexDescriptor => {
                         return Err(IrSubmitError::Unsupported(
                             UnsupportedIrFeature::ResourceState,
@@ -91,11 +97,19 @@ pub(crate) fn encode(
             ));
         }
         let fixup_access = wire_access(fixup.access)?;
-        let first =
-            access_indices.partition_point(|&index| compiled.accesses[index].object < fixup.object);
+        // Native executable and embedded-data references share one physical
+        // allocation/access record. The executable tag belongs to the address
+        // relocation, not a second resource identity.
+        let access_object = match fixup.object {
+            #[cfg(feature = "programmable")]
+            ObjectRef::NativeShader(id) => ObjectRef::External(id),
+            other => other,
+        };
+        let first = access_indices
+            .partition_point(|&index| compiled.accesses[index].object < access_object);
         let end = access_indices.partition_point(|&index| {
             let access = &compiled.accesses[index];
-            (access.object, access.offset) <= (fixup.object, fixup.object_offset)
+            (access.object, access.offset) <= (access_object, fixup.object_offset)
         });
         let resource_index = access_indices[first..end]
             .iter()
@@ -126,12 +140,24 @@ pub(crate) fn encode(
         let resource_offset = absolute_offset.checked_sub(resource.range_offset).ok_or(
             IrSubmitError::Unsupported(UnsupportedIrFeature::ResourceState),
         )?;
+        let resource_index = u32::try_from(resource_index)
+            .map_err(|_| IrSubmitError::Unsupported(UnsupportedIrFeature::ResourceState))?;
+        let source = match fixup.object {
+            #[cfg(feature = "programmable")]
+            ObjectRef::NativeShader(_) => {
+                if fixup.access != Access::READ || fixup.encoding != CodegenAddressEncoding::GpuVa64
+                {
+                    return Err(IrSubmitError::Unsupported(
+                        UnsupportedIrFeature::ResourceState,
+                    ));
+                }
+                submit_wire::RelocationSource::ShaderAttachment(resource_index)
+            }
+            _ => submit_wire::RelocationSource::Attachment(resource_index),
+        };
         relocations.push(submit_wire::Relocation {
             pm4_word_offset: fixup.word_offset,
-            source: submit_wire::RelocationSource::Attachment(
-                u32::try_from(resource_index)
-                    .map_err(|_| IrSubmitError::Unsupported(UnsupportedIrFeature::ResourceState))?,
-            ),
+            source,
             resource_offset,
             required_size: fixup.required_size,
             access: fixup_access,
@@ -139,6 +165,10 @@ pub(crate) fn encode(
                 CodegenAddressEncoding::GpuVa64 => submit_wire::AddressEncoding::GpuVa64,
                 CodegenAddressEncoding::GpuVa49TexDescriptor => {
                     submit_wire::AddressEncoding::GpuVa49TexDescriptor
+                }
+                #[cfg(feature = "programmable")]
+                CodegenAddressEncoding::GpuVa49UboDescriptor => {
+                    submit_wire::AddressEncoding::GpuVa49UboDescriptor
                 }
             },
         });
@@ -224,6 +254,42 @@ mod tests {
             generated_objects: vec![],
         };
         (object, compiled)
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn native_code_relocation_resolves_the_shared_external_access_identity() {
+        let (data, mut compiled) = one_read_fixup();
+        let code = ObjectRef::NativeShader(ObjectId::new(7));
+        compiled.fixups[0].object = code;
+        compiled.fixups[0].object_offset = 0;
+        compiled.fixups[0].required_size = 128;
+        compiled.accesses[0].offset = 0;
+        compiled.accesses[0].size = 256;
+        let data_binding = BoundObject {
+            object: data,
+            attachment_token: 99,
+            allocation_offset: 0,
+            size: 256,
+        };
+        let encoded = encode(
+            &compiled,
+            &[
+                data_binding,
+                BoundObject {
+                    object: code,
+                    ..data_binding
+                },
+            ],
+        )
+        .unwrap();
+        let decoded = adreno_a6xx_submit_wire::decode(&encoded).unwrap();
+        assert!(decoded.requires_isolation());
+        assert_eq!(
+            decoded.relocation(0).unwrap().source,
+            adreno_a6xx_submit_wire::RelocationSource::ShaderAttachment(0)
+        );
+        assert_eq!(decoded.resource(0).unwrap().attachment_token, 99);
     }
 
     #[test]

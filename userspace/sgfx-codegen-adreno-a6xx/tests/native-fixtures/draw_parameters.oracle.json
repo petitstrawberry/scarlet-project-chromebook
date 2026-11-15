@@ -1,0 +1,89 @@
+{
+  "cases": [
+    {
+      "draw_index": 13,
+      "driver_words": [
+        13,
+        7,
+        11,
+        4294967295,
+        0
+      ],
+      "expected_rgba8": [
+        13,
+        135,
+        11,
+        255
+      ],
+      "first_instance": 11,
+      "first_vertex": 7,
+      "instance_count": 2,
+      "name": "nonindexed"
+    },
+    {
+      "base_vertex": -5,
+      "draw_index": 19,
+      "driver_words": [
+        19,
+        4294967291,
+        17,
+        4294967295,
+        4294967295
+      ],
+      "expected_rgba8": [
+        19,
+        123,
+        17,
+        255
+      ],
+      "first_index": 0,
+      "first_instance": 17,
+      "indices_u32": [
+        5,
+        6,
+        7
+      ],
+      "instance_count": 2,
+      "name": "indexed_negative_base"
+    },
+    {
+      "draw_index": 5,
+      "driver_words": [
+        5,
+        2,
+        3,
+        4294967295,
+        0
+      ],
+      "expected_rgba8": [
+        5,
+        130,
+        3,
+        255
+      ],
+      "first_instance": 3,
+      "first_vertex": 2,
+      "instance_count": 1,
+      "name": "following_draw_update"
+    }
+  ],
+  "compiler_cache_version": 7,
+  "entry": "main",
+  "fragment_interface": "location0 flat vec3<u32> = DrawIndex,BaseVertex bits,BaseInstance; FS bitcasts base bits to signed i32 and adds128 for byte readback",
+  "gpu_executed": false,
+  "native_core_khr_equal": true,
+  "procedure": "For codegen verify actual kind3 allocation writes driver_words at offset_vec4, using artifact metadata and driver_ubos if applicable. For GPU execute each case with both original SPV versions and fragment.wgsl/SPV, read every pixel separately before next draw; compare expected with tolerance1. Subsequent draw must update constants, not reuse cached first values.",
+  "render": {
+    "blend": false,
+    "cull": "None",
+    "depth_test": false,
+    "format": "Rgba8Unorm",
+    "size": [
+      4,
+      4
+    ],
+    "topology": "TriangleList"
+  },
+  "source_note": "vertex.template.wgsl is a generator template, not a draw-parameter WGSL shader. Generator patches three argument bindings in Naga IR to BaseVertex/BaseInstance/DrawID then emits valid original SPIR-V. Use vertex-core.spv or vertex-khr.spv as actual input.",
+  "vertex_count": 3
+}

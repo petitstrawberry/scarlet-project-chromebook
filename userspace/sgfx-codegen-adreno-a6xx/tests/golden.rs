@@ -141,6 +141,11 @@ fn assert_well_formed(artifact: &sgfx_codegen_adreno_a6xx::RelocatablePm4) {
             sgfx_codegen_adreno_a6xx::AddressEncoding::GpuVa64 => {
                 assert!(artifact.words[start..end].iter().all(|word| *word == 0));
             }
+            #[cfg(feature = "programmable")]
+            sgfx_codegen_adreno_a6xx::AddressEncoding::GpuVa49UboDescriptor => {
+                assert_eq!(artifact.words[start], 0);
+                assert_eq!(artifact.words[start + 1] & 0x1ffff, 0);
+            }
             sgfx_codegen_adreno_a6xx::AddressEncoding::GpuVa49TexDescriptor => {
                 assert_eq!(artifact.words[start], 0);
                 assert_eq!(artifact.words[start + 1] & 0x1ffff, 0);
@@ -542,6 +547,45 @@ fn depth32_clear_test_and_write_are_a_relocatable_sysmem_stream() {
         2,
         "retire depth once after the paired clears and once after 3D"
     );
+}
+
+#[test]
+fn narrow_and_srgb_uploads_use_exact_bgra_packing_and_logical_row_pitch() {
+    for format in [TextureFormat::Rg8Unorm,TextureFormat::Bgra8UnormSrgb,TextureFormat::Rgba8UnormSrgb] {
+        let bpp=format.bytes_per_pixel().unwrap() as usize;
+        let row=2*bpp;
+        let pitch=row+3;
+        let data:Vec<u8>=(0..pitch+row).map(|n|n as u8).collect();
+        let mut r=resources();
+        let target=r.iter_mut().find(|r|r.id==TARGET).unwrap();
+        let ResourceKind::Image(i)=&mut target.kind else{unreachable!()};
+        i.format=format;i.usage=TextureUsage::COPY_DST;
+        let ops=[Operation::WriteTexture{destination:TARGET,area:rect(1,2,2,2),bytes_per_row:pitch as u32,data:&data}];
+        let artifact=compile(CompileInput{capabilities:Capabilities::a618(512*1024,32768),resources:&r,pipelines:&[],operations:&ops}).unwrap();
+        let mut expected=Vec::new();
+        for y in 0..2 { for p in data[y*pitch..y*pitch+row].chunks_exact(bpp) {
+            match format {
+                TextureFormat::Rg8Unorm=>expected.extend_from_slice(&[0,p[1],p[0],255]),
+                TextureFormat::Rgba8UnormSrgb=>expected.extend_from_slice(&[p[2],p[1],p[0],p[3]]),
+                _=>expected.extend_from_slice(p),
+            }
+        }}
+        assert!(artifact.generated_objects.iter().any(|o|o.kind==GeneratedObjectKind::Upload&&o.bytes==expected));
+        let writes:Vec<_>=artifact.fixups.iter().filter(|f|f.object==ObjectRef::External(TARGET)).collect();
+        assert_eq!(writes.len(),2);
+        assert!(writes.iter().all(|f|f.required_size==8&&f.access==Access::WRITE));
+    }
+}
+
+#[test]
+fn linear_row_upload_cannot_write_tiled_color_memory() {
+    let resource=ResourceMeta {id:TARGET,size:4096,kind:ResourceKind::Image(ImageMeta {
+        conversion:None,texture:None,format:TextureFormat::Bgra8Unorm,storage_format:TextureFormat::Bgra8Unorm,
+        extent:Extent2D::new(64,16).unwrap(),usage:TextureUsage::COPY_DST,modifier:ImageModifier::A6xxTile6_3Color,
+        planes:vec![PlaneLayout{offset:0,stride:256,size:4096}],
+    })};
+    let ops=[Operation::WriteTexture{destination:TARGET,area:rect(0,0,1,1),bytes_per_row:4,data:&[1,2,3,4]}];
+    assert_eq!(compile(CompileInput{capabilities:Capabilities::a618(512*1024,32768),resources:&[resource],pipelines:&[],operations:&ops}).unwrap_err(),CompileError::UnsupportedFeatureReason("tiled color upload requires GPU staging"));
 }
 
 #[test]
@@ -1080,7 +1124,10 @@ fn indexed_draw_rejects_unaligned_binding_and_negative_base_vertex() {
     };
     for (operations, expected) in [
         (make_operations(1, 0), CompileError::OutOfBounds),
-        (make_operations(0, -1), CompileError::UnsupportedFeature),
+        (
+            make_operations(0, -1),
+            CompileError::UnsupportedFeatureReason("negative base vertex"),
+        ),
     ] {
         assert_eq!(
             compile(CompileInput {
@@ -2400,4 +2447,244 @@ fn alternating_textures_initialize_once_before_draws_without_idle_barriers() {
         }),
         Err(CompileError::CommandBudgetExceeded)
     );
+}
+
+#[test]
+fn buffer_copy_rejects_invalid_ranges_usage_and_aliasing() {
+    let source = ObjectId::new(40);
+    let destination = ObjectId::new(41);
+    let resources = [
+        ResourceMeta {
+            id: source,
+            size: 1024,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::COPY_SRC,
+            },
+        },
+        ResourceMeta {
+            id: destination,
+            size: 1024,
+            kind: ResourceKind::Buffer {
+                usage: BufferUsage::COPY_DST,
+            },
+        },
+    ];
+    let copy = |src, src_offset, dst, dst_offset, size| Operation::CopyBufferToBuffer {
+        source: src,
+        source_offset: src_offset,
+        destination: dst,
+        destination_offset: dst_offset,
+        size,
+    };
+    for operation in [
+        copy(source, 0, destination, 0, 0),
+        copy(source, 1, destination, 0, 4),
+        copy(source, 0, destination, 1, 4),
+        copy(source, 0, destination, 0, 3),
+        copy(source, 1024, destination, 0, 4),
+        copy(source, 0, destination, 1024, 4),
+        copy(source, u64::MAX - 3, destination, 0, 8),
+        copy(source, 0, source, 0, 4),
+        copy(destination, 0, source, 0, 4),
+    ] {
+        assert!(
+            compile(CompileInput {
+                capabilities: Capabilities::a618(512 * 1024, 4096),
+                resources: &resources,
+                pipelines: &[],
+                operations: &[operation],
+            })
+            .is_err()
+        );
+    }
+    assert!(
+        compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &[],
+            operations: &[copy(source, 1020, destination, 1020, 4)],
+        })
+        .is_ok()
+    );
+}
+
+#[test]
+fn retained_draw_state_switches_between_straight_and_premultiplied_alpha() {
+    use sgfx_core::ir::{BlendComponent, BlendFactor, BlendOp};
+    let straight = pipeline();
+    let over = BlendComponent::new(
+        BlendFactor::One,
+        BlendFactor::OneMinusSourceAlpha,
+        BlendOp::Add,
+    );
+    let premultiplied = PipelineMeta {
+        id: PipelineId::new(99),
+        descriptor: RenderPipelineDesc::new(
+            TextureFormat::Bgra8Unorm,
+            PrimitiveTopology::TriangleList,
+            straight.descriptor.vertex_buffer().clone(),
+            FragmentProgram::VertexColor,
+            BlendState::new(over, over),
+            straight.descriptor.raster(),
+        )
+        .unwrap(),
+    };
+    let mut operations = vec![
+        Operation::BeginRenderPass(RenderPass {
+            target: TARGET,
+            area: rect(0, 0, 16, 16),
+            load: LoadOp::Load,
+            store: StoreOp::Store,
+            depth: None,
+        }),
+        Operation::SetVertexBuffer {
+            buffer: VERTICES,
+            offset: 0,
+        },
+        Operation::SetUniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+        )),
+    ];
+    for id in [straight.id, premultiplied.id, premultiplied.id, straight.id] {
+        operations.push(Operation::SetPipeline(id));
+        operations.push(Operation::Draw {
+            vertex_count: 3,
+            first_vertex: 0,
+        });
+    }
+    operations.push(Operation::EndRenderPass);
+    let artifact = compile(CompileInput {
+        capabilities: Capabilities::a618(512 * 1024, 16 * 1024),
+        resources: &resources(),
+        pipelines: &[straight, premultiplied],
+        operations: &operations,
+    })
+    .unwrap();
+    let controls: Vec<_> = Packets::new(&artifact.words)
+        .map(Result::unwrap)
+        .filter(|p| {
+            matches!(
+                p.header,
+                Header::Type4 {
+                    register: 0x8820,
+                    ..
+                }
+            )
+        })
+        .map(|p| p.payload.to_vec())
+        .collect();
+    // The repeated premultiplied draw reuses state, but both transitions
+    // must update the source factor rather than keep the previous blend.
+    assert_eq!(
+        controls,
+        vec![
+            vec![0x7e3, 0x0701_0706],
+            vec![0x7e3, 0x0701_0701],
+            vec![0x7e3, 0x0701_0706]
+        ]
+    );
+}
+
+#[test]
+fn fixed_normalized_render_targets_keep_format_and_clear_encoding() {
+    for format in [
+        TextureFormat::Bgra8UnormSrgb,
+        TextureFormat::Rgba8UnormSrgb,
+        TextureFormat::R8Unorm,
+        TextureFormat::Rgba8Unorm,
+    ] {
+        let mut resources = resources();
+        let ResourceKind::Image(image) = &mut resources[0].kind else {
+            panic!()
+        };
+        image.format = format;
+        let original = pipeline().descriptor;
+        let target_pipeline = PipelineMeta {
+            id: PIPELINE,
+            descriptor: RenderPipelineDesc::new(
+                format,
+                original.topology(),
+                original.vertex_buffer().clone(),
+                original.fragment(),
+                original.blend(),
+                original.raster(),
+            )
+            .unwrap(),
+        };
+        let ops = [
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: rect(0, 0, 16, 16),
+                load: LoadOp::Clear(Color::rgba(0.25, 0.5, 0.75, 0.5).unwrap()),
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetVertexBuffer {
+                buffer: VERTICES,
+                offset: 0,
+            },
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::Draw {
+                vertex_count: 3,
+                first_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let a = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &[target_pipeline],
+            operations: &ops,
+        })
+        .unwrap();
+        let reg = |r| {
+            Packets::new(&a.words)
+                .filter_map(|p| {
+                    let p = p.unwrap();
+                    if let Header::Type4 { register, count } = p.header {
+                        if r >= register && r < register + u32::from(count) {
+                            return Some(p.payload[(r - register) as usize]);
+                        }
+                    }
+                    None
+                })
+                .last()
+                .unwrap()
+        };
+        let srgb = matches!(
+            format,
+            TextureFormat::Bgra8UnormSrgb | TextureFormat::Rgba8UnormSrgb
+        );
+        let r8 = format == TextureFormat::R8Unorm;
+        assert_eq!(reg(0x880f), u32::from(srgb));
+        assert_eq!(reg(0xa98a), u32::from(srgb));
+        assert_eq!(reg(0x8822), 0x30 | if r8 { 3 << 13 } else { 1 << 13 });
+        assert_eq!(reg(0x8820), if r8 { 0xe3 } else { 0x7e3 });
+        let clear = if srgb {
+            [137, 188, 225, 128]
+        } else if r8 {
+            [64, 0, 0, 255]
+        } else {
+            [64, 128, 191, 128]
+        };
+        for (i, v) in clear.into_iter().enumerate() {
+            assert_eq!(reg(0x8c2c + i as u32), v);
+        }
+        // Pipeline/attachment format disagreement remains an error.
+        let invalid = [pipeline()];
+        assert!(
+            compile(CompileInput {
+                capabilities: Capabilities::a618(512 * 1024, 4096),
+                resources: &resources,
+                pipelines: &invalid,
+                operations: &ops
+            })
+            .is_err()
+        );
+    }
 }

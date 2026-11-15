@@ -1,0 +1,478 @@
+--- a/src/back/spv/writer.rs
++++ b/src/back/spv/writer.rs
+@@ -1511,0 +1512,8 @@
++                if matches!(built_in, Bi::BaseVertex | Bi::BaseInstance | Bi::DrawID) {
++                    if self.physical_layout.version < 0x10300 &&
++                       !self.capabilities_used.contains(&spirv::Capability::DrawParameters) {
++                        Instruction::extension("SPV_KHR_shader_draw_parameters")
++                            .to_words(&mut self.logical_layout.extensions);
++                    }
++                    self.require_any("shader draw parameters", &[spirv::Capability::DrawParameters])?;
++                }
+--- a/src/front/spv/image.rs
++++ b/src/front/spv/image.rs
+@@ -48,0 +49,2 @@
++    /// Gather sampling; comparison selects X, ordinary gather reads a component.
++    pub gather: bool,
+@@ -193 +195 @@
+-    var: &mut crate::GlobalVariable,
++    ty: &mut Handle<crate::Type>,
+@@ -198,0 +201,3 @@
++    if matches!(arena[*ty].inner, crate::TypeInner::Image { class: crate::ImageClass::Depth { .. }, .. }) {
++        return true;
++    }
+@@ -203,3 +208,3 @@
+-    log::debug!("Flipping comparison for {:?}", var);
+-    let original_ty = &arena[var.ty];
+-    let original_ty_span = arena.get_span(var.ty);
++    log::debug!("Flipping comparison for {:?}", ty);
++    let original_ty = &arena[*ty];
++    let original_ty_span = arena.get_span(*ty);
+@@ -221 +226 @@
+-    var.ty = arena.insert(
++    *ty = arena.insert(
+@@ -466,0 +472,17 @@
++        let gather = if options.gather {
++            let component = if options.compare {
++                0
++            } else {
++                let id = self.next()?;
++                let constant = self.lookup_constant.lookup(id)?;
++                super::resolve_constant(ctx.module.to_ctx(), &constant.inner)
++                    .ok_or(Error::InvalidOperand)?
++            };
++            Some(match component {
++                0 => crate::SwizzleComponent::X,
++                1 => crate::SwizzleComponent::Y,
++                2 => crate::SwizzleComponent::Z,
++                3 => crate::SwizzleComponent::W,
++                _ => return Err(Error::InvalidOperand),
++            })
++        } else { None };
+@@ -476 +498,16 @@
+-        let mut level = crate::SampleLevel::Auto;
++        // Portable gather supports no image operand or one constant offset.
++        // Reject unknown operands/counts instead of the legacy sampler path's
++        // warning-and-skip behavior, which would silently change the operation.
++        if options.gather {
++            let expected = match image_ops {
++                0 => 0,
++                mask if mask == spirv::ImageOperands::CONST_OFFSET.bits() => 1,
++                _ => return Err(Error::InvalidOperand),
++            };
++            if words_left != expected { return Err(Error::InvalidWordCount); }
++        }
++        let mut level = if options.gather {
++            crate::SampleLevel::Zero
++        } else {
++            crate::SampleLevel::Auto
++        };
+@@ -710 +747 @@
+-            gather: None, //TODO
++            gather,
+@@ -718 +755 @@
+-        let handle = if is_depth && depth_ref.is_none() {
++        let handle = if is_depth && depth_ref.is_none() && !options.gather {
+--- a/src/front/spv/mod.rs
++++ b/src/front/spv/mod.rs
+@@ -52,0 +53 @@
++    spirv::Capability::DrawParameters,
+@@ -79,0 +81 @@
++    "SPV_KHR_shader_draw_parameters",
+@@ -2781,2 +2783,2 @@
+-                Op::ImageSampleImplicitLod | Op::ImageSampleExplicitLod => {
+-                    let extra = inst.expect_at_least(5)?;
++                Op::ImageSampleImplicitLod | Op::ImageSampleExplicitLod | Op::ImageGather => {
++                    let extra = inst.expect_at_least(if inst.op == Op::ImageGather { 6 } else { 5 })?;
+@@ -2785,0 +2788 @@
++                        gather: inst.op == Op::ImageGather,
+@@ -2801,0 +2805 @@
++                        gather: false,
+@@ -2813 +2817 @@
+-                Op::ImageSampleDrefImplicitLod | Op::ImageSampleDrefExplicitLod => {
++                Op::ImageSampleDrefImplicitLod | Op::ImageSampleDrefExplicitLod | Op::ImageDrefGather => {
+@@ -2817,0 +2822 @@
++                        gather: inst.op == Op::ImageDrefGather,
+@@ -2833,0 +2839 @@
++                        gather: false,
+@@ -4537,0 +4544 @@
++        types: &mut UniqueArena<crate::Type>,
+@@ -4564,0 +4572,8 @@
++        // Flags already propagate from callee to caller in topological order.
++        // Patch parameter types as well as globals: SPIR-V sampler types carry
++        // no comparison bit, and otherwise helpers keep a non-comparison type.
++        for (argument, &flags) in fun.arguments.iter_mut().zip(&parameters_sampling) {
++            if !image::patch_comparison_type(flags, &mut argument.ty, types) {
++                return Err(Error::InvalidOperand);
++            }
++        }
+@@ -4682 +4697 @@
+-            self.patch_function(Some(handle), fun)?;
++            self.patch_function(Some(handle), fun, &mut module.types)?;
+@@ -4685 +4700 @@
+-            self.patch_function(None, &mut ep.function)?;
++            self.patch_function(None, &mut ep.function, &mut module.types)?;
+@@ -4692 +4707 @@
+-                module.global_variables.get_mut(handle),
++                &mut module.global_variables.get_mut(handle).ty,
+--- a/src/front/wgsl/error.rs
++++ b/src/front/wgsl/error.rs
+@@ -168,0 +169 @@
++    InvalidTextureSampleBaseClampToEdge(Span),
+@@ -471,0 +473,7 @@
++                notes: vec![],
++            },
++            Error::InvalidTextureSampleBaseClampToEdge(span) => ParseError {
++                message:
++                    "textureSampleBaseClampToEdge requires (texture_2d<f32>, sampler, vec2<f32>)"
++                        .into(),
++                labels: vec![(span, "invalid argument types".into())],
+--- a/src/front/wgsl/tests.rs
++++ b/src/front/wgsl/tests.rs
+@@ -829,0 +830,219 @@
++
++const BASE_CLAMP_SHADER: &str = r#"
++    @group(0) @binding(0) var t: texture_2d<f32>;
++    @group(0) @binding(1) var s: sampler;
++    fn sample_base(coords: vec2<f32>) -> vec4<f32> {
++        return textureSampleBaseClampToEdge(t, s, coords);
++    }
++    @fragment fn main(@location(0) coords: vec2<f32>) -> @location(0) vec4<f32> {
++        return sample_base(coords);
++    }
++"#;
++
++#[test]
++fn texture_sample_base_clamp_to_edge_lowers_half_texel_bounds() {
++    let module = parse_str(BASE_CLAMP_SHADER).unwrap();
++    crate::valid::Validator::new(
++        crate::valid::ValidationFlags::all(),
++        crate::valid::Capabilities::empty(),
++    )
++    .validate(&module)
++    .unwrap();
++    let function = module
++        .functions
++        .iter()
++        .find(|(_, f)| f.name.as_deref() == Some("sample_base"))
++        .unwrap()
++        .1;
++    let (image, coordinate) = function
++        .expressions
++        .iter()
++        .find_map(|(_, e)| match *e {
++            crate::Expression::ImageSample {
++                image,
++                coordinate,
++                level: crate::SampleLevel::Zero,
++                gather: None,
++                depth_ref: None,
++                array_index: None,
++                offset: None,
++                ..
++            } => Some((image, coordinate)),
++            _ => None,
++        })
++        .expect("base-level sample with no extra operands");
++    assert!(function.expressions.iter().any(|(_, e)| matches!(e,
++        crate::Expression::ImageQuery { image: query_image, query: crate::ImageQuery::Size { level: None } }
++            if *query_image == image)));
++
++    // Evaluate the lowered coordinate expression with runtime dimensions.
++    // Non-square and one-texel images expose an incorrect scalar extent or
++    // [0, 1] clamp, even when ordinary in-range samples look correct.
++    fn evaluate(
++        expressions: &crate::Arena<crate::Expression>,
++        handle: crate::Handle<crate::Expression>,
++        coords: [f32; 2],
++        dimensions: [f32; 2],
++    ) -> [f32; 2] {
++        use crate::{BinaryOperator as B, Expression as E, MathFunction as M};
++        let eval = |h| evaluate(expressions, h, coords, dimensions);
++        match expressions[handle] {
++            E::FunctionArgument(0) => coords,
++            E::Literal(crate::Literal::F32(value)) => [value; 2],
++            E::Splat {
++                size: crate::VectorSize::Bi,
++                value,
++            } => eval(value),
++            E::Compose { ref components, .. } if components.len() == 2 => {
++                [eval(components[0])[0], eval(components[1])[0]]
++            }
++            E::ImageQuery {
++                query: crate::ImageQuery::Size { level: None },
++                ..
++            } => dimensions,
++            E::As {
++                expr,
++                kind: crate::ScalarKind::Float,
++                convert: Some(4),
++            } => eval(expr),
++            E::Binary { op, left, right } => {
++                let (left, right) = (eval(left), eval(right));
++                core::array::from_fn(|i| match op {
++                    B::Divide => left[i] / right[i],
++                    B::Subtract => left[i] - right[i],
++                    _ => panic!("unexpected coordinate arithmetic: {op:?}"),
++                })
++            }
++            E::Math {
++                fun: M::Clamp,
++                arg,
++                arg1: Some(lo),
++                arg2: Some(hi),
++                arg3: None,
++            } => {
++                let (value, lo, hi) = (eval(arg), eval(lo), eval(hi));
++                core::array::from_fn(|i| value[i].clamp(lo[i], hi[i]))
++            }
++            ref other => panic!("unexpected coordinate expression: {other:?}"),
++        }
++    }
++    for (coords, dimensions, expected) in [
++        ([-3.0, 5.0], [8.0, 4.0], [0.0625, 0.875]),
++        ([0.25, 0.5], [8.0, 4.0], [0.25, 0.5]),
++        ([0.0, 1.0], [1.0, 32.0], [0.5, 0.984375]),
++        ([1.0, 0.0], [16.0, 1.0], [0.96875, 0.5]),
++    ] {
++        assert_eq!(
++            evaluate(&function.expressions, coordinate, coords, dimensions),
++            expected
++        );
++    }
++
++    // Base-level sampling requires no derivatives and is valid outside fragment shaders.
++    let declarations = BASE_CLAMP_SHADER.split("@fragment").next().unwrap();
++    for entry in [
++        "@vertex fn main() -> @builtin(position) vec4<f32> { return sample_base(vec2(0.5)); }",
++        "@group(0) @binding(2) var<storage, read_write> output: vec4<f32>;\n@compute @workgroup_size(1) fn main() { output = sample_base(vec2(0.5)); }",
++    ] {
++        let module = parse_str(&format!("{declarations}{entry}")).unwrap();
++        crate::valid::Validator::new(crate::valid::ValidationFlags::all(), crate::valid::Capabilities::empty())
++            .validate(&module).unwrap();
++    }
++}
++
++#[test]
++fn texture_sample_base_clamp_to_edge_rejects_other_overloads() {
++    for texture in [
++        "texture_1d<f32>",
++        "texture_2d_array<f32>",
++        "texture_3d<f32>",
++        "texture_cube<f32>",
++        "texture_depth_2d",
++        "texture_2d<i32>",
++        "texture_2d<u32>",
++        "texture_multisampled_2d<f32>",
++        "texture_storage_2d<rgba8unorm, read>",
++    ] {
++        let source = BASE_CLAMP_SHADER.replace("texture_2d<f32>", texture);
++        let error = parse_str(&source).expect_err(texture);
++        assert!(
++            error
++                .message()
++                .contains("requires (texture_2d<f32>, sampler, vec2<f32>)"),
++            "{texture}: {error:?}"
++        );
++    }
++    for replacement in [
++        "t, s, 0.5",
++        "t, s, vec3<f32>(0.5)",
++        "t, s, vec2<i32>(1)",
++        "t, s, vec2<u32>(1)",
++        "t, s",
++        "t, s, coords, vec2<i32>(0)",
++    ] {
++        let source = BASE_CLAMP_SHADER.replace(
++            "textureSampleBaseClampToEdge(t, s, coords)",
++            &format!("textureSampleBaseClampToEdge({replacement})"),
++        );
++        assert!(parse_str(&source).is_err(), "accepted {replacement}");
++    }
++    assert!(
++        parse_str(&BASE_CLAMP_SHADER.replace("var s: sampler;", "var s: sampler_comparison;"))
++            .is_err()
++    );
++}
++
++#[test]
++#[cfg(feature = "spv-out")]
++fn texture_sample_base_clamp_to_edge_spirv_has_clamp_and_explicit_zero_lod() {
++    let module = parse_str(BASE_CLAMP_SHADER).unwrap();
++    let info = crate::valid::Validator::new(
++        crate::valid::ValidationFlags::all(),
++        crate::valid::Capabilities::empty(),
++    )
++    .validate(&module)
++    .unwrap();
++    let words = crate::back::spv::write_vec(
++        &module,
++        &info,
++        &crate::back::spv::Options::default(),
++        Some(&crate::back::spv::PipelineOptions {
++            shader_stage: crate::ShaderStage::Fragment,
++            entry_point: "main".into(),
++        }),
++    )
++    .unwrap();
++    let mut instructions = Vec::new();
++    let mut cursor = 5;
++    while cursor < words.len() {
++        let count = (words[cursor] >> 16) as usize;
++        assert!(count > 0);
++        instructions.push(&words[cursor..cursor + count]);
++        cursor += count;
++    }
++    let is_op = |i: &&[u32], op: spirv::Op| i[0] & 0xffff == op as u32;
++    let zero = |id| {
++        instructions
++            .iter()
++            .any(|i| is_op(i, spirv::Op::Constant) && i[2] == id && i[3] == 0)
++    };
++    let samples: Vec<_> = instructions
++        .iter()
++        .filter(|i| is_op(i, spirv::Op::ImageSampleExplicitLod))
++        .collect();
++    assert_eq!(samples.len(), 1);
++    assert_eq!(samples[0][5], spirv::ImageOperands::LOD.bits());
++    assert!(zero(samples[0][6]));
++    assert!(!instructions
++        .iter()
++        .any(|i| is_op(i, spirv::Op::ImageSampleImplicitLod)));
++    let queries: Vec<_> = instructions
++        .iter()
++        .filter(|i| is_op(i, spirv::Op::ImageQuerySizeLod))
++        .collect();
++    assert_eq!(queries.len(), 1);
++    assert!(zero(queries[0][4]));
++    assert!(instructions
++        .iter()
++        .any(|i| is_op(i, spirv::Op::ExtInst) && i[4] == spirv::GLOp::FClamp as u32));
++}
+--- a/src/front/wgsl/lower/mod.rs
++++ b/src/front/wgsl/lower/mod.rs
+@@ -940 +940 @@
+-    // SampleBaseClampToEdge,
++    SampleBaseClampToEdge,
+@@ -955 +955 @@
+-            // "textureSampleBaseClampToEdge" => Some(Self::SampleBaseClampToEdge),
++            "textureSampleBaseClampToEdge" => Self::SampleBaseClampToEdge,
+@@ -971 +971 @@
+-            // Self::SampleBaseClampToEdge => 3,
++            Self::SampleBaseClampToEdge => 3,
+@@ -2866 +2866,96 @@
+-        let coordinate = self.expression(args.next()?, ctx)?;
++        let mut coordinate = self.expression(args.next()?, ctx)?;
++        let clamp_to_edge = matches!(fun, Texture::SampleBaseClampToEdge);
++
++        if clamp_to_edge {
++            // WGSL's ordinary-texture overload is exactly texture_2d<f32>,
++            // sampler, vec2<f32>. Do not extend it to arrays, depth, integer,
++            // multisampled, or storage images merely because ImageSample can.
++            let valid_image = matches!(
++                *resolve_inner!(ctx, image),
++                crate::TypeInner::Image {
++                    dim: crate::ImageDimension::D2,
++                    arrayed: false,
++                    class: crate::ImageClass::Sampled {
++                        kind: crate::ScalarKind::Float,
++                        multi: false,
++                    },
++                }
++            );
++            let valid_sampler = matches!(
++                *resolve_inner!(ctx, sampler),
++                crate::TypeInner::Sampler { comparison: false }
++            );
++            let valid_coordinate = matches!(
++                *resolve_inner!(ctx, coordinate),
++                crate::TypeInner::Vector {
++                    size: crate::VectorSize::Bi,
++                    scalar: crate::Scalar::F32,
++                }
++            );
++            if !valid_image || !valid_sampler || !valid_coordinate {
++                return Err(Error::InvalidTextureSampleBaseClampToEdge(span));
++            }
++
++            // https://www.w3.org/TR/WGSL/#texturesamplebaseclamptoedge
++            // Clamp to texel centers, not [0, 1]: even a repeat sampler must
++            // never select the opposite edge under linear filtering.
++            let dimensions = ctx.append_expression(
++                crate::Expression::ImageQuery {
++                    image,
++                    query: crate::ImageQuery::Size { level: None },
++                },
++                span,
++            )?;
++            let dimensions = ctx.append_expression(
++                crate::Expression::As {
++                    expr: dimensions,
++                    kind: crate::ScalarKind::Float,
++                    convert: Some(4),
++                },
++                span,
++            )?;
++            let half =
++                ctx.append_expression(crate::Expression::Literal(crate::Literal::F32(0.5)), span)?;
++            let half = ctx.append_expression(
++                crate::Expression::Splat {
++                    size: crate::VectorSize::Bi,
++                    value: half,
++                },
++                span,
++            )?;
++            let half_texel = ctx.append_expression(
++                crate::Expression::Binary {
++                    op: crate::BinaryOperator::Divide,
++                    left: half,
++                    right: dimensions,
++                },
++                span,
++            )?;
++            let one =
++                ctx.append_expression(crate::Expression::Literal(crate::Literal::F32(1.0)), span)?;
++            let one = ctx.append_expression(
++                crate::Expression::Splat {
++                    size: crate::VectorSize::Bi,
++                    value: one,
++                },
++                span,
++            )?;
++            let upper = ctx.append_expression(
++                crate::Expression::Binary {
++                    op: crate::BinaryOperator::Subtract,
++                    left: one,
++                    right: half_texel,
++                },
++                span,
++            )?;
++            coordinate = ctx.append_expression(
++                crate::Expression::Math {
++                    fun: crate::MathFunction::Clamp,
++                    arg: coordinate,
++                    arg1: Some(half_texel),
++                    arg2: Some(upper),
++                    arg3: None,
++                },
++                span,
++            )?;
++        }
+@@ -2874 +2969 @@
+-            Texture::Gather => (crate::SampleLevel::Zero, None),
++            Texture::Gather | Texture::SampleBaseClampToEdge => (crate::SampleLevel::Zero, None),
+@@ -2904,5 +2999,9 @@
+-        let offset = args
+-            .next()
+-            .map(|arg| self.expression(arg, &mut ctx.as_const()))
+-            .ok()
+-            .transpose()?;
++        let offset = if clamp_to_edge {
++            // This overload has exactly three arguments, with no texel offset.
++            None
++        } else {
++            args.next()
++                .map(|arg| self.expression(arg, &mut ctx.as_const()))
++                .ok()
++                .transpose()?
++        };

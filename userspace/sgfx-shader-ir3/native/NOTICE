@@ -1,0 +1,17 @@
+The compiler wrapper starts from the project's GPL-2.0-only A618 canonical
+producer and host prototype. Mesa is built from unchanged pinned compiler
+sources, with the explicit platform/build edits in build.py and port.py.
+Mesa source copyright and license notices are preserved in the private overlay.
+Most Mesa compiler components use the MIT license; consult the pinned source.
+
+Scarlet C runtime platform code and cross/audit tooling are adapted from the
+MIT-licensed sgfx-shader-agx implementation in scarlet-project-applesilicon;
+that checkout is read-only and not modified by this crate.
+
+The glass.wgsl test fixture is copied from ScarletUI's actual SGFX glass shader
+for regression coverage (blur_vertex, glass_vertex, horizontal, vertical, glass,
+erase). It is test input, never a replacement for caller shader source.
+
+The private printf adapter builds LLVM libc printf_core from the SDK-pinned
+LLVM source, licensed Apache-2.0 WITH LLVM-exception. Upstream copyright and
+license headers remain in those source inputs; no prebuilt printf is used.

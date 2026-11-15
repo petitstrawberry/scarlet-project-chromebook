@@ -114,15 +114,38 @@ impl DmaAllocation {
     }
 
     pub(crate) fn clean_prefix_for_device(&self, size: usize) -> Result<(), &'static str> {
-        if size == 0 || size > self.requested_size {
+        self.clean_range_for_device(0, size)
+    }
+
+    pub(crate) fn clean_range_for_device(
+        &self,
+        offset: usize,
+        size: usize,
+    ) -> Result<(), &'static str> {
+        if size == 0
+            || offset
+                .checked_add(size)
+                .is_none_or(|end| end > self.requested_size)
+        {
             return Err("qcom-adreno-a618: DMA cache-clean range is invalid");
         }
-        arch::clean_dcache_to_poc_range(self.vaddr(), size);
+        arch::clean_dcache_to_poc_range(self.vaddr() + offset, size);
         Ok(())
     }
 
     pub(crate) fn invalidate_from_device(&self) {
         arch::invalidate_dcache_to_poc_range(self.vaddr(), self.allocation_size());
+    }
+
+    /// Observe one device-written word. The architecture rounds this range to
+    /// cache lines and completes invalidation before the volatile load. Other
+    /// device-written words are not observed by this operation.
+    pub(crate) fn read_device_word_volatile(&self, index: usize) -> Option<u32> {
+        if index >= self.requested_size / core::mem::size_of::<u32>() {
+            return None;
+        }
+        arch::invalidate_dcache_to_poc_range(self.vaddr() + index * 4, 4);
+        self.read_word_volatile(index)
     }
 }
 

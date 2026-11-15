@@ -1,5 +1,15 @@
 //! A6xx PM4 emission with symbolic address placeholders.
 
+#[cfg(feature = "programmable")]
+#[path = "native.rs"]
+pub mod native;
+#[cfg(feature = "programmable")]
+#[path = "native_private.rs"]
+pub mod native_private;
+
+#[path = "color_encoding.rs"]
+pub(crate) mod color_encoding;
+
 use alloc::vec::Vec;
 
 use adreno_a6xx_pm4::{opcode, type4, type7};
@@ -41,7 +51,6 @@ const DEPTH_FORMAT_32: u32 = 4;
 const A2D_IFMT_FLOAT32: u32 = 4;
 // Mesa fd6_format_table maps PIPE_FORMAT_B8G8R8A8_UNORM to WXYZ (1).
 const A2D_BGRA_COLOR_SWAP: u32 = 1 << 10;
-const MRT_BGRA_COLOR_SWAP: u32 = 1 << 13;
 const BLIT_CHANNEL_MASK: u32 = 0xf << 20;
 const BLIT_SOLID_COLOR: u32 = 1 << 7;
 const BLIT_SCISSOR: u32 = 1 << 16;
@@ -195,6 +204,7 @@ const SP_PS_CONST_CONFIG: u32 = 0xbb10;
 #[derive(Clone, Copy)]
 pub(crate) struct DrawState {
     pub(crate) variant: PipelineVariant,
+    pub(crate) topology: u32,
     pub(crate) target: Surface,
     pub(crate) area: PixelRect,
     pub(crate) scissor: PixelRect,
@@ -207,10 +217,36 @@ pub(crate) struct DrawState {
     pub(crate) uniforms: [u32; 32],
     pub(crate) texture: Option<Surface>,
     pub(crate) sampler: [u32; 4],
-    pub(crate) source_over: bool,
+    pub(crate) blend_enabled: bool,
+    pub(crate) blend_control: u32,
     pub(crate) cull: u32,
     pub(crate) depth: Option<DepthDrawState>,
     pub(crate) draw: DrawCall,
+}
+
+struct RenderState {
+    target: Surface,
+    area: PixelRect,
+    scissor: PixelRect,
+    viewport: Viewport,
+    blend_enabled: bool,
+    blend_control: u32,
+    cull: u32,
+    depth: Option<DepthDrawState>,
+}
+impl From<DrawState> for RenderState {
+    fn from(draw: DrawState) -> Self {
+        Self {
+            target: draw.target,
+            area: draw.area,
+            scissor: draw.scissor,
+            viewport: draw.viewport,
+            blend_enabled: draw.blend_enabled,
+            blend_control: draw.blend_control,
+            cull: draw.cull,
+            depth: draw.depth,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -255,6 +291,8 @@ pub(crate) struct Surface {
     pub(crate) stride: u32,
     pub(crate) tile_mode: u32,
     pub(crate) alpha_mask: bool,
+    pub(crate) rg_mask: bool,
+    pub(crate) srgb: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,6 +308,12 @@ pub(crate) struct Emitter {
     texture_words: Vec<u32>,
     texture_fixups: Vec<SymbolicAddress>,
     texture_states: Vec<(Surface, [u32; 4], GeneratedObjectId)>,
+    #[cfg(feature = "programmable")]
+    native_tables: Vec<(Vec<native::Descriptor>, GeneratedObjectId)>,
+    // Own the immutable pipeline (including private scratch identity) while
+    // its VS/FS program state remains active in this compilation's draw batch.
+    #[cfg(feature = "programmable")]
+    last_native_program: Option<alloc::sync::Arc<native::NativeRenderPipeline>>,
     accesses: Vec<ResourceAccess>,
     generated_objects: Vec<GeneratedObject>,
     ccu_sequence: Option<GeneratedObjectId>,
@@ -287,6 +331,10 @@ impl Emitter {
             texture_words: Vec::new(),
             texture_fixups: Vec::new(),
             texture_states: Vec::new(),
+            #[cfg(feature = "programmable")]
+            native_tables: Vec::new(),
+            #[cfg(feature = "programmable")]
+            last_native_program: None,
             accesses: Vec::new(),
             generated_objects: Vec::new(),
             ccu_sequence: None,
@@ -350,6 +398,8 @@ impl Emitter {
         if matches!(object, ObjectRef::CanonicalShader(_)) {
             return Ok(());
         }
+        #[cfg(feature = "programmable")]
+        let object = match object { ObjectRef::NativeShader(id) => ObjectRef::External(id), other => other };
         let mut merged_offset = offset;
         let mut merged_end = offset.checked_add(size).ok_or(CompileError::Overflow)?;
         let mut index = 0;
@@ -511,6 +561,7 @@ impl Emitter {
             } else {
                 !(3 << 30)
             }) | texture.tile_mode
+                | u32::from(texture.srgb) << 2
                 | ((texture.mip_levels - 1) << 16),
             texture.width | (texture.height << 15),
             (texture.stride << 7) | (1 << 29) | if texture.tile_mode == 0 { 0 } else { 2 },
@@ -630,6 +681,10 @@ impl Emitter {
     }
 
     pub(crate) fn end_draw_batch(&mut self) -> Result<(), CompileError> {
+        #[cfg(feature = "programmable")]
+        {
+            self.last_native_program = None;
+        }
         if !self.draw_batch_active {
             return Err(CompileError::InvalidState);
         }
@@ -652,6 +707,10 @@ impl Emitter {
     }
 
     pub(crate) fn draw(&mut self, draw: DrawState) -> Result<(), CompileError> {
+        #[cfg(feature = "programmable")]
+        {
+            self.last_native_program = None;
+        }
         if !self.draw_batch_active {
             return Err(CompileError::InvalidState);
         }
@@ -672,105 +731,7 @@ impl Emitter {
         };
 
         self.emit_program_config(vs, fs)?;
-        // CP tracks RB_RENDER_CNTL and inserts a required hang-workaround WFI
-        // when render modes change.  A raw type-4 write bypasses that tracker.
-        self.packet7(CP_REG_WRITE, &[2, RB_RENDER_CNTL, 0x10])?;
-        self.packet4(
-            RB_MRT_CONTROL,
-            &[
-                if draw.source_over { 0x7e3 } else { 0x7e0 },
-                if draw.source_over {
-                    0x0701_0706
-                } else {
-                    0x0001_0001
-                },
-            ],
-        )?;
-        self.packet4(
-            RB_MRT_BUF_INFO,
-            &[FORMAT_8_8_8_8_UNORM
-                | (draw.target.tile_mode << 8)
-                | if draw.target.tile_mode == 0 {
-                    MRT_BGRA_COLOR_SWAP
-                } else {
-                    0
-                }],
-        )?;
-        self.packet4(
-            RB_MRT_PITCH,
-            &[
-                draw.target.stride >> 6,
-                u32::try_from(draw.target.plane_size >> 6).map_err(|_| CompileError::Overflow)?,
-            ],
-        )?;
-        self.address_register(
-            RB_MRT_BASE,
-            ObjectRef::External(draw.target.object),
-            draw.target.plane_offset,
-            draw.target.plane_size,
-            Access::WRITE,
-        )?;
-        // This backend renders directly to linear system memory.  Program the
-        // complete no-GMEM/no-UBWC MRT state instead of inheriting flag-buffer
-        // or GMEM state from firmware or an earlier operation.
-        self.packet4(RB_MRT_BASE_GMEM, &[0])?;
-        self.packet4(RB_COLOR_FLAG_BUFFER_ADDR, &[0; 3])?;
-        self.packet4(GRAS_LRZ_MRT_BUFFER_INFO_0, &[FORMAT_8_8_8_8_UNORM])?;
-        self.packet4(RB_SRGB_CNTL, &[0])?;
-        self.packet4(SP_SRGB_CNTL, &[0])?;
-        self.packet4(GRAS_CL_ARRAY_SIZE, &[0])?;
-        self.packet4(
-            RB_BLEND_CNTL,
-            &[if draw.source_over {
-                0xffff_0001
-            } else {
-                0xffff_0000
-            }],
-        )?;
-        self.packet4(SP_BLEND_CNTL, &[if draw.source_over { 1 } else { 0 }])?;
-        self.packet4(RB_DITHER_CNTL, &[0])?;
-        self.packet4(SP_PS_MRT_CNTL, &[1])?;
-        self.packet4(RB_PS_MRT_CNTL, &[1])?;
-        self.packet4(SP_PS_MRT_REG, &[FORMAT_8_8_8_8_UNORM])?;
-        self.emit_depth_state(draw.depth)?;
-        self.emit_single_sample_state()?;
-
-        let target_br = pack_xy(draw.target.width - 1, draw.target.height - 1);
-        let area_br = pack_xy(
-            draw.area.x() + draw.area.width() - 1,
-            draw.area.y() + draw.area.height() - 1,
-        );
-        let scissor_br = pack_xy(
-            draw.scissor.x() + draw.scissor.width() - 1,
-            draw.scissor.y() + draw.scissor.height() - 1,
-        );
-        // SGFX vertices are transformed to clip space against the complete
-        // render target.  A render-pass area is damage, not a second logical
-        // framebuffer: shrinking the hardware viewport to that area remaps
-        // the whole scene into each dirty rectangle.  VirGL/wgpu keep the
-        // target viewport stable and apply damage only through scissors.
-        self.packet4(GRAS_CL_VIEWPORT_XOFFSET, &viewport_transform(draw.viewport))?;
-        self.packet4(
-            GRAS_CL_GUARDBAND_CLIP_ADJ,
-            &[guardband_clip_adj(draw.viewport)],
-        )?;
-        self.packet4(
-            GRAS_SC_SCREEN_SCISSOR_TL,
-            &[pack_xy(draw.area.x(), draw.area.y()), area_br],
-        )?;
-        self.packet4(GRAS_SC_VIEWPORT_SCISSOR_TL, &[pack_xy(0, 0), target_br])?;
-        self.packet4(
-            GRAS_SC_WINDOW_SCISSOR_TL,
-            &[pack_xy(draw.scissor.x(), draw.scissor.y()), scissor_br],
-        )?;
-        self.packet4(GRAS_CL_CNTL, &[0x80])?;
-        self.packet4(GRAS_SU_CNTL, &[0x2010 | draw.cull])?;
-        self.packet4(GRAS_SU_POINT_MINMAX, &[0x0010_0010])?;
-        self.packet4(GRAS_SU_POINT_SIZE, &[0x10])?;
-        self.packet4(GRAS_SU_POLY_OFFSET_SCALE, &[0, 0, 0])?;
-        self.packet4(PC_CNTL, &[0])?;
-        self.packet4(VPC_RAST_CNTL, &[3])?;
-        self.packet4(PC_DGEN_RAST_CNTL, &[3])?;
+        self.emit_render_state(RenderState::from(draw))?;
 
         self.packet4(
             VFD_CNTL_0,
@@ -851,14 +812,14 @@ impl Emitter {
         // their cache barrier already precede all draws in the prologue.
         match draw.draw {
             DrawCall::NonIndexed { vertex_count, .. } => {
-                self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, vertex_count])?;
+                self.packet7(CP_DRAW_INDX_OFFSET, &[0x80 | draw.topology, 1, vertex_count])?;
             }
             DrawCall::Indexed(indexed) => {
                 let initiator = match indexed.format {
                     // CP_DRAW_INDX_OFFSET uses the A4xx+ initiator layout:
                     // TRIANGLE_LIST | DMA | INDEX4_SIZE_16/32_BIT.
-                    IndexFormat::Uint16 => 0x404,
-                    IndexFormat::Uint32 => 0x804,
+                    IndexFormat::Uint16 => 0x400 | draw.topology,
+                    IndexFormat::Uint32 => 0x800 | draw.topology,
                 };
                 self.push_word(
                     type7(CP_DRAW_INDX_OFFSET, 7).map_err(|_| CompileError::InvalidPm4)?,
@@ -877,14 +838,117 @@ impl Emitter {
         Ok(())
     }
 
+    fn emit_render_state(&mut self, draw: RenderState) -> Result<(), CompileError> {
+        // CP tracks RB_RENDER_CNTL and inserts a required hang-workaround WFI
+        // when render modes change.  A raw type-4 write bypasses that tracker.
+        self.packet7(CP_REG_WRITE, &[2, RB_RENDER_CNTL, 0x10])?;
+        self.packet4(
+            RB_MRT_CONTROL,
+            &[
+                0x60 | (if draw.target.alpha_mask { 1 } else if draw.target.rg_mask { 3 } else { 15 }) << 7
+                    | if draw.blend_enabled { 3 } else { 0 },
+                color_encoding::target_blend(draw.blend_control, draw.target.alpha_mask || draw.target.rg_mask),
+            ],
+        )?;
+        self.packet4(
+            RB_MRT_BUF_INFO,
+            &[FORMAT_8_8_8_8_UNORM
+                | (draw.target.tile_mode << 8)
+                | color_encoding::target_swap(draw.target.alpha_mask, draw.target.tile_mode != 0) << 13],
+        )?;
+        self.packet4(
+            RB_MRT_PITCH,
+            &[
+                draw.target.stride >> 6,
+                u32::try_from(draw.target.plane_size >> 6).map_err(|_| CompileError::Overflow)?,
+            ],
+        )?;
+        self.address_register(
+            RB_MRT_BASE,
+            ObjectRef::External(draw.target.object),
+            draw.target.plane_offset,
+            draw.target.plane_size,
+            Access::WRITE,
+        )?;
+        // This backend renders directly to linear system memory.  Program the
+        // complete no-GMEM/no-UBWC MRT state instead of inheriting flag-buffer
+        // or GMEM state from firmware or an earlier operation.
+        self.packet4(RB_MRT_BASE_GMEM, &[0])?;
+        self.packet4(RB_COLOR_FLAG_BUFFER_ADDR, &[0; 3])?;
+        self.packet4(GRAS_LRZ_MRT_BUFFER_INFO_0, &[FORMAT_8_8_8_8_UNORM])?;
+        self.packet4(RB_SRGB_CNTL, &[u32::from(draw.target.srgb)])?;
+        self.packet4(SP_SRGB_CNTL, &[u32::from(draw.target.srgb)])?;
+        self.packet4(GRAS_CL_ARRAY_SIZE, &[0])?;
+        self.packet4(
+            RB_BLEND_CNTL,
+            &[if draw.blend_enabled {
+                0xffff_0001
+            } else {
+                0xffff_0000
+            }],
+        )?;
+        self.packet4(SP_BLEND_CNTL, &[if draw.blend_enabled { 1 } else { 0 }])?;
+        self.packet4(RB_DITHER_CNTL, &[0])?;
+        self.packet4(SP_PS_MRT_CNTL, &[1])?;
+        self.packet4(RB_PS_MRT_CNTL, &[1])?;
+        self.packet4(SP_PS_MRT_REG, &[FORMAT_8_8_8_8_UNORM])?;
+        self.emit_render_common_state(draw)
+    }
+
+    fn emit_render_common_state(&mut self, draw: RenderState) -> Result<(), CompileError> {
+        self.emit_depth_state(draw.depth)?;
+        self.emit_single_sample_state()?;
+
+        let target_br = pack_xy(draw.target.width - 1, draw.target.height - 1);
+        let area_br = pack_xy(
+            draw.area.x() + draw.area.width() - 1,
+            draw.area.y() + draw.area.height() - 1,
+        );
+        let scissor_br = pack_xy(
+            draw.scissor.x() + draw.scissor.width() - 1,
+            draw.scissor.y() + draw.scissor.height() - 1,
+        );
+        // SGFX vertices are transformed to clip space against the complete
+        // render target.  A render-pass area is damage, not a second logical
+        // framebuffer: shrinking the hardware viewport to that area remaps
+        // the whole scene into each dirty rectangle.  VirGL/wgpu keep the
+        // target viewport stable and apply damage only through scissors.
+        self.packet4(GRAS_CL_VIEWPORT_XOFFSET, &viewport_transform(draw.viewport))?;
+        self.packet4(
+            GRAS_CL_GUARDBAND_CLIP_ADJ,
+            &[guardband_clip_adj(draw.viewport)],
+        )?;
+        self.packet4(
+            GRAS_SC_SCREEN_SCISSOR_TL,
+            &[pack_xy(draw.area.x(), draw.area.y()), area_br],
+        )?;
+        self.packet4(GRAS_SC_VIEWPORT_SCISSOR_TL, &[pack_xy(0, 0), target_br])?;
+        self.packet4(
+            GRAS_SC_WINDOW_SCISSOR_TL,
+            &[pack_xy(draw.scissor.x(), draw.scissor.y()), scissor_br],
+        )?;
+        self.packet4(GRAS_CL_CNTL, &[0x80])?;
+        self.packet4(GRAS_SU_CNTL, &[0x2010 | draw.cull])?;
+        self.packet4(GRAS_SU_POINT_MINMAX, &[0x0010_0010])?;
+        self.packet4(GRAS_SU_POINT_SIZE, &[0x10])?;
+        self.packet4(GRAS_SU_POLY_OFFSET_SCALE, &[0, 0, 0])?;
+        self.packet4(PC_CNTL, &[0])?;
+        self.packet4(VPC_RAST_CNTL, &[3])?;
+        self.packet4(PC_DGEN_RAST_CNTL, &[3])?;
+
+        Ok(())
+    }
+
     fn fixed_draw_state_matches(previous: DrawState, next: DrawState) -> bool {
         previous.variant == next.variant
+            && previous.topology == next.topology
             && previous.target == next.target
             && previous.area == next.area
             && previous.viewport == next.viewport
             && previous.stride == next.stride
             && previous.attributes == next.attributes
-            && previous.source_over == next.source_over
+            && previous.blend_enabled == next.blend_enabled
+            && previous.blend_control == next.blend_control
             && previous.cull == next.cull
             && previous.depth == next.depth
     }
@@ -978,12 +1042,12 @@ impl Emitter {
         // the command stream itself.
         match draw.draw {
             DrawCall::NonIndexed { vertex_count, .. } => {
-                self.packet7(CP_DRAW_INDX_OFFSET, &[0x84, 1, vertex_count])?;
+                self.packet7(CP_DRAW_INDX_OFFSET, &[0x80 | draw.topology, 1, vertex_count])?;
             }
             DrawCall::Indexed(indexed) => {
                 let initiator = match indexed.format {
-                    IndexFormat::Uint16 => 0x404,
-                    IndexFormat::Uint32 => 0x804,
+                    IndexFormat::Uint16 => 0x400 | draw.topology,
+                    IndexFormat::Uint32 => 0x800 | draw.topology,
                 };
                 self.push_word(
                     type7(CP_DRAW_INDX_OFFSET, 7).map_err(|_| CompileError::InvalidPm4)?,
@@ -1228,6 +1292,10 @@ impl Emitter {
     }
 
     fn submission_begin_2d(&mut self) -> Result<(), CompileError> {
+        #[cfg(feature = "programmable")]
+        {
+            self.last_native_program = None;
+        }
         if self.draw_batch_active {
             return Err(CompileError::InvalidState);
         }
@@ -1244,6 +1312,10 @@ impl Emitter {
     }
 
     fn restore_3d_baseline(&mut self) -> Result<(), CompileError> {
+        #[cfg(feature = "programmable")]
+        {
+            self.last_native_program = None;
+        }
         // Start every self-contained draw from the upstream A6xx restore
         // baseline.  This backend has one synchronous context, so only state
         // reachable by this compact sysmem stream needs to be reset here.
@@ -1380,13 +1452,14 @@ impl Emitter {
         self.submission_begin_2d()?;
         self.wait_for_idle()?;
         self.emit_coordinates(area, None)?;
-        let [red, green, blue, alpha] = color.components();
-        self.packet4(
-            RB_A2D_CLEAR_COLOR_DW0,
-            &[unorm8(red), unorm8(green), unorm8(blue), unorm8(alpha)],
-        )?;
+        // Clear values are pre-encoded; linear A2D writes the exact bytes.
+        self.packet4(RB_A2D_CLEAR_COLOR_DW0, &normalized_clear_words(target, color))?;
         self.emit_a2d_common(FORMAT_8_8_8_8_UNORM, 0, true, true)?;
-        self.emit_destination(target, FORMAT_8_8_8_8_UNORM, A2D_BGRA_COLOR_SWAP)?;
+        self.emit_destination(
+            target,
+            FORMAT_8_8_8_8_UNORM,
+            color_encoding::target_swap(target.alpha_mask, false) << 10,
+        )?;
         self.emit_blit()?;
         self.submission_end()
     }
@@ -1434,13 +1507,14 @@ impl Emitter {
 
         // Each blit's bounds are independently checked by the kernel.
         self.emit_coordinates(area, None)?;
-        let [red, green, blue, alpha] = color.components();
-        self.packet4(
-            RB_A2D_CLEAR_COLOR_DW0,
-            &[unorm8(red), unorm8(green), unorm8(blue), unorm8(alpha)],
-        )?;
+        // Clear values are pre-encoded; linear A2D writes the exact bytes.
+        self.packet4(RB_A2D_CLEAR_COLOR_DW0, &normalized_clear_words(target, color))?;
         self.emit_a2d_common(FORMAT_8_8_8_8_UNORM, 0, true, true)?;
-        self.emit_destination(target, FORMAT_8_8_8_8_UNORM, A2D_BGRA_COLOR_SWAP)?;
+        self.emit_destination(
+            target,
+            FORMAT_8_8_8_8_UNORM,
+            color_encoding::target_swap(target.alpha_mask, false) << 10,
+        )?;
         self.emit_blit()?;
         self.submission_end()
     }
@@ -1472,7 +1546,7 @@ impl Emitter {
         flips: [bool; 2],
     ) -> Result<(), CompileError> {
         if source.tile_mode != 0 {
-            return Err(CompileError::UnsupportedFeature);
+            return Err(CompileError::UnsupportedFeatureReason("tiled blit source"));
         }
         self.submission_begin_2d()?;
         self.wait_for_idle()?;
@@ -1534,7 +1608,9 @@ impl Emitter {
         bytes: &[u8],
     ) -> Result<(), CompileError> {
         if bytes.is_empty() || bytes.len() & 3 != 0 || destination_offset & 3 != 0 {
-            return Err(CompileError::UnsupportedFeature);
+            return Err(CompileError::UnsupportedFeatureReason(
+                "empty or unaligned buffer upload",
+            ));
         }
         let generated = self.add_generated(bytes, 64, Access::READ, GeneratedObjectKind::Upload)?;
         self.copy_upload(
@@ -1545,6 +1621,35 @@ impl Emitter {
             destination_offset,
             destination_required_size,
         )
+    }
+
+    pub(crate) fn resource_barrier(&mut self) -> Result<(), CompileError> {
+        self.packet7(opcode::WAIT_MEM_WRITES, &[])?;
+        self.submission_end()?;
+        self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])
+    }
+
+    pub(crate) fn copy_buffer(
+        &mut self,
+        source: ObjectId,
+        source_offset: u64,
+        destination: ObjectId,
+        destination_offset: u64,
+        size: u64,
+    ) -> Result<(), CompileError> {
+        // Flush earlier GPU writes before CP reads memory. The same bounded
+        // CP_MEMCPY packets as uploads preserve the A618 parser limit.
+        self.resource_barrier()?;
+        self.copy_memory(
+            ObjectRef::External(source),
+            source_offset,
+            usize::try_from(size).map_err(|_| CompileError::Overflow)?,
+            destination,
+            destination_offset,
+        )?;
+        // Invalidate vertex/texture caches before a subsequent draw consumes
+        // the destination; WAIT_MEM_WRITES alone only orders CP memory writes.
+        self.packet7(opcode::EVENT_WRITE, &[EVENT_CACHE_INVALIDATE])
     }
 
     /// One immutable staging allocation for a complete texture strip. Row
@@ -1606,6 +1711,23 @@ impl Emitter {
         if size as u64 > destination_required_size {
             return Err(CompileError::OutOfBounds);
         }
+        self.copy_memory(
+            ObjectRef::Generated(generated),
+            source_offset,
+            size,
+            destination,
+            destination_offset,
+        )
+    }
+
+    fn copy_memory(
+        &mut self,
+        source: ObjectRef,
+        source_offset: u64,
+        size: usize,
+        destination: ObjectId,
+        destination_offset: u64,
+    ) -> Result<(), CompileError> {
         let total_dwords = u32::try_from(size / 4).map_err(|_| CompileError::Overflow)?;
         let mut copied_dwords = 0_u32;
         while copied_dwords < total_dwords {
@@ -1623,7 +1745,7 @@ impl Emitter {
             self.push_word(type7(CP_MEMCPY, 5).map_err(|_| CompileError::InvalidPm4)?)?;
             self.push_word(chunk_dwords)?;
             self.address_words(
-                ObjectRef::Generated(generated),
+                source,
                 source_offset
                     .checked_add(chunk_offset)
                     .ok_or(CompileError::Overflow)?,
@@ -1827,6 +1949,10 @@ mod tests {
             texture_words: vec![],
             texture_fixups: vec![],
             texture_states: vec![],
+            #[cfg(feature = "programmable")]
+            native_tables: vec![],
+            #[cfg(feature = "programmable")]
+            last_native_program: None,
             accesses: vec![],
             generated_objects: vec![],
             ccu_sequence: None,
@@ -1864,4 +1990,20 @@ mod tests {
         assert_eq!(map(-1.0, values[4], values[5]), 0.0);
         assert_eq!(map(1.0, values[4], values[5]), 1.0);
     }
+}
+
+fn normalized_clear_words(target: Surface, color: Color) -> [u32; 4] {
+    let components = color.components();
+    let mut words = components.map(unorm8);
+    if target.srgb {
+        for i in 0..3 {
+            words[i] = color_encoding::srgb8(components[i]);
+        }
+    }
+    if target.alpha_mask {
+        words = [words[0], 0, 0, 255];
+    } else if target.rg_mask {
+        words = [words[0], words[1], 0, 255];
+    }
+    words
 }

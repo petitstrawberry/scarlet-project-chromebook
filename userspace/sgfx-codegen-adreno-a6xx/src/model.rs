@@ -202,6 +202,44 @@ pub struct DepthAttachment {
 /// It is an in-process compiler input, not a kernel/userspace protocol.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operation<'data> {
+    #[cfg(feature = "programmable")]
+    BeginNativeRenderPass(crate::NativeRenderPass),
+    #[cfg(feature = "programmable")]
+    SetProgrammablePipeline(alloc::sync::Arc<crate::NativeRenderPipeline>),
+    /// A real native program implementing the public fixed FragmentProgram
+    /// semantics. It consumes SetUniforms/SetTexture/SetSampler state.
+    #[cfg(feature = "programmable")]
+    SetFixedNativePipeline(alloc::sync::Arc<crate::NativeRenderPipeline>),
+    #[cfg(feature = "programmable")]
+    SetComputePipeline(alloc::sync::Arc<crate::NativeComputePipeline>),
+    #[cfg(feature = "programmable")]
+    SetBindGroup { index: u32, bindings: Vec<crate::NativeBinding> },
+    #[cfg(feature = "programmable")]
+    BeginComputePass,
+    #[cfg(feature = "programmable")]
+    EndComputePass,
+    #[cfg(feature = "programmable")]
+    Dispatch { x: u32, y: u32, z: u32 },
+    #[cfg(feature = "programmable")]
+    SetVertexBufferSlot { slot: u32, buffer: ObjectId, offset: u64 },
+    #[cfg(feature = "programmable")]
+    DrawInstanced { vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32 },
+    #[cfg(feature = "programmable")]
+    DrawIndexedInstanced { index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32 },
+    #[cfg(feature = "programmable")]
+    SetPushConstants { stages: sgfx_core::ir::ShaderStages, offset: u32, data: &'data [u8] },
+    #[cfg(feature = "programmable")]
+    SetDrawIndex(u32),
+    /// Ordered GPU copy between two distinct buffer allocations.
+    CopyBufferToBuffer {
+        source: ObjectId,
+        source_offset: u64,
+        destination: ObjectId,
+        destination_offset: u64,
+        size: u64,
+    },
+    /// Retire writes and invalidate caches before subsequent resource accesses.
+    ResourceBarrier,
     /// Upload bytes to a logical buffer.
     WriteBuffer {
         /// Destination buffer.
@@ -347,6 +385,9 @@ pub enum ObjectRef {
     Generated(GeneratedObjectId),
     /// Immutable program selected from the shared canonical shader pack.
     CanonicalShader(ShaderVariant),
+    /// Caller-owned native code; access accounting uses External with the same ID.
+    #[cfg(feature = "programmable")]
+    NativeShader(ObjectId),
 }
 
 /// Address representation required at one PM4 field.
@@ -357,6 +398,9 @@ pub enum AddressEncoding {
     /// A6xx TEX_MEMOBJ words 4/5: VA bits 5..48 while preserving word 5
     /// bits 17..31 (including the texture depth field).
     GpuVa49TexDescriptor,
+    /// UBO VA in bits 0..48, preserving high-word size in vec4 units.
+    #[cfg(feature = "programmable")]
+    GpuVa49UboDescriptor,
 }
 
 impl AddressEncoding {
@@ -364,12 +408,16 @@ impl AddressEncoding {
     pub const fn word_count(self) -> u32 {
         match self {
             Self::GpuVa64 | Self::GpuVa49TexDescriptor => 2,
+            #[cfg(feature = "programmable")]
+            Self::GpuVa49UboDescriptor => 2,
         }
     }
 
     pub(crate) fn placeholder_is_valid(self, words: &[u32]) -> bool {
         match self {
             Self::GpuVa64 => words == [0, 0],
+            #[cfg(feature = "programmable")]
+            Self::GpuVa49UboDescriptor => words.len() == 2 && words[0] == 0 && words[1] & 0x1ffff == 0,
             Self::GpuVa49TexDescriptor => {
                 words.len() == 2 && words[0] == 0 && words[1] & 0x1ffff == 0
             }
@@ -461,6 +509,8 @@ pub enum CompileError {
     InvalidState,
     /// This compiler revision cannot lower a represented SGFX feature yet.
     UnsupportedFeature,
+    /// A represented feature cannot be lowered; identifies the rejected operation.
+    UnsupportedFeatureReason(&'static str),
     /// The output would exceed the queried PM4 budget.
     CommandBudgetExceeded,
     /// Allocation for a compiler-owned artifact failed.

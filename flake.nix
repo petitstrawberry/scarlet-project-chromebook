@@ -10,9 +10,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    scarlet-rust-toolchain.url = "github:petitstrawberry/scarlet-rust-nix";
+    scarlet-rust-toolchain.url = "github:petitstrawberry/scarlet-rust-nix/3c23906c35053e28d56f3aa9b1d29142535ffab7";
     scarlet-sdk = {
-      url = "github:petitstrawberry/scarlet-sdk/a071222231e8bbd96c1d54f38d99d1b27ec90805";
+      url = "github:petitstrawberry/scarlet-sdk/5f7b7cfba43958a6a0d19156fdfe2cae43cfded5";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.scarlet-rust-toolchain.follows = "scarlet-rust-toolchain";
     };
@@ -102,6 +102,13 @@
             platforms = supportedSystems;
           };
         };
+      mkIr3Compiler = pkgs: system:
+        import ./userspace/sgfx-shader-ir3/native/default.nix {
+          inherit pkgs;
+          rustToolchain = scarlet-rust-toolchain.packages.${system}.scarlet-rust-toolchain;
+          nativeRuntime = scarlet-sdk.packages.${system}.scarlet-native-runtime;
+          llvmSource = scarlet-sdk.inputs.llvm-src;
+        };
       mkCoachzLimine =
         pkgs:
         let
@@ -134,6 +141,11 @@
         {
           vboot-tools = mkVbootTools pkgs;
           coachz-limine = mkCoachzLimine pkgs;
+          scarlet-ir3-compiler = mkIr3Compiler pkgs system;
+          scarlet-ir3-compiler-host = import ./userspace/sgfx-shader-ir3/native/host.nix {
+            inherit pkgs;
+            llvmSource = scarlet-sdk.inputs.llvm-src;
+          };
         }
       );
 
@@ -149,6 +161,7 @@
           cargo-scarlet = scarlet-sdk.packages.${system}.cargo-scarlet;
           cargo-scarlet-plugin-limine = scarlet-sdk.packages.${system}.cargo-scarlet-plugin-limine;
           nativeRuntime = scarlet-sdk.packages.${system}.scarlet-native-runtime;
+          ir3Compiler = mkIr3Compiler pkgs system;
 
           # Current nixpkgs patches PyUSB to use libusb's absolute store path.
           # Only an unpatched/older PyUSB on Darwin should need this fallback.
@@ -163,6 +176,21 @@
           '';
         in
         {
+          # Keep host tests on the same C/C++ runtime used to build Mesa. This
+          # shell avoids pulling in the Scarlet runtime/kernel/image toolchain.
+          ir3-host = pkgs.mkShell {
+            packages = [ rustToolchain pkgs.stdenv.cc ];
+            IR3_MESA_LIB_DIR = "${import ./userspace/sgfx-shader-ir3/native/host.nix {
+              inherit pkgs;
+              llvmSource = scarlet-sdk.inputs.llvm-src;
+            }}/lib";
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "${pkgs.stdenv.cc}/bin/cc";
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "${pkgs.stdenv.cc}/bin/cc";
+            CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER = "${pkgs.stdenv.cc}/bin/cc";
+            shellHook = ''
+              export PATH="${rustToolchain}/bin:$PATH"
+            '';
+          };
           default = pkgs.mkShell {
             packages = [
               # Keep the composed interpreter early so host Python cannot shadow it.
@@ -199,12 +227,14 @@
             shellHook = ''
               export PATH="${rustToolchain}/bin:$PWD/scripts:$PATH"
               export SCARLET_RUST_ACTIVE_BIN="${rustToolchain}/bin"
+              export SCARLET_RUST_TOOLCHAIN="${rustToolchain}"
               export CC="${pkgs.stdenv.cc}/bin/cc"
               export CXX="${pkgs.stdenv.cc}/bin/c++"
               export HOST_CC="$CC"
               export HOST_CXX="$CXX"
               export VULKAN_HEADERS_SOURCE_DIR="${vulkan-headers-src}"
               export SCARLET_NATIVE_RUNTIME="${nativeRuntime}"
+              export IR3_MESA_LIB_DIR="${ir3Compiler}/lib"
               export SCARLET_LLVM_LIBC_SOURCE_DIR="${scarlet-sdk.inputs.llvm-src}/libc"
               export SCARLET_NATIVE_CC="${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang"
               export SCARLET_NATIVE_CXX="${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang++"

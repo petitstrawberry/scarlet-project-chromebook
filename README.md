@@ -123,9 +123,25 @@ The CoachZ kernel and userspace bundles are selected from published Git
 revisions by cargo-scarlet. Every board driver uses the same pinned kernel
 package; no sibling Scarlet checkout is required. The project-owned Adreno
 driver bundle is built from this checkout so its userspace and kernel
-dependencies stay aligned. The current kernel includes firmware-managed GPU
-frequency registration, with its matching revisions recorded in
-`scarlet.toml` and the Cargo lockfiles.
+dependencies stay aligned. The kernel, standard bundles, and driver dependencies
+use the Scarlet revision recorded in `projects/aarch64-coachz-limine/scarlet.toml`
+and `scarlet.lock`. This tracks Scarlet `dev` at `5a502473899c8f74490ca174c85988bad67d2b2c`;
+Android is excluded from `experimental` and remains an explicit opt-in bundle.
+The SDK and Rust toolchain are pinned in `flake.lock`. The Adreno backend uses the bundled SGFX revision
+`9dfbec263fae939e06985277d13f899a60fe3d63`. Release builds disable `sync-debug`,
+and the full rootfs has the same 8 GiB minimum as Scarlet's full project.
+
+Adreno implements buffer-to-buffer copies with bounded GPU `CP_MEMCPY` packets,
+retains both allocations through asynchronous completion, and emits real CCU
+flush/invalidate and CP memory ordering for global resource barriers. Ordinary
+ordered-queue transitions advertise SGFX's implicit-barrier capability so the
+frontend can omit redundant submissions. Portable tests feed these command
+streams through the actual kernel validator, including relocation bounds and
+write authority. Native programmable graphics, portable buffer compute, and eight color attachments
+are enabled after CoachZ output checks. Other optional capabilities are enabled
+only after their corresponding installed-driver checks pass. Programmable NV12
+sampling, robust texel loads, gathers, and transparent-border filtering are
+verified through decoder-backed WGSL and SPIR-V pixel checks.
 The standard `/init` provides USB
 `rootwait` and constructs the current boot Environment; no project-local init
 replacement is needed.
@@ -230,10 +246,13 @@ From the Nix development shell:
 cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
-The kernel, standard bundles, board drivers and project-owned Adreno runtime
-all reference Scarlet `f8d28abd`. The standard bundles provide their pinned
+The kernel, standard bundles and board drivers use merged Scarlet
+`5a502473899c8f74490ca174c85988bad67d2b2c`. Native UI and GPU clients share SDK source
+`2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2`, which is included in that merge;
+the SDK source and kernel APIs are unchanged between these snapshots. The standard bundles provide their pinned
 SGFX, native Vulkan and ScarletUI dependencies; the project's SGFX dependency
-matches the bundle's `0ee6b416` revision. Native clients use the published
+matches the bundle's `9dfbec263fae939e06985277d13f899a60fe3d63` revision
+(core API revision `3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1`). Native clients use the published
 SGFX backend discovery path. The project-owned Adreno driver is installed at
 `/lib/sgfx/libsgfx_scarlet_adreno.so`; `sgfx-probe` reports the selected backend
 and linkage. The `sgfx-native` bundle generates the native userspace Cargo
@@ -377,6 +396,11 @@ bootflow scan -a
 
 ## Raspberry Pi network controller
 
+Full images require at least 8 GiB for the root filesystem. When the Pi's
+`/run` tmpfs is smaller, set `SCARLET_CURRENT_IMAGE=/var/lib/scarlet/current.img`
+in `/etc/default/scarlet-gadget` and create `/var/lib/scarlet` before deploying.
+This stores the backing image on disk and preserves it across Pi reboots.
+
 The optional Raspberry Pi 5 helper provides USB storage, networking and CCD
 control over SSH. Connect the Pi's Ethernet or Wi-Fi to the LAN, its USB-C
 gadget port to the Chromebook, and CCD to a Pi USB host port. The default
@@ -476,7 +500,71 @@ sudo ./scripts/mac-scarlet-routing.sh disable
 ```
 
 Use `disable` when the direct-link session ends. A Pi reboot
-clears the image in `/run/scarlet`, so redeploy it after rebooting.
+clears an image stored in `/run/scarlet`, so redeploy it after rebooting when
+using that default location.
+
+## Read power information
+
+The primary Chrome EC registers `cros-ec-battery` and `cros-ec-usb` with
+Scarlet's read-only `/dev/power_supply` API. Run `power-info` to inspect the
+same snapshots used by desktop clients. Battery observations include presence,
+charging state, remaining/full capacity ratio, voltage, signed current
+(positive into the battery), and temperature when EC command version 1 is
+available. Older firmware falls back to version 0 or its battery memory map.
+Invalid or unsupported measurements remain absent; an idle battery is not
+automatically labeled full.
+
+The USB snapshot describes the EC-selected charging input. A port sourcing
+power or connected without supplying the AP is not online. Its current limit
+is explicitly a configured limit, not measured current. These providers issue
+only read commands and do not alter charging policy, calibration or USB roles.
+
+Portable decoding and EC event-isolation tests:
+
+```sh
+cargo test --locked --manifest-path tests/ec-event-drain/Cargo.toml
+```
+
+## Validate the installed Adreno driver
+
+The Adreno bundle installs `sgfx-adreno-check`. It reports the actual dynamic
+driver's capabilities and verifies ten alternating GPU upload/copy/draw/readback
+generations, including a 320 KiB copy across native chunk boundaries, nonzero
+offsets, and explicit/implicit copy-to-vertex transitions. Every output pixel
+is checked after the completion receipt retires; borrowed uploads are dropped
+before waiting. A separate public-ABI test submits and retires the global
+resource barrier through the backend ABI.
+
+The check also renders a half-transparent retained tile over an opaque
+background and checks every pixel, then exercises replace, additive, erase,
+subtract, reverse-subtract, destination-in, and source-color blending. These
+cover the premultiplied tiles and fallback backdrop filters used by ScarletUI.
+The native encoder and kernel validator accept all SGFX fixed-function blend
+factors and operations independently of the canonical shader variant; the
+validator still rejects reserved fields and unsupported constant/dual-source
+factors. Host tests cover the 500 factor/operation combinations, while the
+installed check verifies the listed modes on the GPU, including Min/Max with
+zero factors and independent color/alpha operations via the current wire ABI.
+
+Native samplers implement independent minification/magnification filters,
+clamp/repeat/mirror/transparent-border addressing, and anisotropy through 16.
+Transparent borders use A6xx fast border color; the validator forbids indirect
+border-table indices, unsupported flags, and reserved sampling modes. Hardware
+checks cover both address axes, all sixteen anisotropy settings, six fixed mip
+levels, and a stretched texture footprint where increasing anisotropy retains
+more detailed mip levels. Exact implicit LOD selection at primitive edges is
+implementation dependent, so that check validates every sampled mip color and
+compares the complete image's LOD distribution.
+
+`sgfx-adreno-check --fixed-only` limits the exit criterion to this fixed-pipeline
+contract. Without that option, missing extended capabilities cause failure
+even if the fixed-pipeline pixel test passes. Capability bits alone do not
+validate programmable rendering or compute execution. Run
+`sgfx-adreno-check --programmable` for those paths. The NV12-specific selectors
+`--nv12-only`, `--nv12-programmable-only`, `--nv12-reconstruction-only`,
+`--nv12-border-only`, and `--nv12-slots-only` cover imported two-plane images,
+ordinary texture restoration, boundary reconstruction, and all sixteen public
+sampler slots. These selectors also take `--programmable`.
 
 ## Repository layout
 
@@ -524,5 +612,18 @@ validated OPPs for `gpu`. Select an available rate with
 feeds Task Manager. Frequency values are the GMU-acknowledged OPP, not an
 independent clock measurement. The GMU applies the matching voltage vote;
 changes serialize with GPU submissions. A failed vote marks the GPU lost
-rather than allowing submissions at an unknown rate. Utilization-based
-governors require hardware counters and are not enabled by this driver.
+rather than allowing submissions at an unknown rate.
+
+The default `simple_ondemand` policy uses GPU hardware busy-counter deltas
+measured at a stable acknowledged OPP. It sums work across passes in 16.67 ms
+windows and estimates pending queue demand against a 10 ms GPU budget. Rising
+demand raises the OPP immediately; lowering requires sustained low demand and
+steps down one OPP at a time. An idle grace period avoids a clock transition
+between every small submission. Thermal limits and explicit manual policies
+remain authoritative. Use `devfreqctl governor gpu simple_ondemand` to restore
+automatic control after a manual test.
+
+Task Manager reports measured GPU utilization separately from the controller's
+work estimate. `devfreqctl get` also exposes failed samples, transition failures,
+and transition call durations. Queue wait, CPU command preparation, and display
+wait are not GPU busy time; this controller cannot by itself remove those stalls.

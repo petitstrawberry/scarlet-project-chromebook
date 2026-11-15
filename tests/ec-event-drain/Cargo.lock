@@ -5,3 +5,11 @@ version = 4
 [[package]]
 name = "ec-event-drain-tests"
 version = "0.1.0"
+dependencies = [
+ "scarlet-abi",
+]
+
+[[package]]
+name = "scarlet-abi"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=2c81d4ce2ab5ddf03d872baf2f57bfc77e54c211#2c81d4ce2ab5ddf03d872baf2f57bfc77e54c211"

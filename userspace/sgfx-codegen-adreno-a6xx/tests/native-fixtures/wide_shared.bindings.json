@@ -1,0 +1,18 @@
+[
+  {
+    "group": 0,
+    "binding": 0,
+    "slot": 0,
+    "kind": "StorageBuffer",
+    "writable": false,
+    "minimum_size": 4
+  },
+  {
+    "group": 0,
+    "binding": 1,
+    "slot": 1,
+    "kind": "StorageBuffer",
+    "writable": true,
+    "minimum_size": 4
+  }
+]

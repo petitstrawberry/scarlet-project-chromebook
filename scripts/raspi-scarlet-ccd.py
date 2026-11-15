@@ -253,13 +253,21 @@ class Handler(socketserver.StreamRequestHandler):
                         hub.write(target, data)
                     finally:
                         hub.operation.release()
-                try:
-                    data = listener.get_nowait()
-                except queue.Empty:
-                    continue
-                if data is None:
-                    return
-                self.wfile.write(data)
+                # A UART echo may arrive as many tiny USB packets. Drain the
+                # bounded queue per poll rather than one packet every 50 ms:
+                # otherwise even a reader consuming immediately is disconnected
+                # while typing a long command or receiving application logs.
+                chunks = []
+                for _ in range(256):
+                    try:
+                        data = listener.get_nowait()
+                    except queue.Empty:
+                        break
+                    if data is None:
+                        return
+                    chunks.append(data)
+                if chunks:
+                    self.wfile.write(b"".join(chunks))
         finally:
             with hub.lock:
                 hub.listeners[target].discard(listener)

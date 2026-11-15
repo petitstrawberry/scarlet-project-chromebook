@@ -43,13 +43,39 @@ pub(crate) trait Transport {
     fn complete(&self, signal: &Self::Signal, result: Result<(), Self::Error>);
 }
 
-struct Job<T: Transport> {
+pub(crate) struct Job<T: Transport> {
     chunks: Vec<T::Chunk>,
     owner: T::Owner,
-    signal: T::Signal,
+    pub(crate) signal: T::Signal,
     next: usize,
     receipts: VecDeque<T::Receipt>,
     bytes: usize,
+}
+
+impl<T: Transport> Job<T> {
+    pub(crate) fn prepare(
+        chunks: Vec<T::Chunk>,
+        owner: T::Owner,
+        signal: T::Signal,
+    ) -> Result<Self, AdmissionError<T::Error>> {
+        let bytes = chunks
+            .iter()
+            .try_fold(0usize, |n, chunk| n.checked_add(T::size(chunk)))
+            .filter(|n| *n <= MAX_PENDING_BYTES)
+            .ok_or(AdmissionError::TooLarge)?;
+        let mut receipts = VecDeque::new();
+        receipts
+            .try_reserve(chunks.len().min(MAX_NATIVE_IN_FLIGHT))
+            .map_err(|_| AdmissionError::OutOfMemory)?;
+        Ok(Self {
+            chunks,
+            owner,
+            signal,
+            next: 0,
+            receipts,
+            bytes,
+        })
+    }
 }
 
 pub(crate) struct Scheduler<T: Transport> {
@@ -104,21 +130,30 @@ impl<T: Transport> Scheduler<T> {
         {
             return Err(AdmissionError::Busy);
         }
-        let mut receipts = VecDeque::new();
-        receipts
-            .try_reserve(chunks.len().min(MAX_NATIVE_IN_FLIGHT))
-            .map_err(|_| AdmissionError::OutOfMemory)?;
+        let job = Job::prepare(chunks, owner, signal)?;
+        self.enqueue_prepared(job)
+    }
+
+    pub(crate) fn reserve_admission(&mut self) -> Result<(), AdmissionError<T::Error>> {
+        self.jobs
+            .try_reserve(MAX_SUBMISSIONS)
+            .map_err(|_| AdmissionError::OutOfMemory)
+    }
+
+    pub(crate) fn enqueue_prepared(&mut self, job: Job<T>) -> Result<(), AdmissionError<T::Error>> {
+        if let Some(error) = self.failure {
+            return Err(AdmissionError::Failed(error));
+        }
+        let bytes = job.bytes;
+        if self.jobs.len() >= MAX_SUBMISSIONS
+            || self.bytes.saturating_add(bytes) > MAX_PENDING_BYTES
+        {
+            return Err(AdmissionError::Busy);
+        }
         self.jobs
             .try_reserve(1)
             .map_err(|_| AdmissionError::OutOfMemory)?;
-        self.jobs.push_back(Job {
-            chunks,
-            owner,
-            signal,
-            next: 0,
-            receipts,
-            bytes,
-        });
+        self.jobs.push_back(job);
         self.bytes += bytes;
         Ok(())
     }

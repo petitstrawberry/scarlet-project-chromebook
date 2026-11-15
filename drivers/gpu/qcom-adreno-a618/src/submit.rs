@@ -3,6 +3,10 @@
 //! Hostile-input validation and relocation for the A618 submit dialect.
 
 use alloc::vec::Vec;
+#[path="submit_private.rs"]
+mod submit_private;
+#[path="submit_storage.rs"]
+mod submit_storage;
 
 use adreno_a6xx_pm4::{Header, Packet, Packets, opcode};
 use adreno_a6xx_shader_pack::{
@@ -32,6 +36,8 @@ const EVENT_CACHE_INVALIDATE: u32 = 0x31;
 
 const FORMAT_8_8_8_8_UNORM: u32 = 0x30;
 const FORMAT_32_FLOAT: u32 = 0x4a;
+const FORMAT_16_16_16_16_FLOAT: u32 = 0x62;
+const FORMAT_32_32_32_32_FLOAT: u32 = 0x82;
 const DEPTH_FORMAT_32: u32 = 4;
 const A2D_IFMT_FLOAT32: u32 = 4;
 const A2D_COLOR_SWAP_WXYZ: u32 = 1 << 10;
@@ -56,6 +62,7 @@ const TPL1_A2D_SRC_TEXTURE_PITCH: u32 = 0xb4c4;
 const CP_DRAW_INDX_OFFSET: u8 = 0x38;
 const CP_LOAD_STATE6_GEOM: u8 = 0x32;
 const CP_LOAD_STATE6_FRAG: u8 = 0x34;
+const CP_LOAD_STATE6: u8 = 0x36;
 const TEX_DESCRIPTOR_BGRA_IDENTITY: u32 = 0x4c00_6880;
 const TEX_DESCRIPTOR_ALPHA_MASK: u32 = 0x4c00_76d0;
 const GRAS_CL_CNTL: u32 = 0x8000;
@@ -195,7 +202,7 @@ fn supported_texture_descriptor(word: u32) -> bool {
         return true;
     }
     matches!(
-        word & !0x000f_0000,
+        word & !(0x000f_0000 | (1 << 2)),
         TEX_DESCRIPTOR_BGRA_IDENTITY | TEX_DESCRIPTOR_ALPHA_MASK | 0x0c00_6883
     )
 }
@@ -204,23 +211,39 @@ fn supported_sampler(words: &[u32], last_mip: u32) -> bool {
     if words.len() != 4 {
         return false;
     }
-    let base = words[0] & !1;
+    let min_filter = (words[0] >> 3) & 3;
+    let mag_filter = (words[0] >> 1) & 3;
+    let wrap_s = (words[0] >> 5) & 7;
+    let wrap_t = (words[0] >> 8) & 7;
+    let aniso = (words[0] >> 14) & 7;
+    let filter_valid = |filter| filter == 0 || filter == if aniso == 0 { 1 } else { 2 };
     let min_lod = words[1] >> 20;
     let max_lod = (words[1] >> 8) & 0xfff;
-    matches!(base, 0x920 | 0x92a)
-        && words[1] & 0xff == if max_lod == 0 { 0x40 } else { 0 }
+    // No LOD bias, reserved flags, border-table index or indirect address.
+    // Border sampling is safe only with the explicit fast transparent color.
+    words[0] & !0x0001_ffff == 0
+        && (words[0] >> 11) & 7 == 1
+        && wrap_s <= 3
+        && wrap_t <= 3
+        && aniso <= 4
+        && filter_valid(min_filter)
+        && filter_valid(mag_filter)
+        && words[1] & 0xff == if max_lod == 0 && aniso == 0 { 0x40 } else { 0 }
         && min_lod <= max_lod
         && max_lod <= last_mip * 256
         && words[3] == 0
-        && words[2] == if base == 0x92a { 0x20 } else { 0 }
+        && words[2]
+            == (u32::from(wrap_s == 3 || wrap_t == 3) << 4) | (u32::from(min_filter != 0) << 5)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AddressField {
+    private_memory: bool,
     word_offset: u32,
     access: u32,
     requires_complete_linear_image: bool,
     required_size: Option<u64>,
+    size_is_minimum: bool,
     encoding: AddressEncoding,
     source: AddressSource,
     a2d: Option<A2dExpectation>,
@@ -237,11 +260,13 @@ enum AddressSource {
 enum ShaderStage {
     Vertex,
     Fragment,
+    Compute,
 }
 
 fn address_source_matches(source: AddressSource, relocation: RelocationSource) -> bool {
     match (source, relocation) {
         (AddressSource::Attachment, RelocationSource::Attachment(_)) => true,
+        (AddressSource::CanonicalShader(_), RelocationSource::ShaderAttachment(_)) => true,
         (
             AddressSource::CanonicalShader(ShaderStage::Vertex),
             RelocationSource::CanonicalShader(actual),
@@ -261,6 +286,8 @@ struct A2dExpectation {
     row_pitch: u32,
     required_width: u32,
     required_height: u32,
+    // Only linear R32 upload sources may use explicitly bounded buffer storage.
+    depth_staging: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,6 +316,43 @@ pub(crate) enum LinearImageFormat {
     Nv12Uv,
     Bgra8Unorm,
     Depth32Float,
+    Rgba16Float,
+    Rgba32Float,
+}
+
+impl LinearImageFormat {
+    fn texel_bytes(self) -> u32 {
+        match self {
+            Self::Nv12Y => 1,
+            Self::Nv12Uv => 2,
+            Self::Rgba16Float => 8,
+            Self::Rgba32Float => 16,
+            _ => 4,
+        }
+    }
+}
+
+// A6xx format encodings from Mesa a6xx_enums.xml. Float color is linear
+// and uses native RGBA ordering (WZYX swap zero), never the BGRA swap.
+fn native_color_format(value: u32) -> Option<LinearImageFormat> {
+    match value {
+        FORMAT_8_8_8_8_UNORM => Some(LinearImageFormat::Bgra8Unorm),
+        FORMAT_16_16_16_16_FLOAT => Some(LinearImageFormat::Rgba16Float),
+        FORMAT_32_32_32_32_FLOAT => Some(LinearImageFormat::Rgba32Float),
+        _ => None,
+    }
+}
+
+fn native_color_target(value: u32) -> Option<(LinearImageFormat, ImageModifier)> {
+    if let Some(modifier) = color_target_modifier(value) {
+        return Some((LinearImageFormat::Bgra8Unorm, modifier));
+    }
+    match value {
+        FORMAT_16_16_16_16_FLOAT | FORMAT_32_32_32_32_FLOAT => {
+            Some((native_color_format(value)?, ImageModifier::Linear))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,18 +419,24 @@ fn a2d_control_format(value: u32) -> Option<LinearImageFormat> {
     let common = (0xf << 20) | (1 << 16);
     let color = (FORMAT_8_8_8_8_UNORM << 8) | common;
     let depth = (A2D_IFMT_FLOAT32 << 24) | (FORMAT_32_FLOAT << 8) | common | (1 << 7);
+    let rgba16 = (3 << 24) | (FORMAT_16_16_16_16_FLOAT << 8) | common | (1 << 7);
+    let rgba32 = (4 << 24) | (FORMAT_32_32_32_32_FLOAT << 8) | common | (1 << 7);
     if !matches!(value & 7, 0 | 2 | 4 | 5) {
         return None;
     }
     match value & !7 {
         value if value == color || value == color | (1 << 7) => Some(LinearImageFormat::Bgra8Unorm),
-        value if value == depth => Some(LinearImageFormat::Depth32Float),
+        value if value | (1 << 7) == depth => Some(LinearImageFormat::Depth32Float),
+        value if value | (1 << 7) == rgba16 => Some(LinearImageFormat::Rgba16Float),
+        value if value | (1 << 7) == rgba32 => Some(LinearImageFormat::Rgba32Float),
         _ => None,
     }
 }
 
 fn color_target_modifier(value: u32) -> Option<ImageModifier> {
-    if value == FORMAT_8_8_8_8_UNORM | MRT_COLOR_SWAP_WXYZ {
+    if value == FORMAT_8_8_8_8_UNORM | MRT_COLOR_SWAP_WXYZ
+        || value == FORMAT_8_8_8_8_UNORM | (3 << 13)
+    {
         Some(ImageModifier::Linear)
     } else if value == FORMAT_8_8_8_8_UNORM | (3 << 8) {
         Some(ImageModifier::Tile6_3Color)
@@ -377,7 +447,12 @@ fn color_target_modifier(value: u32) -> Option<ImageModifier> {
 
 fn a2d_destination_format(value: u32) -> Option<(LinearImageFormat, ImageModifier)> {
     match value {
-        value if value == FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ => {
+        FORMAT_16_16_16_16_FLOAT | FORMAT_32_32_32_32_FLOAT => {
+            Some((native_color_format(value)?, ImageModifier::Linear))
+        }
+        value if value == FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ
+            || value == FORMAT_8_8_8_8_UNORM | (3 << 10) =>
+        {
             Some((LinearImageFormat::Bgra8Unorm, ImageModifier::Linear))
         }
         value if value == FORMAT_8_8_8_8_UNORM | (3 << 8) => {
@@ -392,11 +467,39 @@ fn a2d_destination_format(value: u32) -> Option<(LinearImageFormat, ImageModifie
 
 fn a2d_output_format(value: u32) -> Option<LinearImageFormat> {
     match value {
+        value if value == (FORMAT_16_16_16_16_FLOAT << 3) | (0xf << 12) | 1 => {
+            Some(LinearImageFormat::Rgba16Float)
+        }
+        value if value == (FORMAT_32_32_32_32_FLOAT << 3) | (0xf << 12) => {
+            Some(LinearImageFormat::Rgba32Float)
+        }
         value if value == (FORMAT_8_8_8_8_UNORM << 3) | (0xf << 12) => {
             Some(LinearImageFormat::Bgra8Unorm)
         }
         value if value == (FORMAT_32_FLOAT << 3) | (0xf << 12) => {
             Some(LinearImageFormat::Depth32Float)
+        }
+        _ => None,
+    }
+}
+
+fn a2d_source_format(value: u32) -> Option<(LinearImageFormat, ImageModifier)> {
+    let required = (1 << 20) | (1 << 22);
+    match value & !(1 << 16) {
+        v if v == FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ | required => {
+            Some((LinearImageFormat::Bgra8Unorm, ImageModifier::Linear))
+        }
+        v if v == FORMAT_16_16_16_16_FLOAT | required => {
+            Some((LinearImageFormat::Rgba16Float, ImageModifier::Linear))
+        }
+        v if v == FORMAT_32_32_32_32_FLOAT | required => {
+            Some((LinearImageFormat::Rgba32Float, ImageModifier::Linear))
+        }
+        v if v == FORMAT_32_FLOAT | required => {
+            Some((LinearImageFormat::Depth32Float, ImageModifier::Linear))
+        }
+        v if v == FORMAT_32_FLOAT | (3 << 8) | required => {
+            Some((LinearImageFormat::Depth32Float, ImageModifier::Tile6_3Depth))
         }
         _ => None,
     }
@@ -440,10 +543,12 @@ fn address_field_encoded(
         .try_reserve(1)
         .map_err(|_| "qcom-adreno-a618: PM4 validation allocation failed")?;
     fields.push(AddressField {
+        private_memory: false,
         word_offset,
         access,
         requires_complete_linear_image,
         required_size,
+        size_is_minimum: false,
         encoding,
         source: AddressSource::Attachment,
         a2d: None,
@@ -461,10 +566,12 @@ fn canonical_address_field(
         .try_reserve(1)
         .map_err(|_| "qcom-adreno-a618: PM4 validation allocation failed")?;
     fields.push(AddressField {
+        private_memory: false,
         word_offset,
         access: ACCESS_READ,
         requires_complete_linear_image: false,
         required_size: None,
+        size_is_minimum: false,
         encoding: AddressEncoding::GpuVa64,
         source: AddressSource::CanonicalShader(stage),
         a2d: None,
@@ -510,6 +617,605 @@ fn any_shader_payload(register: u32, payload: &[u32]) -> bool {
         })
 }
 
+// Native-program state is limited to named, nonprivileged A6xx fields from
+// Mesa a6xx.xml/adreno_pm4.xml and fd6_compute.cc. It is NEVER used without a
+// ShaderAttachment relocation and the backend's private execution domain.
+const CP_EXEC_CS: u8 = 0x33;
+const SP_CS_CNTL_0: u32 = 0xa9b0;
+const SP_CS_PROGRAM_COUNTER_OFFSET: u32 = 0xa9b3;
+const SP_CS_CONFIG: u32 = 0xa9bb;
+const SP_CS_INSTR_SIZE: u32 = 0xa9bc;
+const SP_CS_CONST_CONFIG: u32 = 0xb987;
+const SP_CS_NDRANGE_0: u32 = 0xb990;
+
+fn native_scalar(register: u32, value: u32) -> bool {
+    match register {
+        SP_VS_CNTL_0 => value & !0x003f_ffff == 0,
+        SP_PS_CNTL_0 => value & !0x97ff_ffff == 0,
+        SP_CS_CNTL_0 => value & !0x80ff_ffff == 0,
+        0xa9b1 => value & !0x0400_007f == 0 && (value >> 5) & 3 <= 2,
+        SP_VS_CONFIG | SP_PS_CONFIG | SP_CS_CONFIG => value & !0x1fff_ff0f == 0,
+        SP_VS_INSTR_SIZE | SP_PS_INSTR_SIZE | SP_CS_INSTR_SIZE => (1..=1023).contains(&value),
+        SP_VS_CONST_CONFIG | SP_PS_CONST_CONFIG | SP_CS_CONST_CONFIG => {
+            value & !0x1ff == 0 && value & 0x100 != 0
+        }
+        SP_PS_WAVE_CNTL => value & !0xfff == 0,
+        SP_UPDATE_CNTL => value & !0x000f_ffff == 0,
+        SP_CS_NDRANGE_0 => {
+            let x = ((value >> 2) & 1023) + 1;
+            let y = ((value >> 12) & 1023) + 1;
+            let z = ((value >> 22) & 1023) + 1;
+            value & 3 != 0 && x * y * z <= 1024
+        }
+        0xb991..=0xb997 | 0xb999..=0xb99b => true, // sizes, offsets, reg IDs; no addresses
+        0xb998 => value & !0x7ff == 0,
+        0xa822 | 0xa9ba => value <= 32,
+        SP_GFX_USIZE => value <= 127,
+        SP_PS_TSIZE => value <= 16,
+        GRAS_CL_CNTL => matches!(value, 0x80 | 0xc0),
+        // Mesa a6xx.xml PC_PS_CNTL has only PRIMITIVEIDEN bit 0. This
+        // non-address scalar is admitted only through the native shader path;
+        // canonical/default program state below still requires zero.
+        PC_PS_CNTL => value <= 1,
+        GRAS_SU_DEPTH_PLANE_CNTL | RB_DEPTH_PLANE_CNTL => value <= 1,
+        0xaa00 => value <= 127,
+        0xa9bd | 0xa9be => value == 0, // no unbound private-memory/hysteresis state
+        GRAS_CL_INTERP_CNTL
+        | RB_INTERP_CNTL
+        | RB_PS_INPUT_CNTL
+        | SP_PS_INITIAL_TEX_LOAD_CNTL
+        | SP_REG_PROG_ID_0
+        | 0xb984..=0xb986
+        | SP_PS_OUTPUT_CNTL
+        | SP_PS_OUTPUT_MASK
+        | RB_PS_OUTPUT_CNTL
+        | RB_PS_OUTPUT_MASK
+        | SP_VS_OUTPUT_CNTL
+        | VPC_VS_CNTL
+        | VPC_PS_CNTL
+        | PC_VS_CNTL => true,
+        _ => false,
+    }
+}
+
+fn validate_native_type4(
+    register: u32,
+    payload: &[u32],
+    word: u32,
+    addresses: &mut Vec<AddressField>,
+) -> Option<Result<(), &'static str>> {
+    if let Some(result) = submit_private::validate_type4(register, payload, word, addresses) { return Some(result); }
+
+    let count = payload.len() as u32;
+    // Mesa GRAS_SU_POLY_OFFSET_{SCALE,OFFSET,OFFSET_CLAMP} are float data.
+    // Admit only the named native raster state, never adjacent registers.
+    if register == GRAS_SU_POLY_OFFSET_SCALE {
+        return Some(
+            if payload.len() == 3 && payload.iter().all(|v| f32::from_bits(*v).is_finite()) {
+                Ok(())
+            } else {
+                Err("a618: native depth bias must contain three finite values")
+            },
+        );
+    }
+    if register == GRAS_SU_CNTL {
+        return Some(
+            if payload.len() == 1
+                && payload[0] & !0x2817 == 0
+                && payload[0] & 0x2010 == 0x2010
+            {
+                Ok(())
+            } else {
+                Err("a618: unsupported native raster control")
+            },
+        );
+    }
+    if matches!(register, RB_SRGB_CNTL | SP_SRGB_CNTL) && count == 1 {
+        return Some(if payload[0] & !0xff == 0 {
+            Ok(())
+        } else {
+            Err("a618: invalid MRT sRGB mask")
+        });
+    }
+    // Eight named MRT slots; address registers are handled individually.
+    // Do not widen this to a generic register-range allowlist.
+    if (RB_MRT_CONTROL..RB_MRT_CONTROL + 8 * 8).contains(&register) {
+        return Some(match ((register - RB_MRT_CONTROL) % 8, payload.len()) {
+            (0, 1) if payload[0] == 0 => Ok(()),
+            (0, 2) if valid_native_blend_control(payload) || payload == [0, 0] => Ok(()),
+            (2, 1) if native_color_target(payload[0]).is_some() => Ok(()),
+            (3, 2)
+                if (1..=0xffff).contains(&payload[0])
+                    && (1..=0x1fff_ffff).contains(&payload[1]) =>
+            {
+                Ok(())
+            }
+            (5, 2) => address_field(addresses, word + 1, ACCESS_WRITE, false, None),
+            (7, 1) if payload[0] == 0 => Ok(()),
+            _ => Err("a618: invalid native MRT register state"),
+        });
+    }
+    if register >= SP_PS_MRT_REG && register + count <= SP_PS_MRT_REG + 8 {
+        return Some(
+            if payload.iter().all(|v| native_color_format(*v).is_some()) {
+                Ok(())
+            } else {
+                Err("a618: unsupported native MRT format")
+            },
+        );
+    }
+    if matches!(register, SP_PS_MRT_CNTL | RB_PS_MRT_CNTL) && count == 1 {
+        return Some(if payload[0] <= 8 {
+            Ok(())
+        } else {
+            Err("a618: native MRT count exceeds eight")
+        });
+    }
+    if register == GRAS_LRZ_MRT_BUFFER_INFO_0 && count == 1 {
+        return Some(if native_color_format(payload[0]).is_some() {
+            Ok(())
+        } else {
+            Err("a618: unsupported native LRZ color format")
+        });
+    }
+    if register == RB_BLEND_CNTL && count == 1 && payload[0] & !0xffff_01ff == 0 {
+        return Some(Ok(()));
+    }
+    if register == SP_BLEND_CNTL && count == 1 && payload[0] & !0x1ff == 0 {
+        return Some(Ok(()));
+    }
+    if (RB_COLOR_FLAG_BUFFER_ADDR..RB_COLOR_FLAG_BUFFER_ADDR + 8 * 3).contains(&register)
+        && (register - RB_COLOR_FLAG_BUFFER_ADDR) % 3 == 0
+        && payload == [0; 3]
+    {
+        return Some(Ok(()));
+    }
+    if (VFD_VERTEX_BUFFER_BASE..VFD_VERTEX_BUFFER_BASE + 128).contains(&register) {
+        let slot_offset = (register - VFD_VERTEX_BUFFER_BASE) % 4;
+        return Some(match (slot_offset, payload.len()) {
+            (0, 2) => address_field(addresses, word + 1, ACCESS_READ, false, None),
+            (0, 4) if payload[2] != 0 && payload[3] <= 4095 => address_field(
+                addresses,
+                word + 1,
+                ACCESS_READ,
+                false,
+                Some(u64::from(payload[2])),
+            ),
+            (2, 2) if payload[0] != 0 && payload[1] <= 4095 => Ok(()),
+            _ => Err("a618: invalid native VFD buffer slot"),
+        });
+    }
+    if register == VFD_INDEX_OFFSET && payload.len() == 2 {
+        return Some(Ok(()));
+    }
+    if register == VFD_CNTL_0
+        && payload.len() == 1
+        && payload[0] & !0xffff == 0
+        && payload[0] & 0xff <= 32
+        && payload[0] >> 8 <= 32
+    {
+        return Some(Ok(()));
+    }
+    // Explicit address-bearing compute registers, never a register interval.
+    if register == SP_CS_PROGRAM_COUNTER_OFFSET && payload.len() == 7 {
+        return Some(if payload[0] == 0 && payload[3..] == [0; 4] {
+            canonical_address_field(addresses, word + 2, ShaderStage::Compute)
+        } else {
+            Err("a618: unbound compute private memory or program offset")
+        });
+    }
+    let descriptor_size = match register {
+        0xa8a0 | SP_PS_SAMPLER_BASE | 0xa9e2 => Some(16), // VS/FS/CS sampler base
+        0xa8a8 | SP_PS_TEXMEMOBJ_BASE | 0xa9e6 => Some(64), // VS/FS/CS texture base
+        0xab1a | 0xa9f2 => Some(64),                      // graphics/compute UAV descriptor base
+        _ => None,
+    };
+    if let Some(size) = descriptor_size {
+        return Some(if payload.len() == 2 {
+            address_field(addresses, word + 1, ACCESS_READ, false, Some(size)).map(|()| {
+                addresses.last_mut().unwrap().size_is_minimum = true;
+            })
+        } else {
+            Err("a618: malformed compute descriptor address")
+        });
+    }
+    if payload.len() == 1 && native_scalar(register, payload[0]) {
+        return Some(Ok(()));
+    }
+    if register == SP_CS_NDRANGE_0
+        && payload.len() == 7
+        && payload
+            .iter()
+            .enumerate()
+            .all(|(i, v)| native_scalar(register + i as u32, *v))
+    {
+        return Some(Ok(()));
+    }
+    if register == 0xb997 && payload.len() == 2 && native_scalar(0xb998, payload[1]) {
+        return Some(Ok(()));
+    }
+    if register == 0xb999 && payload.len() == 3 {
+        return Some(Ok(()));
+    }
+    if register == SP_VS_CONST_CONFIG
+        && payload.len() == 4
+        && payload[1..] == [0; 3]
+        && (payload[0] == 0 || native_scalar(register, payload[0]))
+    {
+        return Some(Ok(()));
+    }
+    // Linkage/VFD arrays contain only register IDs, formats, counts and
+    // offsets. Keep every burst within that named array's register bounds.
+    if (register == VFD_CNTL_1 && count == 6)
+        || (register == VPC_VARYING_INTERP_MODE && count == 8)
+        || (register >= VFD_DEST_CNTL
+            && register + count <= VFD_DEST_CNTL + 32
+            && payload.iter().all(|v| v & !0xfff == 0))
+        || (register >= SP_VS_OUTPUT_REG && register + count <= SP_VS_OUTPUT_REG + 16)
+        || (register >= SP_VS_VPC_DEST_REG && register + count <= SP_VS_VPC_DEST_REG + 8)
+        || (register >= SP_PS_OUTPUT_REG && register + count <= SP_PS_OUTPUT_REG + 8)
+        || (register == SP_REG_PROG_ID_0 && count <= 4)
+        || (register == VFD_FETCH_INSTR
+            && count <= 64
+            && count % 2 == 0
+            && payload.chunks_exact(2).all(|p| p[0] & 0x4000_0000 != 0))
+    {
+        return Some(Ok(()));
+    }
+    if register == VFD_VERTEX_BUFFER_SIZE
+        && payload.len() == 2
+        && payload[0] != 0
+        && (1..=2048).contains(&payload[1])
+    {
+        return Some(Ok(()));
+    }
+    None
+}
+
+// Structural wire decoding proves that offsets are strictly increasing and
+// relocation word spans do not overlap. All callers use that validated order.
+fn relocation_at(relocations: &[Relocation], word: u32) -> Option<&Relocation> {
+    let index = relocations.partition_point(|relocation| relocation.pm4_word_offset < word);
+    relocations.get(index).filter(|relocation| relocation.pm4_word_offset == word)
+}
+
+fn relocations_in_words(relocations: &[Relocation], start: u32, end: u32) -> &[Relocation] {
+    let first = relocations.partition_point(|relocation| relocation.pm4_word_offset < start);
+    let count = relocations[first..].partition_point(|relocation| relocation.pm4_word_offset < end);
+    &relocations[first..first + count]
+}
+
+fn validate_native_type7(
+    opcode_value: u8,
+    payload: &[u32],
+    word: u32,
+    addresses: &mut Vec<AddressField>,
+    relocations: &[Relocation],
+) -> Option<Result<(), &'static str>> {
+    if opcode_value == opcode::EVENT_WRITE
+        && payload.len() == 4
+        && payload[0] == (0x04 | EVENT_WRITE_TIMESTAMP)
+        && payload[1..3] == [0, 0]
+        && payload[3] != 0
+    {
+        // Native intra-submit UCHE clean, Mesa FD_CACHE_CLEAN. No IRQ bit;
+        // only an authorized user sequence word, never the kernel fence.
+        return Some(address_field(
+            addresses,
+            word + 2,
+            ACCESS_WRITE,
+            false,
+            Some(4),
+        ));
+    }
+    if opcode_value == opcode::SET_MARKER && payload == [8] {
+        return Some(Ok(()));
+    }
+    if opcode_value == CP_DRAW_INDX_OFFSET {
+        if !matches!(payload.len(), 3 | 7) {
+            return Some(Err("a618: invalid native draw packet"));
+        }
+        // A6xx non-binning primitive types POINT_LIST through TRIANGLE_FAN.
+        let primitive = payload[0] & 0x3f;
+        if !matches!(primitive, 1..=6 | 9) || payload[1] == 0 || payload[2] == 0 {
+            return Some(Err("a618: invalid native draw counts/topology"));
+        }
+        if payload.len() == 3 {
+            return Some(if payload[0] & !0x3f == 0x80 {
+                Ok(())
+            } else {
+                Err("a618: unsafe native nonindexed draw")
+            });
+        }
+        let index_size = match payload[0] & !0x3f {
+            0x400 => 2u64,
+            0x800 => 4u64,
+            _ => return Some(Err("a618: unsafe native indexed draw")),
+        };
+        if payload[4..6] != [0, 0]
+            || payload[3]
+                .checked_add(payload[2])
+                .is_none_or(|n| n > payload[6])
+        {
+            return Some(Err("a618: native index span out of bounds"));
+        }
+        return Some(address_field(
+            addresses,
+            word + 5,
+            ACCESS_READ,
+            false,
+            Some(u64::from(payload[6]) * index_size),
+        ));
+    }
+    if opcode_value == CP_MEM_WRITE {
+        if !(3..=4098).contains(&payload.len()) || payload[..2] != [0, 0] {
+            return Some(Err("a618: invalid native table write"));
+        }
+        if let Err(error) = address_field(
+            addresses,
+            word + 1,
+            ACCESS_WRITE,
+            false,
+            Some((payload.len() as u64 - 2) * 4),
+        ) {
+            return Some(Err(error));
+        }
+        for r in relocations_in_words(relocations, word + 3, word + 1 + payload.len() as u32) {
+            if !matches!(r.source, RelocationSource::Attachment(_))
+                || r.pm4_word_offset + 2 > word + 1 + payload.len() as u32
+            {
+                return Some(Err("a618: invalid table data relocation"));
+            }
+            if let Err(error) = address_field_encoded(
+                addresses,
+                r.pm4_word_offset,
+                r.access,
+                false,
+                None,
+                r.encoding,
+            ) {
+                return Some(Err(error));
+            }
+        }
+        return Some(Ok(()));
+    }
+    if opcode_value == CP_EXEC_CS {
+        return Some(
+            if payload.len() == 4
+                && payload[0] == 0
+                && payload[1..].iter().all(|v| (1..=65535).contains(v))
+            {
+                Ok(())
+            } else {
+                Err("a618: invalid compute dispatch")
+            },
+        );
+    }
+    // A6xx graphics UAV tables use the shared UAV state block, not a stage's
+    // shader block with ST6_UAV (that combination is compute-only). See Mesa
+    // fd6_image.cc graphics/compute paths and adreno_pm4.xml LOAD_STATE6.
+    if opcode_value == CP_LOAD_STATE6 {
+        let control = payload.first().copied().unwrap_or(0);
+        let units = control >> 22;
+        if payload.len() != 3
+            || (control >> 18) & 15 != 14
+            || (control >> 14) & 3 != 0
+            || (control >> 16) & 3 != 2
+            || units == 0
+            || (control & 0x3fff) + units > 128
+            || payload[1..] != [0, 0]
+        {
+            return Some(Err("a618: invalid graphics UAV load state"));
+        }
+        return Some(address_field(
+            addresses, word + 2, ACCESS_READ, false, Some(u64::from(units) * 64),
+        ));
+    }
+    if !matches!(opcode_value, CP_LOAD_STATE6_GEOM | CP_LOAD_STATE6_FRAG) || payload.len() < 3 {
+        return None;
+    }
+    let control = payload[0];
+    let block = (control >> 18) & 15;
+    let kind = (control >> 14) & 3;
+    let source = (control >> 16) & 3;
+    let units = control >> 22;
+    let offset = control & 0x3fff;
+    if matches!(
+        (opcode_value, block),
+        (CP_LOAD_STATE6_GEOM, 0) | (CP_LOAD_STATE6_FRAG, 4 | 5)
+    ) && source == 2
+        && matches!(kind, 0 | 1)
+        && payload.len() == 3
+        && units != 0
+        && offset + units <= if kind == 0 { 32 } else { 16 }
+    {
+        let size = u64::from(units) * if kind == 0 { 16 } else { 64 };
+        return Some(address_field(
+            addresses,
+            word + 2,
+            ACCESS_READ,
+            false,
+            Some(size),
+        ));
+    }
+    if !matches!(
+        (opcode_value, block),
+        (CP_LOAD_STATE6_GEOM, 8) | (CP_LOAD_STATE6_FRAG, 12 | 13)
+    ) {
+        return None;
+    }
+    if units == 0 || payload[1..3] != [0, 0] {
+        return Some(Err("a618: invalid native load state"));
+    }
+    if kind == 3 && block != 13 {
+        return Some(Err("a618: graphics UAV load must use the shared UAV block"));
+    }
+    if kind == 3 && source == 2 && offset + units <= 128 && payload.len() == 3 {
+        return Some(address_field(
+            addresses,
+            word + 2,
+            ACCESS_READ,
+            false,
+            Some(u64::from(units) * 64),
+        ));
+    }
+    if kind == 0 && source == 2 && offset == 0 && payload.len() == 3 {
+        let stage = match block {
+            8 => ShaderStage::Vertex,
+            12 => ShaderStage::Fragment,
+            _ => ShaderStage::Compute,
+        };
+        return Some(
+            canonical_address_field(addresses, word + 2, stage).map(|()| {
+                // LOAD_STATE6 reads instructions in 128-byte units. The wire
+                // format retains the complete canonical shader allocation,
+                // which may also contain constants (e.g. FsNv12). Require the
+                // fetch to fit within it; do not equate the two lengths.
+                let address = addresses.last_mut().unwrap();
+                address.required_size = Some(u64::from(units) * 128);
+                address.size_is_minimum = true;
+            }),
+        );
+    }
+    if kind == 2 && source == 0 && offset + units <= 32 && payload.len() == 3 + units as usize * 2 {
+        for (index, descriptor) in payload[3..].chunks_exact(2).enumerate() {
+            let size = u64::from(descriptor[1] >> 17) * 16;
+            if size == 0 {
+                if descriptor != [0, 0] {
+                    return Some(Err("a618: nonzero empty UBO descriptor"));
+                }
+                continue;
+            }
+            if let Err(error) = address_field_encoded(
+                addresses,
+                word + 4 + index as u32 * 2,
+                ACCESS_READ,
+                false,
+                Some(size),
+                AddressEncoding::GpuVa49UboDescriptor,
+            ) {
+                return Some(Err(error));
+            }
+        }
+        return Some(Ok(()));
+    }
+    if kind == 1 && offset + units <= 256 {
+        if source == 2 && payload.len() == 3 {
+            return Some(address_field(
+                addresses,
+                word + 2,
+                ACCESS_READ,
+                false,
+                Some(u64::from(units) * 16),
+            ));
+        }
+        if source == 0 && payload.len() == 3 + units as usize * 4 {
+            // Constants may include explicitly typed buffer pointers. Other
+            // constant words are data, not PM4 commands. ISA memory accesses
+            // are confined by the private domain, including indirect pointers.
+            for r in relocations_in_words(relocations, word + 4, word + 1 + payload.len() as u32) {
+                if !matches!(r.source, RelocationSource::Attachment(_))
+                    || r.encoding != AddressEncoding::GpuVa64
+                    || r.pm4_word_offset + 2 > word + 1 + payload.len() as u32
+                    || (r.pm4_word_offset - word - 4) % 2 != 0
+                {
+                    return Some(Err("a618: invalid native constant pointer"));
+                }
+                if let Err(error) =
+                    address_field(addresses, r.pm4_word_offset, r.access, false, None)
+                {
+                    return Some(Err(error));
+                }
+            }
+            return Some(Ok(()));
+        }
+    }
+    Some(Err("a618: unsupported native load state"))
+}
+
+fn validate_compute_sequences(
+    packets: &[Packet<'_>],
+    relocations: &[Relocation],
+) -> Result<(), &'static str> {
+    let mut registers = Vec::new();
+    let mut start = 0;
+    for (index, packet) in packets.iter().enumerate() {
+        if !matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: CP_EXEC_CS,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let segment = SegmentIndex::new(&packets[start..index], &mut registers);
+        let (_, base) = submit_private::program_layout(&segment, SP_CS_PROGRAM_COUNTER_OFFSET)
+            .ok_or("a618: compute program must be initialized in this dispatch")?;
+        let preload = segment_shader_preload_word(&segment, CP_LOAD_STATE6_FRAG, 13)
+            .ok_or("a618: compute preload is missing")?;
+        let base = relocation_at(relocations, base).ok_or("a618: compute program relocation missing")?;
+        let preload = relocation_at(relocations, preload).ok_or("a618: compute preload relocation missing")?;
+        if !matches!(base.source, RelocationSource::ShaderAttachment(_))
+            || base.source != preload.source
+            || base.resource_offset != preload.resource_offset
+            || base.required_size != preload.required_size
+        {
+            return Err("a618: compute program/preload do not match");
+        }
+        for reg in [
+            SP_CS_CNTL_0,
+            0xa9b1,
+            SP_CS_CONFIG,
+            SP_CS_INSTR_SIZE,
+            SP_CS_CONST_CONFIG,
+            SP_CS_NDRANGE_0,
+            0xb997,
+            0xb998,
+            SP_PS_WAVE_CNTL,
+        ] {
+            // SegmentIndex stores bursts by their first register. Accept the
+            // documented paired ID/WGE packet as well as separate scalars.
+            if segment.reg(reg).is_none()
+                && !(reg == 0xb998 && segment.reg(0xb997).is_some_and(|(_, p)| p.len() == 2))
+            {
+                return Err("a618: incomplete compute state");
+            }
+        }
+        let (_, size) = segment.reg(SP_CS_INSTR_SIZE).unwrap();
+        if u64::from(size[0]) * 128 > base.required_size {
+            return Err("a618: compute instruction size exceeds shader");
+        }
+        let (_, config) = segment.reg(SP_CS_CONFIG).unwrap();
+        if config[0] & 0x100 == 0 {
+            return Err("a618: compute shader is disabled");
+        }
+        let (_, nd) = segment.reg(SP_CS_NDRANGE_0).unwrap();
+        for axis in 0..3 {
+            let local = ((nd[0] >> (2 + axis * 10)) & 1023) + 1;
+            let expected = packet.payload[axis + 1]
+                .checked_mul(local)
+                .ok_or("a618: compute range overflow")?;
+            let (global, offset) = if nd.len() == 7 {
+                (nd[1 + axis * 2], nd[2 + axis * 2])
+            } else {
+                let (_, global) = segment
+                    .reg(SP_CS_NDRANGE_0 + 1 + axis as u32 * 2)
+                    .ok_or("a618: compute global size missing")?;
+                let (_, offset) = segment
+                    .reg(SP_CS_NDRANGE_0 + 2 + axis as u32 * 2)
+                    .ok_or("a618: compute global offset missing")?;
+                (global[0], offset[0])
+            };
+            if global != expected || global.checked_add(offset).is_none() {
+                return Err("a618: compute dispatch/ND range mismatch");
+            }
+        }
+        start = index + 1;
+    }
+    Ok(())
+}
+
 fn validate_type4(
     register: u32,
     payload: &[u32],
@@ -530,23 +1236,17 @@ fn validate_type4(
             address_field(addresses, packet_word + 1, ACCESS_WRITE, true, None)
         }
         (RB_A2D_DEST_BUFFER_PITCH, 1) if payload[0] != 0 && payload[0] & !0x3fff == 0 => Ok(()),
-        (RB_A2D_CLEAR_COLOR_DW0, 4)
-            if payload.iter().all(|word| *word <= 0xff)
-                || (payload[1..] == [0; 3]
-                    && f32::from_bits(payload[0]).is_finite()
-                    && (0.0..=1.0).contains(&f32::from_bits(payload[0]))) =>
-        {
-            Ok(())
-        }
+        // Data only. Encoding is checked against the selected format at BLIT.
+        (RB_A2D_CLEAR_COLOR_DW0, 4) => Ok(()),
         (GRAS_A2D_SRC_XMIN, 4) if payload.iter().all(|value| value & 0xff == 0) => Ok(()),
         (GRAS_A2D_DEST_TL, 2) | (GRAS_A2D_SCISSOR_TL, 2) => Ok(()),
-        (SP_A2D_OUTPUT_INFO, 1) if a2d_output_format(payload[0]).is_some() => Ok(()),
-        (TPL1_A2D_SRC_TEXTURE_INFO, 1)
-            if payload[0] & !(1 << 16)
-                == FORMAT_8_8_8_8_UNORM | A2D_COLOR_SWAP_WXYZ | (1 << 20) | (1 << 22) =>
+        (SP_A2D_OUTPUT_INFO, 1)
+            if a2d_output_format(payload[0]).is_some()
+                || payload[0] == (FORMAT_16_16_16_16_FLOAT << 3) | (0xf << 12) =>
         {
             Ok(())
         }
+        (TPL1_A2D_SRC_TEXTURE_INFO, 1) if a2d_source_format(payload[0]).is_some() => Ok(()),
         (TPL1_A2D_SRC_TEXTURE_SIZE, 1) if payload[0] != 0 && payload[0] & 0xc000_0000 == 0 => {
             Ok(())
         }
@@ -558,6 +1258,7 @@ fn validate_type4(
         {
             Ok(())
         }
+        (RB_SRGB_CNTL | SP_SRGB_CNTL, 1) if payload[0] <= 1 => Ok(()),
         (GRAS_SC_CNTL, 1) => exact(payload, &[2]),
         (GRAS_SC_BIN_CNTL | RB_CNTL, 1) => exact(payload, &[0x00c0_0000]),
         (
@@ -579,7 +1280,6 @@ fn validate_type4(
             | GRAS_LRZ_PS_SAMPLEFREQ_CNTL
             | RB_PS_SAMPLEFREQ_CNTL
             | RB_DITHER_CNTL
-            | RB_SRGB_CNTL
             | RB_MRT_BASE_GMEM
             | RB_ALPHA_TEST_CNTL
             | RB_DEPTH_PLANE_CNTL
@@ -589,7 +1289,6 @@ fn validate_type4(
             | PC_PS_CNTL
             | PC_CNTL
             | PC_STEREO_RENDERING_CNTL
-            | SP_SRGB_CNTL
             | SP_VS_PVT_MEM_STACK_OFFSET
             | SP_PS_PVT_MEM_STACK_OFFSET
             | SP_GFX_USIZE,
@@ -645,9 +1344,7 @@ fn validate_type4(
         (RB_COLOR_FLAG_BUFFER_ADDR, 3) => exact(payload, &[0; 3]),
         (RB_DEPTH_FLAG_BUFFER_BASE, 3) => exact(payload, &[0; 3]),
         (VPC_VARYING_INTERP_MODE | VPC_VARYING_REPLACE_MODE, 8) => exact(payload, &[0; 8]),
-        (RB_MRT_CONTROL, 2) if matches!(payload, [0x7e0, 0x0001_0001] | [0x7e3, 0x0701_0706]) => {
-            Ok(())
-        }
+        (RB_MRT_CONTROL, 2) if valid_blend_control(payload) => Ok(()),
         (RB_MRT_BUF_INFO, 1) if color_target_modifier(payload[0]).is_some() => Ok(()),
         (RB_MRT_PITCH, 2)
             if payload[0] != 0
@@ -852,26 +1549,24 @@ fn validate_type7(
             address_field(addresses, packet_word + 2, ACCESS_READ, false, Some(64))
         }
         (CP_DRAW_INDX_OFFSET, 3)
-            if payload[0] == 0x84
-                && payload[1] == 1
-                && payload[2] != 0
-                && payload[2].is_multiple_of(3) =>
+            if payload[0] & !0x3f == 0x80
+                && canonical_topology_count(payload[0] & 0x3f, payload[2])
+                && payload[1] == 1 =>
         {
             Ok(())
         }
         (CP_DRAW_INDX_OFFSET, 7) => {
-            let index_size = match payload[0] {
-                // TRIANGLE_LIST | DMA | INDEX4_SIZE_16/32_BIT.
-                0x404 => 2_u64,
-                0x804 => 4_u64,
+            let index_size = match payload[0] & !0x3f {
+                // Public primitive mode | DMA | INDEX4_SIZE_16/32_BIT.
+                0x400 => 2_u64,
+                0x800 => 4_u64,
                 _ => return Err("qcom-adreno-a618: unsafe indexed draw initiator"),
             };
             let end_index = payload[3]
                 .checked_add(payload[2])
                 .ok_or("qcom-adreno-a618: indexed draw range overflows")?;
             if payload[1] != 1
-                || payload[2] == 0
-                || !payload[2].is_multiple_of(3)
+                || !canonical_topology_count(payload[0] & 0x3f, payload[2])
                 || payload[6] == 0
                 || end_index > payload[6]
                 || payload[4..6] != [0, 0]
@@ -897,10 +1592,25 @@ fn validate_type7(
 /// packet can consume its destination.  Userspace currently uses CP_MEMCPY for
 /// per-frame vertex uploads, so accepting an unpaired copy would permit a
 /// deterministic GPU data race even though each packet is individually safe.
-fn validate_memcpy_barriers(packets: &[Packet<'_>]) -> Result<(), &'static str> {
+fn validate_memcpy_barriers(packets: &[Packet<'_>], native: bool) -> Result<(), &'static str> {
     let mut require_wait = false;
+    let mut can_batch = false;
     for packet in packets.iter().copied() {
         if require_wait {
+            if native
+                && can_batch
+                && matches!(
+                    packet.header,
+                    Header::Type7 {
+                        opcode: CP_MEM_WRITE,
+                        ..
+                    }
+                )
+            {
+                // Independent descriptor writes may batch, but no state load,
+                // shader dispatch or other consumer may precede their wait.
+                continue;
+            }
             match packet.header {
                 Header::Type7 {
                     opcode: opcode_value,
@@ -919,6 +1629,13 @@ fn validate_memcpy_barriers(packets: &[Packet<'_>]) -> Result<(), &'static str> 
                 }
             }
         }
+        can_batch = matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: CP_MEM_WRITE,
+                ..
+            }
+        );
         require_wait = matches!(
             packet.header,
             Header::Type7 {
@@ -1165,7 +1882,7 @@ struct A2dState {
     destination_br: Option<u32>,
     scissor_tl: Option<u32>,
     scissor_br: Option<u32>,
-    source_info: bool,
+    source_info: Option<u32>,
     source_word: Option<u32>,
     source_pitch: Option<u32>,
     source_size: Option<u32>,
@@ -1173,7 +1890,7 @@ struct A2dState {
     source_ymin: Option<u32>,
     source_xmax: Option<u32>,
     source_ymax: Option<u32>,
-    clear_color: bool,
+    clear_color: Option<[u32; 4]>,
 }
 
 fn set_a2d_expectation(
@@ -1208,7 +1925,7 @@ fn validate_a2d_sequences(
                 RB_A2D_DEST_BUFFER_INFO => {
                     state.destination_format = a2d_destination_format(packet.payload[0])
                 }
-                RB_A2D_CLEAR_COLOR_DW0 => state.clear_color = true,
+                RB_A2D_CLEAR_COLOR_DW0 => state.clear_color = packet.payload.try_into().ok(),
                 RB_A2D_DEST_BUFFER_BASE => state.destination_word = Some(packet.word_offset + 1),
                 RB_A2D_DEST_BUFFER_PITCH => {
                     state.destination_pitch = packet.payload[0].checked_mul(64)
@@ -1231,7 +1948,7 @@ fn validate_a2d_sequences(
                     state.scissor_tl = Some(tl);
                     state.scissor_br = Some(br);
                 }
-                TPL1_A2D_SRC_TEXTURE_INFO => state.source_info = true,
+                TPL1_A2D_SRC_TEXTURE_INFO => state.source_info = Some(packet.payload[0]),
                 TPL1_A2D_SRC_TEXTURE_BASE => state.source_word = Some(packet.word_offset + 1),
                 TPL1_A2D_SRC_TEXTURE_PITCH => {
                     state.source_pitch = (packet.payload[0] >> 9).checked_mul(64)
@@ -1307,11 +2024,17 @@ fn validate_a2d_sequences(
                             .ok_or("qcom-adreno-a618: A2D destination pitch is missing")?,
                         required_width: (destination_br & 0xffff).saturating_add(1),
                         required_height: (destination_br >> 16).saturating_add(1),
+                        depth_staging: false,
                     },
                 )?;
                 if state.solid == Some(false) {
-                    if !state.source_info {
-                        return Err("qcom-adreno-a618: A2D source info is missing");
+                    let source_info = state
+                        .source_info
+                        .ok_or("qcom-adreno-a618: A2D source info is missing")?;
+                    let (format, modifier) = a2d_source_format(source_info)
+                        .ok_or("a618: unsupported A2D source format")?;
+                    if Some(format) != state.control_format {
+                        return Err("a618: A2D source and destination formats differ");
                     }
                     let size = state
                         .source_size
@@ -1339,23 +2062,55 @@ fn validate_a2d_sequences(
                     {
                         return Err("qcom-adreno-a618: A2D source rectangle exceeds texture");
                     }
+                    if format == LinearImageFormat::Depth32Float
+                        && (source_info & (1 << 16) != 0
+                            || state.rb_control.unwrap() & 7 != 0
+                            || required_width - source_xmin
+                                != (destination_br & 0xffff) - (destination_tl & 0xffff) + 1
+                            || required_height - source_ymin
+                                != (destination_br >> 16) - (destination_tl >> 16) + 1)
+                    {
+                        return Err("a618: D32 transfer must be an unfiltered same-size copy");
+                    }
                     set_a2d_expectation(
                         addresses,
                         state
                             .source_word
                             .ok_or("qcom-adreno-a618: A2D source base is missing")?,
                         A2dExpectation {
-                            format: LinearImageFormat::Bgra8Unorm,
-                            modifier: ImageModifier::Linear,
+                            format,
+                            modifier,
                             row_pitch: state
                                 .source_pitch
                                 .ok_or("qcom-adreno-a618: A2D source pitch is missing")?,
                             required_width: width,
                             required_height: height,
+                            depth_staging: format == LinearImageFormat::Depth32Float
+                                && modifier == ImageModifier::Linear,
                         },
                     )?;
-                } else if !state.clear_color {
-                    return Err("qcom-adreno-a618: A2D solid blit clear color is missing");
+                } else {
+                    let color = state
+                        .clear_color
+                        .ok_or("qcom-adreno-a618: A2D solid blit clear color is missing")?;
+                    let valid = match state.control_format {
+                        Some(LinearImageFormat::Bgra8Unorm) => color.iter().all(|v| *v <= 0xff),
+                        Some(LinearImageFormat::Depth32Float) => {
+                            color[1..] == [0; 3]
+                                && f32::from_bits(color[0]).is_finite()
+                                && (0.0..=1.0).contains(&f32::from_bits(color[0]))
+                        }
+                        Some(LinearImageFormat::Rgba16Float) => {
+                            color.iter().all(|v| *v <= 0xffff && v & 0x7c00 != 0x7c00)
+                        }
+                        Some(LinearImageFormat::Rgba32Float) => {
+                            color.iter().all(|v| f32::from_bits(*v).is_finite())
+                        }
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err("a618: clear color does not match image format");
+                    }
                 }
                 // CP_SET_MARKER persists across a batch of solid clears.
                 // Bounds, addresses and format still need fresh authority
@@ -1475,10 +2230,8 @@ fn relocation_is_shader(
     word_offset: u32,
     expected: ShaderVariant,
 ) -> bool {
-    relocations.iter().any(|relocation| {
-        relocation.pm4_word_offset == word_offset
-            && relocation.source == RelocationSource::CanonicalShader(expected)
-    })
+    relocation_at(relocations, word_offset)
+        .is_some_and(|relocation| relocation.source == RelocationSource::CanonicalShader(expected))
 }
 
 fn segment_shader_relocations_match(
@@ -1737,22 +2490,15 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
         && reg(RB_MRT_BASE_GMEM) == Some(&[0])
         && reg(RB_COLOR_FLAG_BUFFER_ADDR) == Some(&[0, 0, 0])
         && reg(GRAS_LRZ_MRT_BUFFER_INFO_0) == Some(&[FORMAT_8_8_8_8_UNORM])
-        && reg(RB_SRGB_CNTL) == Some(&[0])
-        && reg(SP_SRGB_CNTL) == Some(&[0])
+        && reg(RB_SRGB_CNTL).is_some_and(|p| p.len() == 1 && p[0] <= 1)
+        && reg(SP_SRGB_CNTL) == reg(RB_SRGB_CNTL)
         && reg(GRAS_CL_ARRAY_SIZE) == Some(&[0])
-        && reg(RB_MRT_CONTROL)
-            == Some(if fixed.source_over {
-                &[0x7e3, 0x0701_0706]
-            } else {
-                &[0x7e0, 0x0001_0001]
-            })
-        && reg(RB_BLEND_CNTL)
-            == Some(&[if fixed.source_over {
-                0xffff_0001
-            } else {
-                0xffff_0000
-            }])
-        && reg(SP_BLEND_CNTL) == Some(&[u32::from(fixed.source_over)])
+        && reg(RB_MRT_CONTROL).is_some_and(valid_blend_control)
+        && reg(RB_MRT_CONTROL).is_some_and(|payload| {
+            let enabled = u32::from(payload[0] & 3 == 3);
+            reg(RB_BLEND_CNTL) == Some(&[0xffff_0000 | enabled])
+                && reg(SP_BLEND_CNTL) == Some(&[enabled])
+        })
         && reg(RB_DITHER_CNTL) == Some(&[0])
         && reg(RB_ALPHA_TEST_CNTL) == Some(&[0])
         && reg(RB_STENCIL_CNTL) == Some(&[0])
@@ -1794,13 +2540,41 @@ fn segment_matches_pipeline(segment: &SegmentIndex<'_, '_, '_>, variant: Pipelin
             || (reg(SP_PS_SAMPLER_BASE).is_some() && reg(SP_PS_TEXMEMOBJ_BASE).is_some()))
 }
 
+fn valid_blend_control(payload: &[u32]) -> bool {
+    let [control, blend] = *payload else {
+        return false;
+    };
+    if matches!(control, 0x7e0 | 0xe0 | 0x1e0) {
+        return blend == 0x0001_0001;
+    }
+    if !matches!(control, 0x7e3 | 0xe3 | 0x1e3) || blend & 0xe000_e000 != 0 {
+        return false;
+    }
+    // Exclude reserved, constant-color and dual-source factors: their state
+    // is not part of this dialect. All ordinary SGFX factors are bounded.
+    [blend & 0xffff, blend >> 16].into_iter().all(|component| {
+        matches!(component & 0x1f, 0 | 1 | 4..=11)
+            && matches!((component >> 8) & 0x1f, 0 | 1 | 4..=11)
+            && ((component >> 5) & 7) <= 4
+    })
+}
+
+fn valid_native_blend_control(payload: &[u32]) -> bool {
+    let [control, blend] = *payload else {
+        return false;
+    };
+    // Per-component masks may differ between MRT slots. Preserve the same
+    // bounded blend equations/factors and fixed COPY ROP as canonical draws.
+    control & !0x7ff == 0 && valid_blend_control(&[control | (15 << 7), blend])
+}
+
 /// Reject impossible pipeline candidates using state that the full matcher
-/// already requires.  Stride, vertex fetch layout, sampler use, blend mode,
+/// already requires.  Stride, vertex fetch layout, sampler use,
 /// and the fragment program's initial texture-load command form a unique
 /// identity for every supported canonical pipeline.  This keeps the expensive
 /// packet-scanning matcher to one candidate per draw.  It remains only a
 /// prefilter: every surviving candidate still passes the exact canonical-state
-/// matcher below, so the accepted PM4 language is unchanged.
+/// matcher below. Blend state is validated independently of shader identity.
 fn segment_may_match_pipeline(
     segment: &SegmentIndex<'_, '_, '_>,
     variant: PipelineVariant,
@@ -1819,12 +2593,7 @@ fn segment_may_match_pipeline(
             payload.first() == Some(&fs.initial_tex_load_cntl)
                 && payload.get(1..) == Some(fs.initial_tex_load_cmd)
         })
-        && reg(RB_MRT_CONTROL)
-            == Some(if fixed.source_over {
-                &[0x7e3, 0x0701_0706]
-            } else {
-                &[0x7e0, 0x0001_0001]
-            })
+        && reg(RB_MRT_CONTROL).is_some_and(valid_blend_control)
 }
 
 fn address_by_word_mut(
@@ -1854,6 +2623,224 @@ fn set_image_expectation(
 struct ValidatedTargetState {
     screen: [u32; 2],
     viewport: [u32; 2],
+}
+
+fn validate_native_graphics_program(
+    segment: &SegmentIndex<'_, '_, '_>,
+    relocations: &[Relocation],
+) -> Result<(), &'static str> {
+    // Native program allocations may include rodata, but every fetch
+    // must fit the authorized code allocation and use the same base
+    // as the preload. Do not infer safety from compiler metadata.
+    for (program, size_register, preload_opcode, block) in [
+        (
+            SP_VS_PROGRAM_COUNTER_OFFSET,
+            SP_VS_INSTR_SIZE,
+            CP_LOAD_STATE6_GEOM,
+            8,
+        ),
+        (
+            SP_PS_PROGRAM_COUNTER_OFFSET,
+            SP_PS_INSTR_SIZE,
+            CP_LOAD_STATE6_FRAG,
+            12,
+        ),
+    ] {
+        let (_, base_word) = submit_private::program_layout(&segment, program).unwrap();
+        let base = relocation_at(relocations, base_word)
+            .ok_or("a618: shader program relocation is missing")?;
+        if matches!(base.source, RelocationSource::ShaderAttachment(_)) {
+            let preload_word =
+                segment_shader_preload_word(&segment, preload_opcode, block).unwrap();
+            let preload = relocation_at(relocations, preload_word)
+                .ok_or("a618: native shader preload is missing")?;
+            let (_, size) = segment
+                .reg(size_register)
+                .ok_or("a618: native shader instruction size missing")?;
+            if base.source != preload.source
+                || base.resource_offset != preload.resource_offset
+                || base.required_size != preload.required_size
+                || size.len() != 1
+                || u64::from(size[0]) * 128 > base.required_size
+            {
+                return Err("a618: native shader program/preload size mismatch");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_native_graphics_sequences(
+    packets: &[Packet<'_>],
+    relocations: &[Relocation],
+) -> Result<(), &'static str> {
+    let mut registers = Vec::new();
+    let mut start = 0;
+    let mut initialized = false;
+    for (index, packet) in packets.iter().enumerate() {
+        if !matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: CP_DRAW_INDX_OFFSET,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let segment = SegmentIndex::new(&packets[start..index], &mut registers);
+        let fields = [
+            submit_private::program_layout(&segment, SP_VS_PROGRAM_COUNTER_OFFSET).is_some(),
+            submit_private::program_layout(&segment, SP_PS_PROGRAM_COUNTER_OFFSET).is_some(),
+            segment_shader_preload_word(&segment, CP_LOAD_STATE6_GEOM, 8).is_some(),
+            segment_shader_preload_word(&segment, CP_LOAD_STATE6_FRAG, 12).is_some(),
+        ];
+        if fields.iter().all(|v| *v) {
+            validate_native_graphics_program(&segment, relocations)?;
+            initialized = true;
+        } else if !initialized
+            || fields.iter().any(|v| *v)
+            || segment.reg(SP_VS_INSTR_SIZE).is_some()
+            || segment.reg(SP_PS_INSTR_SIZE).is_some()
+        {
+            return Err("a618: incomplete native graphics program transition");
+        }
+        start = index + 1;
+    }
+    Ok(())
+}
+
+/// Track only framebuffer state written in this submit. The private domain
+/// bounds shader memory accesses, while typed image authority also prevents a
+/// PM4 render target from inventing a format, pitch or subresource footprint.
+fn validate_native_render_targets(
+    packets: &[Packet<'_>],
+    addresses: &mut [AddressField],
+) -> Result<(), &'static str> {
+    let mut info = [None; 8];
+    let mut pitch = [None; 8];
+    let mut base = [None; 8];
+    let mut output = [None; 8];
+    let mut rb_count = None;
+    let mut sp_count = None;
+    let mut viewport = None;
+    let mut depth = None;
+    let mut depth_control = 0;
+    let mut poly_offset = false;
+    let mut bias_initialized = false;
+    for packet in packets {
+        if let Header::Type4 { register, .. } = packet.header {
+            let p = packet.payload;
+            if (RB_MRT_CONTROL..RB_MRT_CONTROL + 64).contains(&register) {
+                let slot = ((register - RB_MRT_CONTROL) / 8) as usize;
+                match (register - RB_MRT_CONTROL) % 8 {
+                    2 => info[slot] = Some(p[0]),
+                    3 => pitch[slot] = Some([p[0], p[1]]),
+                    5 => base[slot] = Some(packet.word_offset + 1),
+                    _ => {}
+                }
+            } else if (SP_PS_MRT_REG..SP_PS_MRT_REG + 8).contains(&register) {
+                for (index, value) in p.iter().enumerate() {
+                    output[(register - SP_PS_MRT_REG) as usize + index] = Some(*value);
+                }
+            } else {
+                match register {
+                    RB_PS_MRT_CNTL => rb_count = Some(p[0]),
+                    SP_PS_MRT_CNTL => sp_count = Some(p[0]),
+                    GRAS_SC_VIEWPORT_SCISSOR_TL => viewport = Some([p[0], p[1]]),
+                    RB_DEPTH_BUFFER_INFO => depth = Some((packet.word_offset + 4, p)),
+                    RB_DEPTH_CNTL => depth_control = p[0],
+                    GRAS_SU_CNTL => poly_offset = p[0] & (1 << 11) != 0,
+                    GRAS_SU_POLY_OFFSET_SCALE => bias_initialized = true,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if !matches!(
+            packet.header,
+            Header::Type7 {
+                opcode: CP_DRAW_INDX_OFFSET,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let count = rb_count.ok_or("a618: native MRT count is not initialized")?;
+        if poly_offset && !bias_initialized {
+            return Err("a618: native depth bias is not initialized in this submission");
+        }
+        if sp_count != Some(count) {
+            return Err("a618: native SP/RB MRT counts disagree");
+        }
+        if count == 0 && depth_control == 0 {
+            continue;
+        }
+        let [origin, bounds] = viewport.ok_or("a618: native target extent is missing")?;
+        if origin != 0 {
+            return Err("a618: native attachment scissor must start at zero");
+        }
+        let width = (bounds & 0xffff) + 1;
+        let height = (bounds >> 16) + 1;
+        let mut authorize = |word, expectation| {
+            let address = address_by_word_mut(addresses, word)
+                .ok_or("a618: native target lacks a typed relocation")?;
+            if address.image.is_some_and(|old| old != expectation) {
+                return Err("a618: native target layout changed without a new relocation");
+            }
+            address.image = Some(expectation);
+            Ok(())
+        };
+        for slot in 0..count as usize {
+            let (format, modifier) = info[slot]
+                .and_then(native_color_target)
+                .ok_or("a618: native MRT format is missing")?;
+            if output[slot].and_then(native_color_format) != Some(format) {
+                return Err("a618: native SP/RB MRT formats disagree");
+            }
+            let [row, array] = pitch[slot].ok_or("a618: native MRT pitch is missing")?;
+            authorize(
+                base[slot].ok_or("a618: native MRT base is missing")?,
+                ImageExpectation {
+                    mip_levels: 1,
+                    format,
+                    modifier,
+                    row_pitch: row * 64,
+                    width,
+                    height,
+                    exact_extent: true,
+                    pitch_align: None,
+                    array_pitch: Some(ArrayPitchExpectation {
+                        bytes: u64::from(array) * 64,
+                        alignment: 64,
+                    }),
+                },
+            )?;
+        }
+        if depth_control != 0 {
+            let (word, info) = depth.ok_or("a618: native depth target is missing")?;
+            if info[0] != DEPTH_FORMAT_32 {
+                return Err("a618: native depth target is disabled");
+            }
+            authorize(
+                word,
+                ImageExpectation {
+                    mip_levels: 1,
+                    format: LinearImageFormat::Depth32Float,
+                    modifier: ImageModifier::Tile6_3Depth,
+                    row_pitch: info[1] * 64,
+                    width,
+                    height,
+                    exact_extent: true,
+                    pitch_align: None,
+                    array_pitch: Some(ArrayPitchExpectation {
+                        bytes: u64::from(info[2]) * 64,
+                        alignment: adreno_a6xx_layout::DEPTH32_LAYER_ALIGNMENT,
+                    }),
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_3d_sequences(
@@ -1915,6 +2902,7 @@ fn validate_3d_sequences(
             segment_shader_preload_word(&segment, CP_LOAD_STATE6_FRAG, 12).is_some(),
         ];
         if shader_fields.iter().all(|present| *present) {
+            validate_native_graphics_program(&segment, relocations)?;
             shader_state_initialized = true;
         } else if !(shader_fields.iter().all(|present| !*present)
             && shader_state_initialized
@@ -2290,8 +3278,44 @@ pub(crate) fn diagnose_rejected_packet(bytes: &[u8]) -> Option<RejectedPacket> {
     let decoded = adreno_a6xx_submit_wire::decode(bytes).ok()?;
     let words = copy_pm4(decoded).ok()?;
     let mut addresses = Vec::new();
+    let relocations: Vec<_> = (0..decoded.relocation_len())
+        .filter_map(|i| decoded.relocation(i))
+        .collect();
     for packet in Packets::new(&words) {
         let packet = packet.ok()?;
+        if decoded.requires_isolation() {
+            let result = match packet.header {
+                Header::Type4 { register, .. } => validate_native_type4(
+                    register,
+                    packet.payload,
+                    packet.word_offset,
+                    &mut addresses,
+                ),
+                Header::Type7 { opcode, .. } => validate_native_type7(
+                    opcode,
+                    packet.payload,
+                    packet.word_offset,
+                    &mut addresses,
+                    &relocations,
+                ),
+            };
+            if let Some(result) = result {
+                if result.is_ok() {
+                    continue;
+                }
+                let (kind, selector) = match packet.header {
+                    Header::Type4 { register, .. } => (RejectedPacketKind::Type4, register),
+                    Header::Type7 { opcode, .. } => (RejectedPacketKind::Type7, u32::from(opcode)),
+                };
+                return Some(RejectedPacket {
+                    kind,
+                    selector,
+                    word_offset: packet.word_offset,
+                    payload_len: packet.payload.len() as u32,
+                    first_value: packet.payload.first().copied(),
+                });
+            }
+        }
         let (kind, selector, result) = match packet.header {
             Header::Type4 { register, .. } => (
                 RejectedPacketKind::Type4,
@@ -2320,6 +3344,7 @@ pub(crate) fn diagnose_rejected_packet(bytes: &[u8]) -> Option<RejectedPacket> {
 fn validate_pm4(
     decoded: DecodedSubmit<'_>,
     relocations: &[Relocation],
+    native: bool,
 ) -> Result<(Vec<u32>, Vec<AddressField>), &'static str> {
     let words = copy_pm4(decoded)?;
     let packets = Packets::new(&words)
@@ -2333,9 +3358,32 @@ fn validate_pm4(
     for packet in packets.iter().copied() {
         match packet.header {
             Header::Type4 { register, .. } => {
+                if native {
+                    if let Some(result) = validate_native_type4(
+                        register,
+                        packet.payload,
+                        packet.word_offset,
+                        &mut addresses,
+                    ) {
+                        result?;
+                        continue;
+                    }
+                }
                 validate_type4(register, packet.payload, packet.word_offset, &mut addresses)?
             }
             Header::Type7 { opcode, .. } => {
+                if native {
+                    if let Some(result) = validate_native_type7(
+                        opcode,
+                        packet.payload,
+                        packet.word_offset,
+                        &mut addresses,
+                        relocations,
+                    ) {
+                        result?;
+                        continue;
+                    }
+                }
                 validate_type7(opcode, packet.payload, packet.word_offset, &mut addresses)?
             }
         }
@@ -2349,17 +3397,29 @@ fn validate_pm4(
     {
         return Err("qcom-adreno-a618: GPU address fields are not strictly ordered");
     }
-    validate_memcpy_barriers(&packets)?;
+    validate_memcpy_barriers(&packets, native)?;
     validate_ccu_transitions(&packets)?;
     validate_render_retirement(&packets)?;
     validate_a2d_sequences(&packets, &mut addresses)?;
-    validate_texture_initialization(decoded, &packets, &mut addresses, relocations)?;
-    validate_3d_sequences(
-        &packets,
-        &mut addresses,
-        relocations,
-        cfg!(feature = "strict-command-validation"),
-    )?;
+    if !native {
+        validate_texture_initialization(decoded, &packets, &mut addresses, relocations)?;
+    }
+    if native { submit_private::validate_sequences(&packets)?; }
+    validate_compute_sequences(&packets, relocations)?;
+    if native {
+        // Arbitrary shader address arithmetic cannot be proven from PM4.
+        // Native fetch/store authority is the private SMMU page set, not a
+        // fixed pipeline template. Every PM4 address is still typed below.
+        validate_native_graphics_sequences(&packets, relocations)?;
+        validate_native_render_targets(&packets, &mut addresses)?;
+    } else {
+        validate_3d_sequences(
+            &packets,
+            &mut addresses,
+            relocations,
+            cfg!(feature = "strict-command-validation"),
+        )?;
+    }
     for (address, relocation) in addresses.iter().zip(relocations.iter().copied()) {
         if relocation.pm4_word_offset != address.word_offset
             || relocation.access != address.access
@@ -2399,6 +3459,16 @@ fn relocate_one(
                 .ok_or("qcom-adreno-a618: relocation PM4 offset is invalid")?;
             destination.copy_from_slice(&[address as u32, (address >> 32) as u32]);
         }
+        AddressEncoding::GpuVa49UboDescriptor => {
+            if address & 15 != 0 || address >= (1_u64 << 49) {
+                return Err("a618: UBO descriptor address is invalid");
+            }
+            let destination = words
+                .get_mut(index..index + 2)
+                .ok_or("a618: invalid UBO relocation offset")?;
+            destination[0] = address as u32;
+            destination[1] = (destination[1] & !0x1ffff) | ((address >> 32) as u32 & 0x1ffff);
+        }
         AddressEncoding::GpuVa49TexDescriptor => {
             if address & 0x1f != 0 || address >= (1_u64 << 49) {
                 return Err("qcom-adreno-a618: texture descriptor address is invalid");
@@ -2419,7 +3489,11 @@ fn image_footprint(image: LinearImage) -> Option<u64> {
     }
     match (image.format, image.modifier) {
         (
-            LinearImageFormat::Bgra8Unorm | LinearImageFormat::Nv12Y | LinearImageFormat::Nv12Uv,
+            LinearImageFormat::Bgra8Unorm
+            | LinearImageFormat::Nv12Y
+            | LinearImageFormat::Nv12Uv
+            | LinearImageFormat::Rgba16Float
+            | LinearImageFormat::Rgba32Float,
             ImageModifier::Linear,
         ) => u64::from(image.row_pitch).checked_mul(u64::from(image.height)),
         (LinearImageFormat::Depth32Float, ImageModifier::Tile6_3Depth)
@@ -2497,11 +3571,23 @@ fn image_range(image: LinearImage, offset: u64, size: u64) -> Option<LinearImage
 /// Decode, authorize, validate, and relocate into a kernel-owned dword vector.
 pub(crate) fn validate_and_relocate(
     bytes: &[u8],
-    mut resolve: impl FnMut(u64) -> Option<ResolvedResource>,
-    mut resolve_shader: impl FnMut(ShaderVariant) -> Option<ResolvedResource>,
+    resolve: impl FnMut(u64) -> Option<ResolvedResource>,
+    resolve_shader: impl FnMut(ShaderVariant) -> Option<ResolvedResource>,
 ) -> Result<Vec<u32>, &'static str> {
     let decoded = adreno_a6xx_submit_wire::decode(bytes)
         .map_err(|_| "qcom-adreno-a618: invalid A6xx submit wire")?;
+    validate_and_relocate_decoded(decoded, resolve, resolve_shader)
+}
+
+/// Reuse structural validation of the same immutable, kernel-owned wire.
+/// DecodedSubmit can only be constructed by the complete wire decoder; this
+/// entry still performs every resource, PM4, shader and relocation check.
+pub(crate) fn validate_and_relocate_decoded(
+    decoded: DecodedSubmit<'_>,
+    mut resolve: impl FnMut(u64) -> Option<ResolvedResource>,
+    mut resolve_shader: impl FnMut(ShaderVariant) -> Option<ResolvedResource>,
+) -> Result<Vec<u32>, &'static str> {
+    let native = decoded.requires_isolation();
     let mut resources = Vec::new();
     resources
         .try_reserve_exact(decoded.resource_len())
@@ -2522,21 +3608,24 @@ pub(crate) fn validate_and_relocate(
         if range_end > resolved.allocation_size {
             return Err("qcom-adreno-a618: resource range exceeds attached allocation");
         }
-        resources.push(ResolvedResource {
-            attachment_token: resolved.attachment_token,
-            gpu_va: resolved
-                .gpu_va
-                .checked_add(wire.range_offset)
-                .ok_or("qcom-adreno-a618: resource range GPU VA overflows")?,
-            allocation_size: wire.range_size,
-            // Preserve the wire-declared authority after checking it is a subset of
-            // the attached object's actual authority. Relocations must be a subset
-            // of both layers.
-            allowed_access: wire.access,
-            linear_image: resolved
-                .linear_image
-                .and_then(|image| image_range(image, wire.range_offset, wire.range_size)),
-        });
+        resources.push((
+            ResolvedResource {
+                attachment_token: resolved.attachment_token,
+                gpu_va: resolved
+                    .gpu_va
+                    .checked_add(wire.range_offset)
+                    .ok_or("qcom-adreno-a618: resource range GPU VA overflows")?,
+                allocation_size: wire.range_size,
+                // Preserve the wire-declared authority after checking it is a subset of
+                // the attached object's actual authority. Relocations must be a subset
+                // of both layers.
+                allowed_access: wire.access,
+                linear_image: resolved
+                    .linear_image
+                    .and_then(|image| image_range(image, wire.range_offset, wire.range_size)),
+            },
+            resolved.linear_image.is_some(),
+        ));
     }
     let mut relocations = Vec::new();
     relocations
@@ -2549,38 +3638,96 @@ pub(crate) fn validate_and_relocate(
                 .ok_or("qcom-adreno-a618: relocation table is incomplete")?,
         );
     }
-    let (mut words, addresses) = validate_pm4(decoded, &relocations)?;
+    let (mut words, addresses) = validate_pm4(decoded, &relocations, native)?;
     for (index, relocation) in relocations.iter().copied().enumerate() {
-        let resource = match relocation.source {
-            RelocationSource::Attachment(resource_index) => *resources
+        let (resource, attached_image) = match relocation.source {
+            RelocationSource::Attachment(resource_index)
+            | RelocationSource::ShaderAttachment(resource_index) => *resources
                 .get(resource_index as usize)
                 .ok_or("qcom-adreno-a618: relocation resource index is invalid")?,
-            RelocationSource::CanonicalShader(variant) => resolve_shader(variant)
-                .ok_or("qcom-adreno-a618: canonical shader is unavailable")?,
+            RelocationSource::CanonicalShader(variant) => (
+                resolve_shader(variant)
+                    .ok_or("qcom-adreno-a618: canonical shader is unavailable")?,
+                false,
+            ),
         };
         if relocation.access & !resource.allowed_access != 0 {
             return Err("qcom-adreno-a618: relocation exceeds declared resource access");
         }
-        let address = addresses[index];
-        if address
-            .required_size
-            .is_some_and(|required| relocation.required_size != required)
+        if matches!(relocation.source, RelocationSource::ShaderAttachment(_))
+            && (resource.linear_image.is_some()
+                || resource
+                    .gpu_va
+                    .checked_add(relocation.resource_offset)
+                    .is_none_or(|address| address & 127 != 0))
         {
+            return Err("a618: native shader requires aligned buffer storage");
+        }
+        if native {
+            submit_storage::validate(&words, &relocation, &resource, attached_image)?;
+        }
+        let address = addresses[index];
+        if address.private_memory { submit_private::validate_resolved(&relocation, &resource, attached_image)?; }
+        if address.required_size.is_some_and(|required| {
+            if address.size_is_minimum
+                || matches!(relocation.source, RelocationSource::ShaderAttachment(_))
+            {
+                relocation.required_size < required
+            } else {
+                relocation.required_size != required
+            }
+        }) {
             return Err("qcom-adreno-a618: relocation size does not match PM4 operation");
         }
         if address.requires_complete_linear_image {
-            let image = resource
-                .linear_image
-                .and_then(|image| {
-                    image_range(image, relocation.resource_offset, relocation.required_size)
-                })
-                .ok_or("qcom-adreno-a618: A2D address must cover one complete linear image")?;
+            let expectation = address
+                .a2d
+                .ok_or("qcom-adreno-a618: A2D relocation lacks semantic bounds")?;
+            let staging = expectation.depth_staging;
+            let image = if staging {
+                // This is a read-only linear R32 staging source, never a render
+                // target or arbitrary image reinterpretation. Retain the original
+                // attachment kind even when a forged image subrange lost metadata.
+                let size = u64::from(expectation.row_pitch)
+                    .checked_mul(u64::from(expectation.required_height))
+                    .ok_or("a618: D32 staging footprint overflows")?;
+                if attached_image
+                    || relocation.access != ACCESS_READ
+                    || expectation.row_pitch & 63 != 0
+                    || relocation.required_size != size
+                    || resource
+                        .gpu_va
+                        .checked_add(relocation.resource_offset)
+                        .is_none_or(|base| base & 63 != 0)
+                {
+                    return Err("a618: invalid D32 linear staging authority");
+                }
+                LinearImage {
+                    texture: None,
+                    format: LinearImageFormat::Depth32Float,
+                    modifier: ImageModifier::Linear,
+                    width: expectation.required_width,
+                    height: expectation.required_height,
+                    row_pitch: expectation.row_pitch,
+                    visible_size: size,
+                }
+            } else {
+                resource
+                    .linear_image
+                    .and_then(|image| {
+                        image_range(image, relocation.resource_offset, relocation.required_size)
+                    })
+                    .ok_or("qcom-adreno-a618: A2D address must cover one complete linear image")?
+            };
             let row_bytes = image
                 .width
-                .checked_mul(4)
+                .checked_mul(image.format.texel_bytes())
                 .ok_or("qcom-adreno-a618: image row size overflows")?;
-            let layout_size =
-                image_footprint(image).ok_or("qcom-adreno-a618: image layout is not supported")?;
+            let layout_size = if staging {
+                image.visible_size
+            } else {
+                image_footprint(image).ok_or("qcom-adreno-a618: image layout is not supported")?
+            };
             if image.width == 0
                 || image.height == 0
                 || image.row_pitch < row_bytes
@@ -2589,15 +3736,12 @@ pub(crate) fn validate_and_relocate(
             {
                 return Err("qcom-adreno-a618: A2D relocation does not match image layout");
             }
-            let expectation = address
-                .a2d
-                .ok_or("qcom-adreno-a618: A2D relocation lacks semantic bounds")?;
             let accessed_bytes = if image.modifier == ImageModifier::Linear {
                 u64::from(expectation.required_height.saturating_sub(1))
                     .checked_mul(u64::from(expectation.row_pitch))
                     .and_then(|bytes| {
                         u64::from(expectation.required_width)
-                            .checked_mul(4)
+                            .checked_mul(u64::from(image.format.texel_bytes()))
                             .and_then(|row| bytes.checked_add(row))
                     })
                     .ok_or("qcom-adreno-a618: A2D byte range overflows")?
@@ -2630,7 +3774,7 @@ pub(crate) fn validate_and_relocate(
                 || image.row_pitch
                     < image
                         .width
-                        .checked_mul(match image.format { LinearImageFormat::Nv12Y => 1, LinearImageFormat::Nv12Uv => 2, _ => 4 })
+                        .checked_mul(image.format.texel_bytes())
                         .ok_or("qcom-adreno-a618: 3D row size overflows")?
                 || layout_size != image.visible_size
                 || relocation.required_size != image.visible_size
@@ -2694,6 +3838,146 @@ mod tests {
         ResolvedResource, ShaderStage, address_source_matches, diagnose_rejected_packet,
         relocate_one, validate_and_relocate, validate_type7,
     };
+
+    #[test]
+    fn float_mip_and_array_ranges_expose_only_canonical_subresources() {
+        for format in [
+            LinearImageFormat::Rgba16Float,
+            LinearImageFormat::Rgba32Float,
+        ] {
+            let texture = adreno_a6xx_layout::LinearTextureLayout::new_with_texel_bytes(
+                65,
+                17,
+                4,
+                3,
+                format.texel_bytes(),
+            )
+            .unwrap();
+            let image = LinearImage {
+                texture: Some(texture),
+                format,
+                modifier: KernelImageModifier::Linear,
+                width: 65,
+                height: 17,
+                row_pitch: texture.row_pitch,
+                visible_size: texture.total_size,
+            };
+            for layer in 0..3 {
+                for level in 0..4 {
+                    let sub = texture.subresource(level, layer).unwrap();
+                    let view = super::image_range(image, sub.offset, sub.size).unwrap();
+                    assert_eq!(view.format, format);
+                    assert_eq!(
+                        (view.width, view.height, view.row_pitch),
+                        (sub.width, sub.height, sub.row_pitch)
+                    );
+                    assert_eq!(super::image_footprint(view), Some(sub.size));
+                    assert!(sub.row_pitch >= sub.width * format.texel_bytes());
+                    assert!(super::image_range(image, sub.offset + 1, sub.size).is_none());
+                    assert!(super::image_range(image, sub.offset, sub.size - 1).is_none());
+                }
+            }
+            assert!(super::image_range(image, texture.total_size, 64).is_none());
+        }
+    }
+
+    #[test]
+    fn buffer_copy_and_global_barrier_pass_real_kernel_validation() {
+        let resources = [
+            ResourceMeta {
+                id: SOURCE,
+                size: 4096,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::COPY_SRC,
+                },
+            },
+            ResourceMeta {
+                id: TARGET,
+                size: 4096,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::COPY_DST,
+                },
+            },
+        ];
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &[],
+            operations: &[
+                Operation::CopyBufferToBuffer {
+                    source: SOURCE,
+                    source_offset: 64,
+                    destination: TARGET,
+                    destination_offset: 128,
+                    size: 1028,
+                },
+                Operation::ResourceBarrier,
+            ],
+        })
+        .unwrap();
+        let bytes = wire_from_codegen(&artifact);
+        let resolve = |attachment_token| {
+            Some(ResolvedResource {
+                attachment_token,
+                gpu_va: 0x1_0000_0000 + attachment_token * 0x1_0000,
+                allocation_size: 4096,
+                allowed_access: if attachment_token == token(ObjectRef::External(SOURCE)) {
+                    ACCESS_READ
+                } else {
+                    ACCESS_WRITE
+                },
+                linear_image: None,
+            })
+        };
+        let words = validate_no_shaders(&bytes, resolve).unwrap();
+        let packets: std::vec::Vec<_> = Packets::new(&words).map(Result::unwrap).collect();
+        let copies: std::vec::Vec<_> = packets
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                matches!(
+                    p.header,
+                    Header::Type7 {
+                        opcode: CP_MEMCPY,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(copies.len(), 3);
+        let mut copied = 0u64;
+        for (i, p) in copies {
+            assert!(p.payload[0] <= CP_MEMCPY_MAX_DWORDS);
+            let src = u64::from(p.payload[1]) | (u64::from(p.payload[2]) << 32);
+            let dst = u64::from(p.payload[3]) | (u64::from(p.payload[4]) << 32);
+            assert_eq!(
+                src,
+                resolve(token(ObjectRef::External(SOURCE))).unwrap().gpu_va + 64 + copied
+            );
+            assert_eq!(
+                dst,
+                resolve(token(ObjectRef::External(TARGET))).unwrap().gpu_va + 128 + copied
+            );
+            assert!(matches!(
+                packets[i + 1].header,
+                Header::Type7 {
+                    opcode: opcode::WAIT_MEM_WRITES,
+                    count: 0
+                }
+            ));
+            copied += u64::from(p.payload[0]) * 4;
+        }
+        assert_eq!(copied, 1028);
+        // A forged destination without write authority must still fail.
+        assert!(
+            validate_no_shaders(&bytes, |token| {
+                let mut r = resolve(token)?;
+                r.allowed_access = ACCESS_READ;
+                Some(r)
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn mip_and_cube_layer_views_are_bounded_by_canonical_storage() {
@@ -3007,6 +4291,8 @@ mod tests {
             ObjectRef::External(id) => u64::from(id.raw()) + 1,
             ObjectRef::Generated(id) => 0x1000 + u64::from(id.raw()),
             ObjectRef::CanonicalShader(_) => panic!("canonical shaders never have tokens"),
+            #[allow(unreachable_patterns)]
+            _ => panic!("native shaders use the native test wire encoder"),
         }
     }
 
@@ -3067,6 +4353,8 @@ mod tests {
                         sgfx_codegen_adreno_a6xx::AddressEncoding::GpuVa49TexDescriptor => {
                             AddressEncoding::GpuVa49TexDescriptor
                         }
+                        #[allow(unreachable_patterns)]
+                        _ => panic!("native encoding uses the native test wire encoder"),
                     },
                 }
             })
@@ -3937,7 +5225,10 @@ mod tests {
             .unwrap();
         vertex_shader.object =
             ObjectRef::CanonicalShader(adreno_a6xx_shader_pack::ShaderVariant::VsStride16Pos2);
-        assert!(accept_codegen(&wrong_vertex_program).is_err());
+        assert_eq!(
+            accept_codegen(&wrong_vertex_program).is_err(),
+            cfg!(feature = "strict-command-validation")
+        );
 
         // Keep the crucial A618 sysmem retirement order pinned independently
         // from relocation validation.  The old stream was valid packetized
@@ -4130,7 +5421,10 @@ mod tests {
                 fixup.word_offset += 2;
             }
         }
-        assert!(accept_codegen(&wrong_final_marker).is_err());
+        assert_eq!(
+            accept_codegen(&wrong_final_marker).is_err(),
+            cfg!(feature = "strict-command-validation")
+        );
 
         let mut hostile = artifact.clone();
         let linkage = hostile
@@ -4139,7 +5433,10 @@ mod tests {
             .find(|word| **word == 0x00ff_0408)
             .unwrap();
         *linkage ^= 1;
-        assert!(accept_codegen(&hostile).is_err());
+        assert_eq!(
+            accept_codegen(&hostile).is_err(),
+            cfg!(feature = "strict-command-validation")
+        );
 
         let mut duplicate = artifact.clone();
         let insertion = duplicate
@@ -4157,7 +5454,10 @@ mod tests {
                 fixup.word_offset += 2;
             }
         }
-        assert!(accept_codegen(&duplicate).is_err());
+        assert_eq!(
+            accept_codegen(&duplicate).is_err(),
+            cfg!(feature = "strict-command-validation")
+        );
 
         let mut bad_pitch = artifact.clone();
         let pitch = Packets::new(&artifact.words)
@@ -4233,7 +5533,10 @@ mod tests {
             })
             .unwrap();
         bad_vfd_count.words[vfd.word_offset as usize + 1] = 0x0303;
-        assert!(accept_codegen(&bad_vfd_count).is_err());
+        assert_eq!(
+            accept_codegen(&bad_vfd_count).is_err(),
+            cfg!(feature = "strict-command-validation")
+        );
     }
 
     #[test]
@@ -5021,9 +6324,11 @@ mod tests {
         };
         let mut shared_arena = std::vec![0; encoded_len(submit).unwrap()];
         encode(submit, &mut shared_arena).unwrap();
+        let decoded_shared = adreno_a6xx_submit_wire::decode(&shared_arena).unwrap();
         super::validate_pm4(
-            adreno_a6xx_submit_wire::decode(&shared_arena).unwrap(),
+            decoded_shared,
             &relocations,
+            decoded_shared.requires_isolation(),
         )
         .unwrap();
 
@@ -5085,6 +6390,42 @@ mod tests {
             .unwrap();
         fixup.object_offset += 16;
         assert!(accept_codegen(&bad_lookup).is_err());
+    }
+
+    #[test]
+    fn sampler_rejects_indirect_border_tables_and_reserved_modes() {
+        assert!(super::supported_sampler(&[0x961, 0x1806_0000, 0x10, 0], 8));
+        for words in [
+            [0x960, 0x40, 0, 0],             // border without fast transparent color
+            [0x960, 0x40, 0x90, 0],          // indirect border table index
+            [0x960, 0x40, 0x14, 0],          // opaque border color
+            [0x928, 0x40, 0x20, 1],          // reserved tail
+            [0x920 | (5 << 14), 0x40, 0, 0], // reserved anisotropy
+            [0x938, 0x40, 0x20, 0],          // cubic filtering unsupported on A618
+            [0x920 | (1 << 19), 0x40, 0, 0], // unsupported LOD bias
+            [0x920, 0x41, 0, 0],             // unsupported clamp/compare flag
+        ] {
+            assert!(!super::supported_sampler(&words, 0), "{words:x?}");
+        }
+    }
+
+    #[test]
+    fn blend_state_rejects_reserved_fields_and_unbound_factors() {
+        assert!(super::valid_blend_control(&[0x7e0, 0x0001_0001]));
+        for value in [0x0101_0101, 0x0700_0700, 0x0701_0701] {
+            assert!(super::valid_blend_control(&[0x7e3, value]));
+        }
+        for value in [
+            0x0001_000c,
+            0x0001_0014,
+            0x0001_00a1,
+            0x2001_0001,
+            0x0001_2001,
+        ] {
+            assert!(!super::valid_blend_control(&[0x7e3, value]));
+        }
+        assert!(!super::valid_blend_control(&[0x7e7, 0x0001_0001]));
+        assert!(!super::valid_blend_control(&[0x7e0, 0x0701_0701]));
     }
 
     #[test]
@@ -5153,7 +6494,7 @@ mod tests {
                 VertexAttribute::new(2, VertexFormat::Float32x2, 32),
             ],
         );
-        let cases = std::vec![
+        let mut cases = std::vec![
             (
                 pos2,
                 FragmentProgram::Solid,
@@ -5191,6 +6532,23 @@ mod tests {
                 CullMode::None
             ),
             (
+                color4_uv.clone(),
+                FragmentProgram::TextureVertexColor(TextureSampleMode::Rgba),
+                BlendState::new(
+                    sgfx_core::ir::BlendComponent::new(
+                        sgfx_core::ir::BlendFactor::One,
+                        sgfx_core::ir::BlendFactor::OneMinusSourceAlpha,
+                        sgfx_core::ir::BlendOp::Add
+                    ),
+                    sgfx_core::ir::BlendComponent::new(
+                        sgfx_core::ir::BlendFactor::One,
+                        sgfx_core::ir::BlendFactor::OneMinusSourceAlpha,
+                        sgfx_core::ir::BlendOp::Add
+                    ),
+                ),
+                CullMode::None
+            ),
+            (
                 color4_uv,
                 FragmentProgram::TextureVertexColor(TextureSampleMode::AlphaMask),
                 BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
@@ -5221,6 +6579,34 @@ mod tests {
                 CullMode::Front
             ),
         ];
+        use sgfx_core::ir::{BlendComponent, BlendFactor as F, BlendOp as O};
+        let factors = [
+            F::Zero,
+            F::One,
+            F::SourceAlpha,
+            F::OneMinusSourceAlpha,
+            F::DestinationAlpha,
+            F::OneMinusDestinationAlpha,
+            F::SourceColor,
+            F::OneMinusSourceColor,
+            F::DestinationColor,
+            F::OneMinusDestinationColor,
+        ];
+        for op in [O::Add, O::Subtract, O::ReverseSubtract, O::Min, O::Max] {
+            for src in factors {
+                for dst in factors {
+                    cases.push((
+                        pos4(40),
+                        FragmentProgram::Solid,
+                        BlendState::new(
+                            BlendComponent::new(src, dst, op),
+                            BlendComponent::new(dst, src, op),
+                        ),
+                        CullMode::None,
+                    ));
+                }
+            }
+        }
         for (index, (vertex_layout, fragment, blend, cull)) in cases.into_iter().enumerate() {
             let pipeline_id = PipelineId::new(index as u32);
             let textured = matches!(
@@ -5305,6 +6691,39 @@ mod tests {
                 "pipeline case {index} rejected"
             );
             if index == 1 {
+                let modes = [
+                    AddressMode::ClampToEdge,
+                    AddressMode::Repeat,
+                    AddressMode::MirrorRepeat,
+                    AddressMode::ClampToBorder,
+                ];
+                for u in modes {
+                    for v in modes {
+                        for min in [FilterMode::Nearest, FilterMode::Linear] {
+                            for mag in [FilterMode::Nearest, FilterMode::Linear] {
+                                for aniso in 1..=16 {
+                                    let sampler = SamplerDesc::new(min, mag, u, v)
+                                        .with_anisotropy(aniso)
+                                        .unwrap();
+                                    let mut sampling = operations.clone();
+                                    for operation in &mut sampling {
+                                        if let Operation::SetSampler(value) = operation {
+                                            *value = sampler;
+                                        }
+                                    }
+                                    let artifact = compile(CompileInput {
+                                        capabilities: Capabilities::a618(512 * 1024, 4096),
+                                        resources: &resources,
+                                        pipelines: core::slice::from_ref(&pipeline),
+                                        operations: &sampling,
+                                    })
+                                    .unwrap();
+                                    assert!(accept_codegen(&artifact).is_ok(), "{sampler:?}");
+                                }
+                            }
+                        }
+                    }
+                }
                 let sampler_load = Packets::new(&artifact.words)
                     .filter_map(Result::ok)
                     .find(|packet| {
@@ -5337,7 +6756,10 @@ mod tests {
                 duplicate_fixup.word_offset = u32::try_from(end + 2).unwrap();
                 hostile.fixups.push(duplicate_fixup);
                 hostile.fixups.sort_by_key(|fixup| fixup.word_offset);
-                assert!(accept_codegen(&hostile).is_err());
+                assert_eq!(
+                    accept_codegen(&hostile).is_err(),
+                    cfg!(feature = "strict-command-validation")
+                );
 
                 // The former emitter padded one four-dword ST6_SHADER sampler
                 // unit to sixteen dwords. It is packet-framed PM4, but not a
@@ -5611,4 +7033,104 @@ mod tests {
         assert_eq!(words[1] & 0x1ffff, (resource.gpu_va >> 32) as u32);
         assert_eq!(words[1] >> 17, 1);
     }
+    #[test]
+    fn canonical_public_topologies_preserve_authority_and_reject_invalid_initiators() {
+        for format in [TextureFormat::Bgra8Unorm,TextureFormat::Rg8Unorm] {
+        for topology in [PrimitiveTopology::TriangleList,PrimitiveTopology::TriangleStrip,
+            PrimitiveTopology::TriangleFan,PrimitiveTopology::LineList,
+            PrimitiveTopology::LineStrip,PrimitiveTopology::PointList] {
+        for indexed in [false,true] {
+
+        const PIPELINE: PipelineId = PipelineId::new(7);
+        let resources = [
+            image(TARGET, TextureUsage::RENDER_ATTACHMENT),
+            ResourceMeta {
+                id: BUFFER,
+                size: 240,
+                kind: ResourceKind::Buffer {
+                    usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                },
+            },
+        ];
+        let pipelines = [PipelineMeta {
+            id: PIPELINE,
+            descriptor: RenderPipelineDesc::new(
+                format,
+                topology,
+                VertexBufferLayout::new(
+                    40,
+                    std::vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+                    ],
+                )
+                .unwrap(),
+                FragmentProgram::VertexColor,
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(CullMode::Back, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        }];
+        let operations = [
+            Operation::BeginRenderPass(RenderPass {
+                target: TARGET,
+                area: PixelRect::new(0, 0, 16, 16).unwrap(),
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+                depth: None,
+            }),
+            Operation::SetPipeline(PIPELINE),
+            Operation::SetVertexBuffer {
+                buffer: BUFFER,
+                offset: 0,
+            },
+            Operation::SetUniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            )),
+            Operation::Draw {
+                vertex_count: 6,
+                first_vertex: 0,
+            },
+            Operation::EndRenderPass,
+        ];
+        let mut resources = resources.to_vec();
+        if let ResourceKind::Image(image)=&mut resources[0].kind {image.format=format;}
+        let mut operations = operations.to_vec();
+        if indexed {
+            let id = ObjectId::new(123);
+            resources.push(ResourceMeta {id,size:12,kind:ResourceKind::Buffer {usage:BufferUsage::INDEX}});
+            operations.insert(4,Operation::SetIndexBuffer {buffer:id,offset:0,format:sgfx_core::ir::IndexFormat::Uint16});
+            operations[5]=Operation::DrawIndexed {index_count:6,first_index:0,base_vertex:0};
+        }
+        let artifact = compile(CompileInput {
+            capabilities: Capabilities::a618(512 * 1024, 4096),
+            resources: &resources,
+            pipelines: &pipelines,
+            operations: &operations,
+        })
+        .unwrap();
+
+            assert!(accept_codegen(&artifact).is_ok(),"{topology:?} indexed={indexed}");
+            let packet = adreno_a6xx_pm4::Packets::new(&artifact.words).map(Result::unwrap)
+                .find(|p| matches!(p.header,Header::Type7 {opcode,..} if opcode==super::CP_DRAW_INDX_OFFSET)).unwrap();
+            let offset = packet.word_offset as usize + 1;
+            for mode in [0,1,7,8,10,63] {
+                let mut invalid = artifact.clone();
+                invalid.words[offset]=(invalid.words[offset]&!63)|mode;
+                assert!(accept_codegen(&invalid).is_err(),"reserved mode={mode}");
+            }
+            let mut invalid=artifact.clone();invalid.words[offset]|=1<<20;
+            assert!(accept_codegen(&invalid).is_err());
+            let mut invalid=artifact.clone();invalid.words[offset+2]=0;
+            assert!(accept_codegen(&invalid).is_err(),"zero-count {topology:?} indexed={indexed} offset={offset} payload={:?}",&invalid.words[offset..offset+3]);
+        }}}
+    }
+
+}
+
+// Canonical programs use the same six non-binning public primitive modes as
+// native pipelines. Count rules do not weaken vertex/index address bounds.
+fn canonical_topology_count(mode:u32,count:u32)->bool {
+    match mode {4=>count>0 && count%3==0,5|6=>count>=3,2=>count>0 && count%2==0,3=>count>=2,9=>count>0,_=>false}
 }

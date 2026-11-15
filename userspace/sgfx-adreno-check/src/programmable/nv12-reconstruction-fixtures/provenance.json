@@ -1,0 +1,80 @@
+{
+  "generator": "work/validation/nv12-reconstruction-oracle/make_video_fixture.py",
+  "ffmpeg": "/nix/store/mv3x2v2pr6pwvwj7cdyh8nci2q1wpnjq-ffmpeg-headless-8.1.2-bin/bin/ffmpeg",
+  "ffmpeg_version": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "dimensions": [
+    128,
+    128
+  ],
+  "input_formula": {
+    "Y": "48+(13*x+23*y)%160",
+    "U": "80+(7*x+11*y)%96",
+    "V": "80+(17*x+5*y)%96"
+  },
+  "encode_arguments": [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-y",
+    "-f",
+    "rawvideo",
+    "-pixel_format",
+    "yuv420p",
+    "-video_size",
+    "128x128",
+    "-framerate",
+    "1",
+    "-i",
+    "TEMP/input.yuv",
+    "-frames:v",
+    "1",
+    "-c:v",
+    "libx264",
+    "-threads",
+    "1",
+    "-profile:v",
+    "baseline",
+    "-qp",
+    "1",
+    "-preset",
+    "veryslow",
+    "-tune",
+    "zerolatency",
+    "-x264-params",
+    "keyint=1:aud=1:repeat-headers=1:deblock=0,0",
+    "-f",
+    "h264",
+    "frame.h264"
+  ],
+  "decode_arguments": [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-y",
+    "-threads",
+    "1",
+    "-i",
+    "/Users/petitstrawberry/Development/Rust/Scarlet/.work/chromebook-sync/work/validation/nv12-reconstruction-oracle/staged-programmable/nv12-reconstruction-fixtures/frame.h264",
+    "-frames:v",
+    "1",
+    "-f",
+    "rawvideo",
+    "-pix_fmt",
+    "nv12",
+    "reference.nv12"
+  ],
+  "reference": "Actual software decode of the committed baseline Annex-B H264; repeated software decode byte-identical. No fabricated handles, GPU packets or CPU pixel injection.",
+  "statistics": {
+    "luma_unique": 160,
+    "u_unique": 96,
+    "v_unique": 96,
+    "luma_2x2_all_distinct": 16129,
+    "luma_2x2_total": 16129,
+    "uv_2x2_all_distinct": 3969,
+    "uv_2x2_total": 3969
+  },
+  "sha256": {
+    "frame.h264": "1760bf9f4b56394995cc90698f1bb5e8e669d77beb3618fd1909797c666d4752",
+    "reference.nv12": "ff90868a7e4c7d09c675e8dabbdc94a27c1db05b6324a0c11c0e8a3a2900d2a8"
+  }
+}

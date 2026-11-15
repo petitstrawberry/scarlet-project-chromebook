@@ -8,6 +8,8 @@ license = "GPL-2.0-only"
 path = "src/lib.rs"
 
 [features]
+# Optional, sampled completion-path timing for hardware diagnostics.
+submit-profile = []
 # Production follows the conventional DRM-style boundary: isolate GPU virtual
 # memory, authorize submitted BOs/relocations, reject privileged packets, and
 # let CP protect enforce the register privilege boundary.  This opt-in mode is
@@ -17,7 +19,7 @@ strict-command-validation = []
 
 [dependencies]
 fdt = "0.1.5"
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "be5689a8722edfce3287fe1de3c3de2715111deb", package = "scarlet", default-features = false }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5a502473899c8f74490ca174c85988bad67d2b2c", package = "scarlet", default-features = false }
 scarlet-driver-qcom-sc7180-gpucc = { path = "../../clk/qcom-sc7180-gpucc" }
 scarlet-driver-qcom-cmd-db = { path = "../../soc/qcom-cmd-db" }
 qcom-sc7180-interconnect = { package = "scarlet-driver-qcom-sc7180-interconnect", path = "../../interconnect/qcom-sc7180" }
@@ -28,4 +30,4 @@ adreno-a6xx-submit-wire = { path = "../../../shared/adreno-a6xx-submit-wire" }
 
 [dev-dependencies]
 sgfx-codegen-adreno-a6xx = { path = "../../../userspace/sgfx-codegen-adreno-a6xx" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "0ee6b41669904ced227f01cc435933c646a60c75", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1", default-features = false }

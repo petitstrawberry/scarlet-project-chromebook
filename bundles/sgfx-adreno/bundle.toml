@@ -3,6 +3,7 @@
 kind = "cargo"
 source = "../../userspace/sgfx-backend-scarlet-adreno-plugin"
 package = "sgfx-backend-scarlet-adreno-plugin"
+features = ["programmable"]
 lib = "sgfx_scarlet_adreno"
 architectures = ["aarch64"]
 to = "/lib/sgfx/libsgfx_scarlet_adreno.so"
@@ -11,3 +12,11 @@ to = "/lib/sgfx/libsgfx_scarlet_adreno.so"
 kind = "copy"
 source = "../../userspace/sgfx-backend-scarlet-adreno-plugin/scarlet-adreno.sgfx-driver"
 to = "/lib/sgfx/scarlet-adreno.sgfx-driver"
+
+[[layers]]
+kind = "cargo"
+source = "../../userspace/sgfx-adreno-check"
+package = "sgfx-adreno-check"
+bin = "sgfx-adreno-check"
+architectures = ["aarch64"]
+to = "/bin/sgfx-adreno-check"

@@ -1,0 +1,35 @@
+[package]
+name = "sgfx-shader-ir3"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "Validated WGSL/SPIR-V to source-built Mesa IR3 for Adreno A618"
+
+[workspace]
+exclude = ["vendor/naga"]
+[features]
+default = ["mesa"]
+mesa = ["frontend"]
+frontend = ["std", "dep:naga"]
+std = ["serde/std", "serde_json/std"]
+[dependencies]
+naga = { optional = true, version = "=24.0.0", path = "vendor/naga", features = ["wgsl-in", "spv-in", "spv-out"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[[bin]]
+name = "ir3-compile"
+path = "src/bin/ir3-compile.rs"
+required-features = ["mesa"]
+
+[[example]]
+name = "gather_oracle"
+required-features = ["mesa"]
+
+[[example]]
+name = "draw_parameters_oracle"
+required-features = ["mesa"]
+
+[[example]]
+name = "storage_oracle"
+required-features = ["mesa"]

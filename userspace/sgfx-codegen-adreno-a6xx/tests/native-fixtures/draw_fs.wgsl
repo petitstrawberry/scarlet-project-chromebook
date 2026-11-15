@@ -1,0 +1,1 @@
+@fragment fn main(@location(0) @interpolate(flat) params:vec3<u32>)->@location(0) vec4<f32>{return vec4<f32>(f32(params.x),f32(bitcast<i32>(params.y)+128),f32(params.z),255.0)/255.0;}

@@ -72,6 +72,7 @@ impl Drop for MmioMapping {
 }
 
 pub(crate) struct A618Gmu {
+    activity: crate::activity::ActivityWindow,
     registers: GmuRegisters,
     rscc: DwordRegisters,
     pdc: DwordRegisters,
@@ -117,6 +118,7 @@ impl A618Gmu {
             return Err("qcom-adreno-a618: legacy GMU IOVA layout is not contiguous");
         }
         let result = Self {
+            activity: crate::activity::ActivityWindow::default(),
             registers: GmuRegisters::new(gmu_mapping.base),
             rscc: DwordRegisters::new(gmu_mapping.base + RSCC_BYTE_OFFSET),
             pdc: DwordRegisters::new(pdc_mapping.base),
@@ -214,6 +216,7 @@ impl A618Gmu {
             initial.vote,
         );
 
+        self.activity.reset();
         self.active = true;
         let boot = (|| {
             self.registers.write(GMU_AO_HOST_INTERRUPT_CLR, u32::MAX);
@@ -287,6 +290,9 @@ impl A618Gmu {
             return Err(error);
         }
         self.ready = true;
+        // Seed the interval before registering devfreq, so enabling the
+        // utilization governor does not fail its first capability probe.
+        let _ = self.sample_utilization();
         let frequency_khz = self
             .current_gpu_index
             .and_then(|index| self.power.as_ref()?.gx_levels.get(index))
@@ -579,6 +585,37 @@ impl A618Gmu {
             .skip(1)
             .map(|level| u64::from(level.frequency_khz))
             .collect())
+    }
+
+    /// Like Linux a6xx_gpu_busy, sample GMU XOCLK counter 0 configured
+    /// with selector BIT(5). CX MMIO stays accessible while holding this GMU
+    /// lock; no GX registers or GPU idle waits are needed for telemetry.
+    pub(crate) fn sample_utilization(
+        &mut self,
+    ) -> Result<scarlet::device::devfreq::DeviceFrequencyUtilization, &'static str> {
+        if !self.ready || !self.active {
+            self.activity.reset();
+            return Err("qcom-adreno-a618: GMU is not ready");
+        }
+        let ticks = self.busy_ticks()?;
+        let (busy, total) = self.activity.sample(ticks, time::current_time())?;
+        Ok(scarlet::device::devfreq::DeviceFrequencyUtilization { busy, total })
+    }
+
+    /// Independent raw counter read; never consumes the utilization interval.
+    pub(crate) fn busy_ticks(&self) -> Result<u64, &'static str> {
+        if !self.ready || !self.active {
+            return Err("qcom-adreno-a618: GMU is not ready");
+        }
+        for _ in 0..4 {
+            let high = self.registers.read(GMU_POWER_COUNTER_XOCLK_0_H);
+            let low = self.registers.read(GMU_POWER_COUNTER_XOCLK_0_L);
+            if high != self.registers.read(GMU_POWER_COUNTER_XOCLK_0_H) {
+                continue;
+            }
+            return Ok((u64::from(high) << 32) | u64::from(low));
+        }
+        Err("qcom-adreno-a618: unstable activity counter")
     }
 
     /// Last firmware-acknowledged OPP, not an independently measured clock.

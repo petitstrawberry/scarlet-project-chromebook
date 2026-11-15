@@ -1,0 +1,46 @@
+{
+  "generator": "work/validation/core-api-nv12/make_fixture.py",
+  "ffmpeg": "/nix/store/mv3x2v2pr6pwvwj7cdyh8nci2q1wpnjq-ffmpeg-headless-8.1.2-bin/bin/ffmpeg",
+  "encode_arguments": [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-y",
+    "-f",
+    "rawvideo",
+    "-pixel_format",
+    "yuv420p",
+    "-video_size",
+    "128x128",
+    "-framerate",
+    "1",
+    "-i",
+    "/var/folders/sy/h5zyj4m52gx6pwb_fb970cwm0000gn/T/sgfx-nv12-fixture-mgk_h1hs/input.yuv",
+    "-frames:v",
+    "1",
+    "-c:v",
+    "libx264",
+    "-profile:v",
+    "baseline",
+    "-qp",
+    "1",
+    "-preset",
+    "veryslow",
+    "-tune",
+    "zerolatency",
+    "-x264-params",
+    "keyint=1:aud=1:repeat-headers=1:deblock=0,0",
+    "-f",
+    "h264",
+    "frame.h264"
+  ],
+  "dimensions": [
+    128,
+    128
+  ],
+  "reference": "Actual software decode of committed Annex B frame; GPU oracle checks constant-tile interiors against YUV bytes, compares full native output with canonical NV12 output.",
+  "sha256": {
+    "frame.h264": "fb178296e71acdb12b5a40c92b2cc2922d127252855c941a0dc003f275ebb736",
+    "reference.nv12": "18e20fc75ce2e9a38204bdfac1f01c0ea72af445a96864d78f5a1397b06798ed"
+  }
+}

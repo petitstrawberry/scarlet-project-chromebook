@@ -15,7 +15,10 @@ use sgfx_core::{
     backend::{CommandExecutor, CommandSubmitter, Completion, CompletionStatus, SubmitError},
     ir,
 };
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
+
+mod driver;
+mod timestamp;
 
 struct Session {
     inner: adreno::MappedTargetSession,
@@ -40,10 +43,18 @@ fn core_batch(batch: abi::Batch) -> ir::abi::Batch {
 
 fn error(e: adreno::IrSubmitError) -> i32 {
     use adreno::IrSubmitError as E;
+    // Preserve the underlying reason across the deliberately small C status
+    // vocabulary. Bound diagnostics so repeated rejected frames cannot flood
+    // the system journal.
+    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        eprintln!("[sgfx-adreno] request failed: {e:?}");
+    }
     match e {
         E::OutOfMemory => abi::OUT_OF_MEMORY,
         E::Unsupported(_) | E::AsyncUnsupported => abi::UNSUPPORTED,
         E::InvalidIr(_)
+        | E::ShaderCompile(_)
         | E::ResourceTableMismatch
         | E::ContextMismatch
         | E::TargetExtentMismatch
@@ -52,7 +63,10 @@ fn error(e: adreno::IrSubmitError) -> i32 {
         | E::ImageAlreadyMapped => abi::INVALID,
         E::Codegen(e) => match e {
             sgfx_codegen_adreno_a6xx::CompileError::OutOfMemory => abi::OUT_OF_MEMORY,
-            sgfx_codegen_adreno_a6xx::CompileError::UnsupportedFeature => abi::UNSUPPORTED,
+            sgfx_codegen_adreno_a6xx::CompileError::UnsupportedFeature
+            | sgfx_codegen_adreno_a6xx::CompileError::UnsupportedFeatureReason(_) => {
+                abi::UNSUPPORTED
+            }
             _ => abi::INVALID,
         },
         E::SubmitWire(_) => abi::INVALID,
@@ -75,8 +89,18 @@ fn status(result: Result<(), i32>) -> i32 {
     result.err().unwrap_or(abi::OK)
 }
 unsafe fn object<'a, T>(p: Object) -> Result<&'a mut T, i32> {
+    if !(p as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        return Err(abi::INVALID);
+    }
     // SAFETY: the ABI requires a live object of the indicated kind and serialized calls.
     unsafe { p.cast::<T>().as_mut() }.ok_or(abi::INVALID)
+}
+unsafe fn input<'a, T>(p: *const T) -> Result<&'a T, i32> {
+    if !(p as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        return Err(abi::INVALID);
+    }
+    // SAFETY: the ABI caller retains readable initialized storage for this call.
+    unsafe { p.as_ref() }.ok_or(abi::INVALID)
 }
 unsafe fn span<'a, T>(s: Span<T>) -> Result<&'a [T], i32> {
     if s.len > isize::MAX as usize / core::mem::size_of::<T>().max(1)
@@ -88,6 +112,24 @@ unsafe fn span<'a, T>(s: Span<T>) -> Result<&'a [T], i32> {
     // SAFETY: the caller supplies initialized storage valid for this call.
     Ok(unsafe { s.as_slice() })
 }
+
+fn programmable_capability_flags(negotiated: bool) -> u64 {
+    if cfg!(feature = "programmable") && negotiated {
+        // Verified on A618 through the installed native DriverApi: four SSBOs,
+        // 128-lane workgroups, 128-byte uniforms/push constants, eight MRTs,
+        // typed/sRGB/depth sampling, exact native float/depth transfers, and
+        // write/copy/compute buffer visibility before receipt waits.
+        abi::PROGRAMMABLE_GRAPHICS | abi::COMPUTE_BUFFERS | abi::COLOR_ATTACHMENTS_8
+            | abi::DEPTH_SAMPLING | abi::TYPED_TEXTURE_VIEWS | abi::SRGB_TEXTURE_VIEWS
+            | abi::DEPTH_TRANSFERS | abi::FLOAT_COLOR_ATTACHMENTS | abi::IMMEDIATE_BUFFER_READBACK
+            | abi::READ_ONLY_STORAGE_BUFFERS | abi::PUSH_CONSTANTS_128
+            | abi::EXTENDED_VERTEX_FORMATS | abi::VERTEX_ATTRIBUTE_DIVISORS
+            | abi::SHADER_DRAW_PARAMETERS
+    } else {
+        0
+    }
+}
+
 unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i32 {
     if out.is_null() || caps.is_null() {
         return abi::INVALID;
@@ -127,7 +169,12 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
             } else {
                 0
             }
-            | abi::RGBA8_COLOR_ATTACHMENT;
+            | abi::RGBA8_COLOR_ATTACHMENT
+            | abi::SAMPLER_ANISOTROPY_16
+            | abi::GLOBAL_RESOURCE_BARRIERS
+            | abi::IMPLICIT_RESOURCE_BARRIERS
+            | if c.supports_gpu_timestamps() { abi::GPU_TIMESTAMPS } else { 0 }
+            | programmable_capability_flags(c.supports_programmable_graphics());
         unsafe {
             caps.write(flags);
             out.write(Box::into_raw(Box::new(device)).cast());
@@ -237,24 +284,46 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
             .table
             .abi_retired_resources(words)
             .map_err(|_| abi::INVALID)?;
+        let (shaders, compute, render) = s
+            .table
+            .abi_retired_programs(words)
+            .map_err(|_| abi::INVALID)?;
         // Never turn resource retirement into a hidden GPU wait in submit.
-        if (!textures.is_empty() || !buffers.is_empty()) && !s.inner.is_idle().map_err(error)? {
+        if (!textures.is_empty()
+            || !buffers.is_empty()
+            || !shaders.is_empty()
+            || !compute.is_empty()
+            || !render.is_empty())
+            && !s.inner.is_idle().map_err(error)?
+        {
             return Err(abi::BUSY);
         }
-        for id in textures {
-            s.inner.release_texture(id).map_err(error)?;
-        }
-        for id in buffers {
-            s.inner.release_buffer(id).map_err(error)?;
-        }
-        match s.table.sync_abi_snapshot(words) {
-            Ok((_, revision)) => s.revision = revision,
-            Err(_) => {
-                s.poisoned = true;
-                return Err(abi::INVALID);
+        let result = (|| {
+            for id in render {
+                s.inner
+                    .release_programmable_render_pipeline(id)
+                    .map_err(error)?;
             }
+            for id in compute {
+                s.inner.release_compute_pipeline(id).map_err(error)?;
+            }
+            for id in shaders {
+                s.inner.release_shader_module(id).map_err(error)?;
+            }
+            for id in textures {
+                s.inner.release_texture(id).map_err(error)?;
+            }
+            for id in buffers {
+                s.inner.release_buffer(id).map_err(error)?;
+            }
+            let (_, revision) = s.table.sync_abi_snapshot(words).map_err(|_| abi::INVALID)?;
+            s.revision = revision;
+            Ok(())
+        })();
+        if result.is_err() {
+            s.poisoned = true;
         }
-        Ok(())
+        result
     })())
 }
 unsafe extern "C" fn image(p: Object, slot: u32, out: *mut abi::ImageInfo) -> i32 {
@@ -335,7 +404,7 @@ unsafe extern "C" fn execute(p: Object, batch: *const abi::Batch) -> i32 {
         if s.poisoned {
             return Err(abi::DEVICE_LOST);
         }
-        let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
+        let batch = unsafe { input(batch) }?;
         let commands =
             unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, core_batch(*batch)) }
                 .map_err(|_| abi::INVALID)?;
@@ -354,7 +423,7 @@ unsafe extern "C" fn submit(p: Object, batch: *const abi::Batch, out: *mut abi::
         if s.poisoned {
             return Err(abi::DEVICE_LOST);
         }
-        let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
+        let batch = unsafe { input(batch) }?;
         let commands =
             unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, core_batch(*batch)) }
                 .map_err(|_| abi::INVALID)?;
@@ -371,7 +440,7 @@ unsafe extern "C" fn submit(p: Object, batch: *const abi::Batch, out: *mut abi::
         Ok(abi::SubmitResult {
             disposition,
             error,
-            receipt: Box::into_raw(Box::new(receipt)).cast(),
+            receipt: into_receipt(receipt),
         })
     })();
     unsafe {
@@ -392,17 +461,16 @@ unsafe extern "C" fn wait(p: Object, timeout: u64, out: *mut u32) -> i32 {
         out.write(abi::PENDING);
     }
     status((|| {
-        if p.is_null() {
-            return Err(abi::INVALID);
-        }
-        let state = unsafe {
-            object::<adreno::Submission>(p)?.wait(if timeout == u64::MAX {
+        // Receipt retain/wait/drop can be called concurrently: never create an
+        // exclusive reference to this shared Arc allocation.
+        let receipt = unsafe { input(p.cast::<adreno::Submission>().cast_const()) }?;
+        let state = receipt
+            .wait(if timeout == u64::MAX {
                 None
             } else {
                 Some(Duration::from_nanos(timeout))
             })
-        }
-        .map_err(error)?;
+            .map_err(error)?;
         unsafe {
             out.write(if state == CompletionStatus::Complete {
                 abi::COMPLETE
@@ -414,9 +482,29 @@ unsafe extern "C" fn wait(p: Object, timeout: u64, out: *mut u32) -> i32 {
     })())
 }
 unsafe extern "C" fn drop_receipt(p: Object) {
+    unsafe {
+        release_shared::<adreno::Submission>(p);
+    }
+}
+
+fn into_receipt(receipt: adreno::Submission) -> Object {
+    Arc::into_raw(Arc::new(receipt)).cast_mut().cast()
+}
+
+unsafe fn retain_shared<T>(p: Object) {
     if !p.is_null() {
+        // SAFETY: p is an Arc<T> data pointer with a live caller-owned reference.
         unsafe {
-            drop(Box::from_raw(p.cast::<adreno::Submission>()));
+            Arc::increment_strong_count(p.cast::<T>());
+        }
+    }
+}
+
+unsafe fn release_shared<T>(p: Object) {
+    if !p.is_null() {
+        // SAFETY: consumes exactly one caller-owned Arc<T> strong reference.
+        unsafe {
+            Arc::decrement_strong_count(p.cast::<T>());
         }
     }
 }
@@ -448,7 +536,7 @@ pub unsafe extern "C" fn sgfx_backend_get_api_v2(
     if out.is_null() {
         return abi::INVALID;
     }
-    let Some(host) = (unsafe { host.as_ref() }) else {
+    let Ok(host) = (unsafe { input(host) }) else {
         return abi::INVALID;
     };
     if host.size as usize != core::mem::size_of::<abi::HostInfo>() || host.reserved != 0 {
@@ -496,6 +584,34 @@ pub unsafe extern "C" fn sgfx_backend_get_api_v2(
 mod tests {
     use super::*;
     use core::mem::{MaybeUninit, size_of};
+
+    #[test]
+    fn programmable_flags_require_build_and_negotiation() {
+        assert_eq!(programmable_capability_flags(false), 0);
+        let flags = programmable_capability_flags(true);
+        assert_eq!(
+            flags,
+            if cfg!(feature = "programmable") {
+                abi::PROGRAMMABLE_GRAPHICS | abi::COMPUTE_BUFFERS | abi::COLOR_ATTACHMENTS_8
+            | abi::DEPTH_SAMPLING | abi::TYPED_TEXTURE_VIEWS | abi::SRGB_TEXTURE_VIEWS
+            | abi::DEPTH_TRANSFERS | abi::FLOAT_COLOR_ATTACHMENTS | abi::IMMEDIATE_BUFFER_READBACK
+            | abi::READ_ONLY_STORAGE_BUFFERS | abi::PUSH_CONSTANTS_128
+            | abi::EXTENDED_VERTEX_FORMATS | abi::VERTEX_ATTRIBUTE_DIVISORS
+            | abi::SHADER_DRAW_PARAMETERS
+            } else {
+                0
+            },
+        );
+        assert_eq!(
+            flags & !(abi::PROGRAMMABLE_GRAPHICS | abi::COMPUTE_BUFFERS | abi::COLOR_ATTACHMENTS_8
+            | abi::DEPTH_SAMPLING | abi::TYPED_TEXTURE_VIEWS | abi::SRGB_TEXTURE_VIEWS
+            | abi::DEPTH_TRANSFERS | abi::FLOAT_COLOR_ATTACHMENTS | abi::IMMEDIATE_BUFFER_READBACK
+            | abi::READ_ONLY_STORAGE_BUFFERS | abi::PUSH_CONSTANTS_128
+            | abi::EXTENDED_VERTEX_FORMATS | abi::VERTEX_ATTRIBUTE_DIVISORS
+            | abi::SHADER_DRAW_PARAMETERS),
+            0
+        );
+    }
 
     fn host() -> abi::HostInfo {
         abi::HostInfo {
@@ -625,6 +741,51 @@ mod tests {
             error(adreno::IrSubmitError::CompletionUnavailable),
             abi::DEVICE_LOST
         );
+        assert_eq!(
+            error(adreno::IrSubmitError::ShaderCompile(
+                "invalid SPIR-V".into()
+            )),
+            abi::INVALID
+        );
+    }
+
+    #[test]
+    fn shared_receipt_abi_retains_same_pointer_and_drops_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Receipt(Arc<AtomicUsize>);
+        impl Drop for Receipt {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let receipt = Arc::into_raw(Arc::new(Receipt(Arc::clone(&drops))))
+            .cast_mut()
+            .cast();
+        // Keep the initial owner live while threads exercise retain/release on
+        // the same ABI pointer; no exclusive Rust reference may be constructed.
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let address = receipt as usize;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        unsafe {
+                            retain_shared::<Receipt>(address as Object);
+                            release_shared::<Receipt>(address as Object);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        unsafe {
+            release_shared::<Receipt>(receipt);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        unsafe {
+            retain_shared::<Receipt>(core::ptr::null_mut());
+            release_shared::<Receipt>(core::ptr::null_mut());
+        }
     }
 }
 

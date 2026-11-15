@@ -16,6 +16,7 @@ use scarlet::device::{
     platform::{PlatformDeviceDriver, PlatformDeviceInfo},
 };
 
+mod activity;
 mod backend;
 mod firmware;
 mod gmu;

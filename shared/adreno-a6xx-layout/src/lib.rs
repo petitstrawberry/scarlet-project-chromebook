@@ -77,7 +77,22 @@ pub struct LinearSubresource {
 }
 
 impl LinearTextureLayout {
+    /// Four-byte physical texels, including the backend's expanded R8 storage.
     pub fn new(width: u32, height: u32, mip_levels: u32, array_layers: u32) -> Option<Self> {
+        Self::new_with_texel_bytes(width, height, mip_levels, array_layers, 4)
+    }
+
+    /// Calculate layer-first storage for 4-, 8-, or 16-byte physical texels.
+    /// Pitch, offsets, layer stride and size are all bytes. Reject dimensions,
+    /// mip/layer counts or byte footprints not representable by this layout.
+    /// The public fields and subresource lookup are identical to `new`.
+    pub fn new_with_texel_bytes(
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+        array_layers: u32,
+        texel_bytes: u32,
+    ) -> Option<Self> {
         if width == 0
             || height == 0
             || width > 0x7fff
@@ -86,10 +101,11 @@ impl LinearTextureLayout {
             || mip_levels > 32 - width.max(height).leading_zeros()
             || array_layers == 0
             || array_layers > 2048
+            || !matches!(texel_bytes, 4 | 8 | 16)
         {
             return None;
         }
-        let row_pitch = align_up_u32(width.checked_mul(4)?, 64)?;
+        let row_pitch = align_up_u32(width.checked_mul(texel_bytes)?, 64)?;
         let mut chain_size = 0u64;
         for level in 0..mip_levels {
             let pitch = align_up_u32((row_pitch >> level).max(1), 64)?;
@@ -181,7 +197,110 @@ pub const fn is_depth32_tile6_3_layout(
 
 #[cfg(test)]
 mod tests {
-    use super::{Depth32Tile6Layout, depth32_tile6_3_layout, is_depth32_tile6_3_layout};
+    use super::{
+        Depth32Tile6Layout, LinearTextureLayout, depth32_tile6_3_layout, is_depth32_tile6_3_layout,
+    };
+
+    #[test]
+    fn explicit_four_byte_storage_preserves_existing_layouts() {
+        for (width, height, mips, layers) in [(1, 1, 1, 1), (65, 17, 4, 6), (1024, 513, 11, 2)] {
+            assert_eq!(
+                LinearTextureLayout::new(width, height, mips, layers),
+                LinearTextureLayout::new_with_texel_bytes(width, height, mips, layers, 4)
+            );
+        }
+    }
+
+    #[test]
+    fn float_mips_have_byte_pitches_offsets_and_aligned_layer_strides() {
+        for (bytes, stride, expected) in [
+            (
+                8,
+                16384,
+                [(0, 576), (9792, 320), (12352, 192), (13120, 128)],
+            ),
+            (
+                16,
+                28672,
+                [(0, 1088), (18496, 576), (23104, 320), (24384, 192)],
+            ),
+        ] {
+            let layout = LinearTextureLayout::new_with_texel_bytes(65, 17, 4, 6, bytes).unwrap();
+            assert_eq!(layout.row_pitch, expected[0].1);
+            assert_eq!(layout.layer_stride, stride);
+            assert_eq!(layout.total_size, u64::from(stride) * 6);
+            for layer in 0..6 {
+                for (mip, &(offset, pitch)) in expected.iter().enumerate() {
+                    let sub = layout.subresource(mip as u32, layer).unwrap();
+                    assert_eq!(sub.offset, offset + u64::from(layer) * u64::from(stride));
+                    assert_eq!(sub.row_pitch, pitch);
+                    assert_eq!(sub.width, 65 >> mip);
+                    assert_eq!(sub.height, 17 >> mip);
+                    assert!(sub.row_pitch >= sub.width * bytes);
+                    assert_eq!(sub.size, u64::from(pitch) * u64::from(sub.height));
+                    assert!(sub.offset + sub.size <= u64::from(layer + 1) * u64::from(stride));
+                    if mip < 3 {
+                        assert_eq!(
+                            sub.offset + sub.size,
+                            layout.subresource(mip as u32 + 1, layer).unwrap().offset
+                        );
+                    }
+                }
+            }
+            assert!(layout.subresource(4, 0).is_none());
+            assert!(layout.subresource(0, 6).is_none());
+        }
+    }
+
+    #[test]
+    fn wide_texels_pad_only_last_mip_and_do_not_truncate_large_arrays() {
+        for bytes in [4, 8, 16] {
+            // Level zero uses five rows; the final one-row mip is padded to four.
+            let layout = LinearTextureLayout::new_with_texel_bytes(1, 5, 3, 2, bytes).unwrap();
+            assert_eq!(layout.subresource(1, 0).unwrap().offset, 320);
+            assert_eq!(layout.subresource(2, 0).unwrap().offset, 448);
+            assert_eq!(layout.subresource(2, 0).unwrap().size, 64);
+            assert_eq!(layout.layer_stride, 4096);
+            let large =
+                LinearTextureLayout::new_with_texel_bytes(8192, 8192, 1, 2048, bytes).unwrap();
+            assert_eq!(large.layer_stride, 8192 * 8192 * bytes);
+            assert_eq!(large.total_size, u64::from(8192 * 8192 * bytes) * 2048);
+            let last = large.subresource(0, 2047).unwrap();
+            assert_eq!(last.offset + last.size, large.total_size);
+            assert!(large.total_size > u64::from(u32::MAX));
+        }
+    }
+
+    #[test]
+    fn physical_texel_width_and_unrepresentable_layer_sizes_are_rejected() {
+        for bytes in [0, 1, 2, 3, 5, 12, 32, u32::MAX] {
+            assert!(LinearTextureLayout::new_with_texel_bytes(1, 1, 1, 1, bytes).is_none());
+        }
+        for bytes in [4, 8, 16] {
+            for (width, height, mips, layers) in [
+                (0, 8, 1, 1),
+                (8, 0, 1, 1),
+                (8, 8, 0, 1),
+                (8, 8, 5, 1),
+                (8, 8, 1, 0),
+                (8, 8, 1, 2049),
+                (u32::MAX, 1, 1, 1),
+                (1, u32::MAX, 1, 1),
+                (1, 1, u32::MAX, 1),
+                (32767, 32767, 1, 1),
+            ] {
+                assert!(
+                    LinearTextureLayout::new_with_texel_bytes(width, height, mips, layers, bytes)
+                        .is_none()
+                );
+            }
+        }
+        // Valid dimensions, but a 16-byte texel mip chain cannot fit a u32
+        // layer stride. No wrap/truncation to a smaller allocation is allowed.
+        assert!(LinearTextureLayout::new_with_texel_bytes(16384, 16384, 1, 1, 16).is_none());
+        assert!(LinearTextureLayout::new_with_texel_bytes(16384, 12288, 1, 1, 16).is_some());
+        assert!(LinearTextureLayout::new_with_texel_bytes(16384, 12288, 15, 1, 16).is_none());
+    }
 
     #[test]
     fn linear_mips_follow_freedreno_pitch_halving_and_layer_alignment() {

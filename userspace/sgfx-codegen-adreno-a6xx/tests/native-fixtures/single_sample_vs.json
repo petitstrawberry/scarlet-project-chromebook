@@ -1,0 +1,352 @@
+{
+  "abi_version": 1,
+  "gpu_id": 618,
+  "stage": "vertex",
+  "allocation_bytes": 384,
+  "sizedwords": 36,
+  "instrlen": 1,
+  "constant_data_offset": 192,
+  "constant_data_bytes": 192,
+  "constlen": 16,
+  "const_alloc_max_vec4": 13,
+  "immediate_offset_dwords": 52,
+  "imm_values": [],
+  "const_allocations": [
+    {
+      "kind": 0,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 1,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 2,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 3,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 4,
+      "offset_vec4": 0,
+      "size_vec4": 12,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 5,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 6,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 7,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 8,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 9,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 10,
+      "offset_vec4": 12,
+      "size_vec4": 1,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 1
+    },
+    {
+      "kind": 11,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    },
+    {
+      "kind": 12,
+      "offset_vec4": 0,
+      "size_vec4": 0,
+      "reserved_size_vec4": 0,
+      "reserved_align_vec4": 0
+    }
+  ],
+  "reserved_vec4": 0,
+  "num_ubos": 0,
+  "num_app_ubos": 1,
+  "num_driver_params": 0,
+  "driver_ubos": [
+    {
+      "idx": 1,
+      "size": 0
+    },
+    {
+      "idx": -1,
+      "size": 0
+    },
+    {
+      "idx": -1,
+      "size": 0
+    },
+    {
+      "idx": -1,
+      "size": 0
+    }
+  ],
+  "ubo_ranges": [
+    {
+      "block": 1,
+      "bindless_base": 0,
+      "bindless": false,
+      "global": false,
+      "offset": 0,
+      "start": 0,
+      "end": 192
+    }
+  ],
+  "ubo_range_size": 192,
+  "push_consts_type": 0,
+  "max_reg": 1,
+  "max_half_reg": -1,
+  "halfregs_footprint": 4,
+  "max_waves": 16,
+  "subgroup_size": 64,
+  "branchstack": 0,
+  "branchstack_hw": 0,
+  "mergedregs": true,
+  "early_preamble": false,
+  "double_threadsize": false,
+  "threadsize": 64,
+  "pvtmem_size": 0,
+  "pvtmem_per_wave": false,
+  "inputs": [
+    {
+      "slot": 9,
+      "regid": 0,
+      "compmask": 1,
+      "inloc": 0,
+      "sysval": true,
+      "bary": false,
+      "half": false,
+      "flat": false,
+      "rasterflat": false
+    }
+  ],
+  "outputs": [
+    {
+      "slot": 0,
+      "regid": 3,
+      "view": 0,
+      "aliased_components": 0,
+      "half": false
+    },
+    {
+      "slot": 32,
+      "regid": 2,
+      "view": 0,
+      "aliased_components": 0,
+      "half": false
+    },
+    {
+      "slot": 33,
+      "regid": 2,
+      "view": 0,
+      "aliased_components": 0,
+      "half": false
+    }
+  ],
+  "total_in": 1,
+  "sysval_in": 1,
+  "varying_in": 0,
+  "attr_in": 0,
+  "output_size": 0,
+  "vtxid_base": 252,
+  "writes_pos": true,
+  "writes_smask": false,
+  "writes_psize": false,
+  "writes_viewport": false,
+  "writes_stencilref": false,
+  "need_full_quad": false,
+  "need_pixlod": false,
+  "need_driver_params": false,
+  "no_earlyz": false,
+  "has_kill": false,
+  "sample_shading": false,
+  "rasterization_samples": 0,
+  "fragcoord_compmask": 0,
+  "frag_face": false,
+  "reads_smask": false,
+  "reads_primid": false,
+  "num_samp": 0,
+  "num_sampler_prefetch": 0,
+  "sampler_prefetch": [],
+  "prefetch_bary_type": 0,
+  "prefetch_end_of_quad": false,
+  "num_ssbos": 0,
+  "num_uavs": 0,
+  "has_ssbo": false,
+  "image_mapping": {
+    "num_tex": 0,
+    "tex_base": 0,
+    "ssbo_to_tex": [
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255
+    ],
+    "image_to_tex": [
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255
+    ],
+    "tex_to_image": [
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255,
+      255
+    ]
+  },
+  "shared_size": 0,
+  "local_size": [
+    0,
+    0,
+    0
+  ],
+  "local_size_variable": false,
+  "has_barrier": false,
+  "compute": null,
+  "binary_bytes": 144,
+  "clip_mask": 0,
+  "color0_mrt": false,
+  "cull_mask": 0,
+  "dual_src_blend": false,
+  "has_samp": 0,
+  "has_tex": 0,
+  "imm_count_dwords": 0,
+  "inputs_count": 1,
+  "multi_pos_output": false,
+  "name": "runtime",
+  "outputs_count": 3,
+  "sgfx_sampled_interface": {
+    "bindings": [],
+    "version": 1
+  }
+}

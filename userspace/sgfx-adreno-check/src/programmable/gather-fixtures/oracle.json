@@ -1,0 +1,426 @@
+{
+  "bindings": [
+    {
+      "binding": 0,
+      "group": 0,
+      "kind": "sampled texture"
+    },
+    {
+      "binding": 1,
+      "group": 0,
+      "kind": "ordinary sampler unless case.sampler_compare is non-null"
+    }
+  ],
+  "cases": [
+    {
+      "component": 0,
+      "entry": "main",
+      "expected_bgra8": [
+        58,
+        81,
+        70,
+        47
+      ],
+      "expected_rgba8": [
+        70,
+        81,
+        58,
+        47
+      ],
+      "input": "input.rgba8",
+      "name": "red",
+      "native_code_equal": true,
+      "offset": [
+        0,
+        0
+      ],
+      "pixels": 16,
+      "sampled_view_depth": false,
+      "sampler_compare": null,
+      "spirv_source": "red.source.spv",
+      "texel_order": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "tolerance_per_channel": 1,
+      "wgsl_source": "red.wgsl"
+    },
+    {
+      "component": 1,
+      "entry": "main",
+      "expected_bgra8": [
+        78,
+        85,
+        68,
+        61
+      ],
+      "expected_rgba8": [
+        68,
+        85,
+        78,
+        61
+      ],
+      "input": "input.rgba8",
+      "name": "green",
+      "native_code_equal": true,
+      "offset": [
+        0,
+        0
+      ],
+      "pixels": 16,
+      "sampled_view_depth": false,
+      "sampler_compare": null,
+      "spirv_source": "green.source.spv",
+      "texel_order": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "tolerance_per_channel": 1,
+      "wgsl_source": "green.wgsl"
+    },
+    {
+      "component": 2,
+      "entry": "main",
+      "expected_bgra8": [
+        54,
+        83,
+        80,
+        51
+      ],
+      "expected_rgba8": [
+        80,
+        83,
+        54,
+        51
+      ],
+      "input": "input.rgba8",
+      "name": "blue",
+      "native_code_equal": true,
+      "offset": [
+        0,
+        0
+      ],
+      "pixels": 16,
+      "sampled_view_depth": false,
+      "sampler_compare": null,
+      "spirv_source": "blue.source.spv",
+      "texel_order": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "tolerance_per_channel": 1,
+      "wgsl_source": "blue.wgsl"
+    },
+    {
+      "component": 3,
+      "entry": "main",
+      "expected_bgra8": [
+        206,
+        187,
+        200,
+        219
+      ],
+      "expected_rgba8": [
+        200,
+        187,
+        206,
+        219
+      ],
+      "input": "input.rgba8",
+      "name": "alpha",
+      "native_code_equal": true,
+      "offset": [
+        0,
+        0
+      ],
+      "pixels": 16,
+      "sampled_view_depth": false,
+      "sampler_compare": null,
+      "spirv_source": "alpha.source.spv",
+      "texel_order": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "tolerance_per_channel": 1,
+      "wgsl_source": "alpha.wgsl"
+    },
+    {
+      "component": 0,
+      "entry": "main",
+      "expected_bgra8": [
+        46,
+        69,
+        58,
+        35
+      ],
+      "expected_rgba8": [
+        58,
+        69,
+        46,
+        35
+      ],
+      "input": "input.rgba8",
+      "name": "red_offset",
+      "native_code_equal": true,
+      "offset": [
+        1,
+        -1
+      ],
+      "pixels": 16,
+      "sampled_view_depth": false,
+      "sampler_compare": null,
+      "spirv_source": "red_offset.source.spv",
+      "texel_order": [
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "tolerance_per_channel": 1,
+      "wgsl_source": "red_offset.wgsl"
+    },
+    {
+      "component": 0,
+      "entry": "main",
+      "expected_bgra8": [
+        32,
+        159,
+        128,
+        223
+      ],
+      "expected_rgba8": [
+        128,
+        159,
+        32,
+        223
+      ],
+      "input": "input.depth32f",
+      "name": "depth_regular",
+      "native_code_equal": true,
+      "offset": [
+        0,
+        0
+      ],
+      "pixels": 16,
+      "sampled_view_depth": true,
+      "sampler_compare": null,
+      "spirv_source": "depth_regular.source.spv",
+      "texel_order": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "tolerance_per_channel": 1,
+      "wgsl_source": "depth_regular.wgsl"
+    },
+    {
+      "component": 0,
+      "entry": "main",
+      "expected_bgra8": [
+        0,
+        255,
+        0,
+        255
+      ],
+      "expected_rgba8": [
+        0,
+        255,
+        0,
+        255
+      ],
+      "input": "input.depth32f",
+      "name": "depth_less",
+      "native_code_equal": true,
+      "offset": [
+        0,
+        0
+      ],
+      "pixels": 16,
+      "sampled_view_depth": true,
+      "sampler_compare": "Less",
+      "spirv_source": "depth_less.source.spv",
+      "texel_order": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "tolerance_per_channel": 1,
+      "wgsl_source": "depth_less.wgsl"
+    },
+    {
+      "component": 0,
+      "entry": "main",
+      "expected_bgra8": [
+        0,
+        255,
+        255,
+        255
+      ],
+      "expected_rgba8": [
+        255,
+        255,
+        0,
+        255
+      ],
+      "input": "input.depth32f",
+      "name": "depth_less_equal",
+      "native_code_equal": true,
+      "offset": [
+        0,
+        0
+      ],
+      "pixels": 16,
+      "sampled_view_depth": true,
+      "sampler_compare": "LessEqual",
+      "spirv_source": "depth_less_equal.source.spv",
+      "texel_order": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "tolerance_per_channel": 1,
+      "wgsl_source": "depth_less_equal.wgsl"
+    }
+  ],
+  "compiler_cache_version": 7,
+  "gpu_executed": false,
+  "procedure": "Create separate WGSL and source.spv modules for each case, same pipeline/layout/resources; draw both; read back BGRA8; compare all 16 pixels to expected_bgra8 and compare the two results. Do not feed *.bin as shader source. Native artifacts use legacy compiler slot allocation, runtime uses parent canonical map.",
+  "reference": "https://www.w3.org/TR/WGSL/#texturegather",
+  "render": {
+    "blend": false,
+    "cull": "None",
+    "depth_test": false,
+    "format": "Bgra8Unorm",
+    "height": 4,
+    "topology": "TriangleList",
+    "width": 4
+  },
+  "sampler": {
+    "address": "ClampToEdge",
+    "lod_max": 0,
+    "lod_min": 0,
+    "mag": "Nearest",
+    "min": "Nearest",
+    "mip": "Nearest"
+  },
+  "texture": {
+    "height": 4,
+    "layers": 1,
+    "mip_levels": 1,
+    "rgba8_bytes_are": "SGFX logical RGBA upload order, not raw GPU BGRA allocation",
+    "width": 4
+  },
+  "vertex": {
+    "entry": "main",
+    "spirv": "fullscreen.source.spv",
+    "vertices": 3,
+    "wgsl": "fullscreen.wgsl"
+  }
+}
