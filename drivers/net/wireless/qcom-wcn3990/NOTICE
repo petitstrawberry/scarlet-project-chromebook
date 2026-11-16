@@ -1,0 +1,12 @@
+The WCN3990 SNOC transport, wire definitions and firmware sequencing use Linux
+ath10k as the protocol reference. This Rust driver is licensed GPL-2.0-only.
+
+References:
+- Linux v6.12, adc218676eef25575469234709c2d87185ca223a:
+  drivers/net/wireless/ath/ath10k/snoc.c, qmi.c, qmi_wlfw_v01.c and headers.
+- ChromiumOS kernel 6.6, cc1a33bf3fcee271d9f66ccd9fbbc7b06eacdabd:
+  drivers/net/wireless/ath/ath10k/{ce,htc,htt,htt_tx,htt_rx,mac,wmi,wmi-tlv}
+  sources and headers, rx_desc.h, regd.c and regd_common.h.
+
+Firmware is not included in this driver. Its source revisions, licenses and
+checksums are listed in projects/aarch64-coachz-limine/wifi-firmware.json.

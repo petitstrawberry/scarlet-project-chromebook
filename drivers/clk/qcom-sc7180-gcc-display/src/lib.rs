@@ -3,7 +3,7 @@
 #![no_std]
 
 //! SC7180 GCC bootstrap and the clock/reset subset used by display, USB, eMMC,
-//! LPASS, the CoachZ trackpad I2C serial engine, and CPU frequency hardware.
+//! LPASS, MSS, the CoachZ trackpad I2C serial engine, and CPU frequency hardware.
 //!
 //! The driver deliberately covers only the GCC resources consumed by Scarlet's
 //! SC7180 display, primary USB path, CoachZ eMMC and trackpad, and CPU DVFS
@@ -144,6 +144,29 @@ const GPU_CLOCKS: [SimpleClockDescriptor; 6] = [
         halt_check: true,
         always_on: false,
     },
+];
+
+// MSS PIL's reset and active branches (Linux gcc-sc7180.c). These gates
+// expose no programmable parent/rate, so report an unknown rate (0) rather
+// than inventing a fixed bus frequency. Voted branches use the same enable
+// halt check; disabling only withdraws our branch vote.
+const fn mss_clock(id: u32, name: &'static str, register: usize) -> SimpleClockDescriptor {
+    SimpleClockDescriptor {
+        id,
+        name,
+        register,
+        enable_mask: 1,
+        rate: 0,
+        halt_check: true,
+        always_on: false,
+    }
+}
+const MSS_CLOCKS: [SimpleClockDescriptor; 5] = [
+    mss_clock(125, "gcc_mss_cfg_ahb_clk", 0x8a000),
+    mss_clock(126, "gcc_mss_mfab_axis_clk", 0x8a004),
+    mss_clock(127, "gcc_mss_nav_axi_clk", 0x8a00c),
+    mss_clock(128, "gcc_mss_q6_memnoc_axi_clk", 0x8a154),
+    mss_clock(129, "gcc_mss_snoc_axi_clk", 0x8a150),
 ];
 
 const GCC_APSS_CLOCK_BRANCH_ENA_VOTE: usize = 0x52008;
@@ -877,6 +900,7 @@ struct Sc7180GccProvider {
     qup_serial_clocks: [ClkHandle; QUP_SERIAL_CLOCKS.len()],
     lpass_cfg_clock: ClkHandle,
     gpu_clocks: [ClkHandle; GPU_CLOCKS.len()],
+    mss_clocks: [ClkHandle; MSS_CLOCKS.len()],
 }
 
 impl Sc7180GccProvider {
@@ -923,6 +947,12 @@ impl Sc7180GccProvider {
                 descriptor: GPU_CLOCKS[index],
             }))
         });
+        let mss_clocks = core::array::from_fn(|index| {
+            ClkHandle::new(Arc::new(Sc7180GccSimpleClock {
+                registers,
+                descriptor: MSS_CLOCKS[index],
+            }))
+        });
         Self {
             gpll0_out_main: ClkHandle::new(Arc::new(Sc7180Gpll0MainClock)),
             clocks,
@@ -931,6 +961,7 @@ impl Sc7180GccProvider {
             qup_serial_clocks,
             lpass_cfg_clock,
             gpu_clocks,
+            mss_clocks,
         }
     }
 }
@@ -1103,6 +1134,9 @@ impl ClkProvider for Sc7180GccProvider {
         }
         if let Some(index) = GPU_CLOCKS.iter().position(|clock| clock.id == *id) {
             return Ok(self.gpu_clocks[index].clone());
+        }
+        if let Some(index) = MSS_CLOCKS.iter().position(|clock| clock.id == *id) {
+            return Ok(self.mss_clocks[index].clone());
         }
         if let Some(index) = SDCC1_CLOCKS.iter().position(|clock| clock.id == *id) {
             return Ok(self.sdcc1_clocks[index].clone());

@@ -1,0 +1,8 @@
+[package]
+name = "scarlet-driver-qcom-smem"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[target.'cfg(target_os = "none")'.dependencies]
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "e86151e122cfeb92e834c7485a491df163c8d91b", default-features = false }

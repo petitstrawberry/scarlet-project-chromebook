@@ -11,7 +11,7 @@ path = "bsp"
 package = "scarlet"
 
 [bsp.kernel]
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5a502473899c8f74490ca174c85988bad67d2b2c" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "e86151e122cfeb92e834c7485a491df163c8d91b" }
 features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = false }
 
 [modules]
@@ -24,6 +24,13 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-qcom-pm8941-rtc" = { path = "../../drivers/rtc/qcom-pm8941-rtc", enabled = true }
 "scarlet-driver-qcom-sc7180-gcc-display" = { path = "../../drivers/clk/qcom-sc7180-gcc-display", enabled = true }
 "scarlet-driver-qcom-cmd-db" = { path = "../../drivers/soc/qcom-cmd-db", enabled = true }
+"scarlet-driver-qcom-smem" = { path = "../../drivers/soc/qcom-smem", enabled = true }
+"scarlet-driver-qcom-scm" = { path = "../../drivers/firmware/qcom-scm", enabled = true }
+"scarlet-driver-qcom-sc7180-mss-reset" = { path = "../../drivers/reset/qcom-sc7180-mss", enabled = true }
+"scarlet-driver-qcom-sc7180-mss" = { path = "../../drivers/remoteproc/qcom-sc7180-mss", enabled = true }
+"scarlet-driver-qcom-apcs" = { path = "../../drivers/mailbox/qcom-apcs", enabled = true }
+"scarlet-driver-qcom-smp2p" = { path = "../../drivers/soc/qcom-smp2p", enabled = true }
+"scarlet-driver-qcom-wcn3990" = { path = "../../drivers/net/wireless/qcom-wcn3990", enabled = true }
 "scarlet-driver-qcom-rpmh-rsc" = { path = "../../drivers/soc/qcom-rpmh-rsc", enabled = true }
 "scarlet-driver-qcom-sc7180-rpmhcc" = { path = "../../drivers/clk/qcom-sc7180-rpmhcc", enabled = true }
 "scarlet-driver-qcom-sc7180-cpufreq-hw" = { path = "../../drivers/cpufreq/qcom-sc7180-hw", enabled = true }
@@ -62,17 +69,17 @@ output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5a502473899c8f74490ca174c85988bad67d2b2c" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "e86151e122cfeb92e834c7485a491df163c8d91b" }
 subdir = "bundles/sgfx-native"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5a502473899c8f74490ca174c85988bad67d2b2c" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "e86151e122cfeb92e834c7485a491df163c8d91b" }
 subdir = "bundles/base"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5a502473899c8f74490ca174c85988bad67d2b2c" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "e86151e122cfeb92e834c7485a491df163c8d91b" }
 subdir = "bundles/cli-utils"
 
 # Kernel drivers use the global VFS, whose root remains the initramfs after
@@ -82,6 +89,10 @@ subdir = "bundles/cli-utils"
 kind = "copy"
 source = "firmware/qcom"
 to = "/lib/firmware/qcom"
+
+[[images.initramfs.layers]]
+kind = "bundle"
+path = "../../bundles/wifi-firmware/bundle.toml"
 
 [[images.initramfs.layers]]
 kind = "copy"
@@ -102,7 +113,7 @@ min-size-mib = 8192
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5a502473899c8f74490ca174c85988bad67d2b2c" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "e86151e122cfeb92e834c7485a491df163c8d91b" }
 subdir = "bundles/full"
 
 [[images.rootfs.layers]]
@@ -113,6 +124,10 @@ path = "../../bundles/sgfx-adreno/bundle.toml"
 kind = "copy"
 source = "firmware/qcom"
 to = "/lib/firmware/qcom"
+
+[[images.rootfs.layers]]
+kind = "bundle"
+path = "../../bundles/wifi-firmware/bundle.toml"
 
 [[images.rootfs.layers]]
 kind = "copy"

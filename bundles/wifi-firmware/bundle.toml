@@ -1,0 +1,5 @@
+# Locally fetched inputs only. This build step verifies hashes and never downloads.
+[[layers]]
+kind = "script"
+source = "../../scripts/install-wifi-firmware.sh"
+to = "/"

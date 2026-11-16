@@ -110,7 +110,7 @@ combined_esp_mtools_image() {
 inject_and_verify_esp() {
   local fat_image="$1"
   local label="$2"
-  local safe_label current_efi verified_efi verified_dtb
+  local safe_label current_efi current_dtb verified_efi verified_dtb
 
   safe_label="${label//[^[:alnum:]]/_}"
   current_efi="$verify_dir/${safe_label}-current-BOOTAA64.EFI"
@@ -131,7 +131,12 @@ inject_and_verify_esp() {
 
   ensure_fat_directory "$fat_image" '::/dtb'
   ensure_fat_directory "$fat_image" '::/dtb/qcom'
-  mcopy -o -i "$fat_image" "$handoff_dtb" "$esp_dtb_path"
+  current_dtb="$verify_dir/${safe_label}-current-handoff.dtb"
+  if ! mcopy -i "$fat_image" "$esp_dtb_path" "$current_dtb" 2>/dev/null \
+    || ! cmp -s "$handoff_dtb" "$current_dtb"
+  then
+    mcopy -o -i "$fat_image" "$handoff_dtb" "$esp_dtb_path"
+  fi
 
   verified_dtb="$verify_dir/${safe_label}-sc7180-google-coachz.dtb"
   mcopy -i "$fat_image" "$esp_dtb_path" "$verified_dtb"

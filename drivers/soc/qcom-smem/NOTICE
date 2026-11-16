@@ -1,0 +1,6 @@
+The Qualcomm SMEM v12 wire layout and allocation protocol follow Linux v6.12,
+drivers/soc/qcom/smem.c, at adc218676eef25575469234709c2d87185ca223a:
+https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/drivers/soc/qcom/smem.c
+
+The TCSR mutex protocol follows Linux v6.12, drivers/hwspinlock/qcom_hwspinlock.c.
+Both Linux sources are GPL-2.0-only. This driver is GPL-2.0-only.

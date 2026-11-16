@@ -1,0 +1,12 @@
+[package]
+name = "scarlet-driver-qcom-sc7180-mss"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[target.'cfg(target_os = "none")'.dependencies]
+qcom-glink = { package = "scarlet-driver-qcom-glink", path = "../../rpmsg/qcom-glink" }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "e86151e122cfeb92e834c7485a491df163c8d91b", default-features = false }
+qcom-scm = { package = "scarlet-driver-qcom-scm", path = "../../firmware/qcom-scm" }
+qcom-smem = { package = "scarlet-driver-qcom-smem", path = "../../soc/qcom-smem" }
+qcom-smp2p = { package = "scarlet-driver-qcom-smp2p", path = "../../soc/qcom-smp2p" }

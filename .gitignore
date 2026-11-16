@@ -22,6 +22,9 @@ target/
 *.vboot
 *.vboot.manifest.json
 
+# Wi-Fi firmware is fetched locally; do not redistribute the binary payloads.
+/projects/aarch64-coachz-limine/firmware/wifi/
+
 # Python
 __pycache__/
 *.py[cod]

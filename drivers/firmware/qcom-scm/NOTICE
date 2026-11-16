@@ -1,0 +1,10 @@
+The SMCCC64 argument/continuation and memory-ownership wire protocols follow
+Linux drivers/firmware/qcom_scm.c and qcom_scm-smc.c (GPL-2.0-only), and
+include/dt-bindings/firmware/qcom,scm.h (GPL-2.0-only OR BSD-2-Clause).
+Reference release: Linux v6.12, adc218676eef25575469234709c2d87185ca223a.
+
+The TF-A capability/indirect argument interpretation was also checked against
+plat/qti/common/src/qti_syscall.c at b5eaba47efc5e4e3029086d5c25eee0e8dbb0129:
+https://chromium.googlesource.com/external/github.com/ARM-software/arm-trusted-firmware/+/b5eaba47efc5e4e3029086d5c25eee0e8dbb0129/plat/qti/common/src/qti_syscall.c
+This does not establish the installed CoachZ secure firmware revision; the
+native probe checks the actual running monitor's capability query.

@@ -298,7 +298,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=5a502473899c8f74490ca174c85988bad67d2b2c#5a502473899c8f74490ca174c85988bad67d2b2c"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=e86151e122cfeb92e834c7485a491df163c8d91b#e86151e122cfeb92e834c7485a491df163c8d91b"
 dependencies = [
  "aes",
  "ccm",
@@ -317,7 +317,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=5a502473899c8f74490ca174c85988bad67d2b2c#5a502473899c8f74490ca174c85988bad67d2b2c"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=e86151e122cfeb92e834c7485a491df163c8d91b#e86151e122cfeb92e834c7485a491df163c8d91b"
 
 [[package]]
 name = "scarlet-driver-chrome-ec-mkbp-button"
@@ -401,6 +401,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-apcs"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-cmd-db"
 version = "0.1.0"
 dependencies = [
@@ -427,6 +434,14 @@ name = "scarlet-driver-qcom-geni-spi"
 version = "0.1.0"
 dependencies = [
  "scarlet",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-glink"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-qcom-smem",
 ]
 
 [[package]]
@@ -522,6 +537,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-sc7180-mss"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-qcom-glink",
+ "scarlet-driver-qcom-scm",
+ "scarlet-driver-qcom-smem",
+ "scarlet-driver-qcom-smp2p",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-sc7180-mss-reset"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-sc7180-qfprom"
 version = "0.1.0"
 dependencies = [
@@ -562,12 +595,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-qcom-scm"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-qcom-sdhci-sc7180"
 version = "0.1.0"
 dependencies = [
  "scarlet",
  "scarlet-driver-qcom-cmd-db",
  "scarlet-driver-qcom-rpmh-rsc",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-smem"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-smp2p"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-qcom-smem",
 ]
 
 [[package]]
@@ -583,6 +638,17 @@ version = "0.1.0"
 dependencies = [
  "scarlet",
  "scarlet-driver-qcom-sc7180-interconnect",
+]
+
+[[package]]
+name = "scarlet-driver-qcom-wcn3990"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-qcom-cmd-db",
+ "scarlet-driver-qcom-glink",
+ "scarlet-driver-qcom-rpmh-rsc",
+ "scarlet-driver-qcom-scm",
 ]
 
 [[package]]
@@ -607,6 +673,7 @@ dependencies = [
  "scarlet-driver-google-sc7180-trogdor-audio",
  "scarlet-driver-max98360a",
  "scarlet-driver-qcom-adreno-a618",
+ "scarlet-driver-qcom-apcs",
  "scarlet-driver-qcom-cmd-db",
  "scarlet-driver-qcom-dwc3",
  "scarlet-driver-qcom-geni-i2c",
@@ -623,14 +690,20 @@ dependencies = [
  "scarlet-driver-qcom-sc7180-lpass",
  "scarlet-driver-qcom-sc7180-lpasscc",
  "scarlet-driver-qcom-sc7180-mdss",
+ "scarlet-driver-qcom-sc7180-mss",
+ "scarlet-driver-qcom-sc7180-mss-reset",
  "scarlet-driver-qcom-sc7180-qfprom",
  "scarlet-driver-qcom-sc7180-rpmhcc",
  "scarlet-driver-qcom-sc7180-rpmhpd",
  "scarlet-driver-qcom-sc7180-tlmm",
  "scarlet-driver-qcom-sc7180-videocc",
+ "scarlet-driver-qcom-scm",
  "scarlet-driver-qcom-sdhci-sc7180",
+ "scarlet-driver-qcom-smem",
+ "scarlet-driver-qcom-smp2p",
  "scarlet-driver-qcom-spmi-pmic-arb",
  "scarlet-driver-qcom-venus-sc7180",
+ "scarlet-driver-qcom-wcn3990",
  "scarlet-driver-ti-sn65dsi86",
 ]
 

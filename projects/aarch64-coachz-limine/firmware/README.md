@@ -1,5 +1,11 @@
 # CoachZ Qualcomm firmware
 
+Wi-Fi inputs are downloaded separately and are not vendored here. Run
+`python3 scripts/fetch-wifi-firmware.py` from the repository root before image
+creation. The hash-pinned local files go into the Git-ignored `wifi/` directory;
+the installer verifies them for both initramfs and rootfs without network
+access. See [the Wi-Fi bring-up notes](../../../docs/wireless.md).
+
 This directory vendors the binary firmware files required by the Adreno A618
 GPU and Venus 5.4 video decoder. They are imported byte-for-byte from the
 official linux-firmware repository at the pinned revision below; image creation

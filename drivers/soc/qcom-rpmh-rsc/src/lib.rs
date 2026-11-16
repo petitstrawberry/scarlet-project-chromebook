@@ -114,6 +114,7 @@ impl Drop for MmioMapping {
 
 /// A probed Qualcomm application Resource State Coordinator.
 pub struct RpmhRsc {
+    physical: u64,
     tcs_base: usize,
     registers: RegisterLayout,
     active_tcs_offset: u32,
@@ -402,6 +403,13 @@ pub fn controller(phandle: u32) -> Option<Arc<RpmhRsc>> {
         .map(|(_, controller)| Arc::clone(controller))
 }
 
+/// Resolve a DRV window described by firmware even when its RSC node has no
+/// explicit DT phandle (the platform core assigns a private synthetic one).
+pub fn controller_at(physical: u64) -> Option<Arc<RpmhRsc>> {
+    CONTROLLERS.lock().iter().find(|(_, controller)| controller.physical == physical)
+        .map(|(_, controller)| Arc::clone(controller))
+}
+
 fn read_be_cells(property: &[u8]) -> Result<Vec<u32>, &'static str> {
     if property.len() % 4 != 0 {
         return Err("qcom-rpmh-rsc: malformed cell property");
@@ -565,6 +573,7 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .ok_or("qcom-rpmh-rsc: TCS base overflow")?;
 
     let controller = Arc::new(RpmhRsc {
+        physical: resource.start,
         tcs_base,
         registers,
         active_tcs_offset,

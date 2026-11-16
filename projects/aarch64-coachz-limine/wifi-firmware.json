@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "name": "trogdor-mss-nolte",
+      "kind": "tar.gz",
+      "url": "https://gitlab.com/jenneron/firmware-google-trogdor/-/archive/bae7f2275cd7ccd73111662e25b124c082f296ea/firmware-google-trogdor-bae7f2275cd7ccd73111662e25b124c082f296ea.tar.gz",
+      "revision": "bae7f2275cd7ccd73111662e25b124c082f296ea",
+      "sha512": "0f013f5cf62f649dbff139f5454ea0d614cd9a6bacb6d6d05b3bb898c3791e13573f0a5cbf2894f11393635f85ffa260f74da656b40447ff0ea85ec979a68394",
+      "max_download_bytes": 67108864,
+      "provenance": "https://gitlab.com/postmarketOS/pmaports/-/blob/ac668fe0ef86323e2473bb9a1b6836f3263560f7/device/community/firmware-google-trogdor/APKBUILD",
+      "license": "proprietary (as declared by the source package)",
+      "files": [
+        {
+          "member": "firmware-google-trogdor-bae7f2275cd7ccd73111662e25b124c082f296ea/qcom/sc7180-trogdor/modem-nolte/mba.mbn",
+          "path": "qcom/sc7180-trogdor/modem-nolte/mba.mbn",
+          "size": 283296,
+          "sha256": "a6045894f169ccf4247d48142ab5b3c6b63081193f7b39e759f6ec1c35b1357d"
+        },
+        {
+          "member": "firmware-google-trogdor-bae7f2275cd7ccd73111662e25b124c082f296ea/qcom/sc7180-trogdor/modem-nolte/qdsp6sw.mbn",
+          "path": "qcom/sc7180-trogdor/modem-nolte/qdsp6sw.mbn",
+          "size": 9217920,
+          "sha256": "3fb2957ef653a0609b0a95847f06b49485bbf0d950b5fd55b45353d1c74235e2"
+        }
+      ]
+    },
+    {
+      "name": "wcn3990-board",
+      "kind": "file",
+      "url": "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/8c7fac62c0d1c3b8915f596effc1ef6e95fd6b5f/ath10k/WCN3990/hw1.0/board-2.bin",
+      "revision": "8c7fac62c0d1c3b8915f596effc1ef6e95fd6b5f",
+      "max_download_bytes": 1048576,
+      "files": [
+        {
+          "path": "ath10k/WCN3990/hw1.0/board-2.bin",
+          "size": 893528,
+          "sha256": "c49d2f1894de6edc0ab0c8c9a17ca0328703747c49b6e9428f1de501c2c02c1d"
+        }
+      ]
+    },
+    {
+      "name": "wcn3990-features",
+      "kind": "file",
+      "url": "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/8c7fac62c0d1c3b8915f596effc1ef6e95fd6b5f/ath10k/WCN3990/hw1.0/firmware-5.bin",
+      "revision": "8c7fac62c0d1c3b8915f596effc1ef6e95fd6b5f",
+      "max_download_bytes": 4096,
+      "files": [
+        {
+          "path": "ath10k/WCN3990/hw1.0/firmware-5.bin",
+          "size": 60,
+          "sha256": "fef6539e0127579536bc977be57a90d018b83f2931fedc3a8870fbe38d6c4127"
+        }
+      ]
+    },
+    {
+      "name": "ath10k-license",
+      "kind": "file",
+      "url": "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/8c7fac62c0d1c3b8915f596effc1ef6e95fd6b5f/LICENSES/LICENSE.QualcommAtheros_ath10k",
+      "revision": "8c7fac62c0d1c3b8915f596effc1ef6e95fd6b5f",
+      "max_download_bytes": 16384,
+      "files": [
+        {
+          "path": "licenses/LICENSE.QualcommAtheros_ath10k",
+          "size": 2713,
+          "sha256": "337a55102138d7baa143ee4a4c6c91693e0113fece35d380b2a12109e8c23b3f"
+        }
+      ]
+    }
+  ]
+}

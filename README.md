@@ -18,6 +18,8 @@ Qualcomm firmware
   -> Scarlet kernel and initramfs
 ```
 
+See [onboard Wi-Fi](docs/wireless.md) for setup, supported modes and driver dependencies.
+
 ## Current status
 
 Working on CoachZ rev3:
@@ -30,13 +32,14 @@ Working on CoachZ rev3:
 - Qualcomm GENI UART output and interrupt-driven input
 - Scarlet initramfs, `stemd`, login, and an interactive shell
 - SC7180 eMMC root storage and removable SD card support (`mmcblk0`/`mmcblk1`)
+- onboard WPA2-Personal/CCMP Wi-Fi on 2.4 GHz and 5 GHz, with DHCP/DNS
 
 Still under development:
 
 - framebuffer and display output
 - Scarlet-side SC7180 USB host, USB mass-storage, and CDC-NCM support
 - persistent USB root filesystem
-- onboard networking and GPU support
+- further wireless PHY/security modes and GPU features
 
 The full image boots through its initramfs and waits for the USB root
 filesystem at `/dev/usbblk0p2`, then mounts that ext2 partition for userspace.
