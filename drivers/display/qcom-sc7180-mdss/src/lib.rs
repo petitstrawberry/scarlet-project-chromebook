@@ -467,6 +467,7 @@ impl Sc7180DisplayEngine {
 }
 
 pub struct Sc7180GraphicsDevice {
+    mdss_physical_address: u64,
     external: bool,
     active: AtomicBool,
     config: FramebufferConfig,
@@ -892,6 +893,10 @@ impl MaskableInterruptSource for Sc7180GraphicsDevice {
 }
 
 impl GraphicsDevice for Sc7180GraphicsDevice {
+    fn display_device_key(&self) -> Option<alloc::string::String> {
+        Some(alloc::format!("platform:{:x}", self.mdss_physical_address))
+    }
+
     fn connectors(&self) -> Vec<scarlet::device::graphics::output::ConnectorInfo> {
         use scarlet::device::graphics::output::{ConnectorInfo, ConnectorKind};
         let mut outputs = vec![ConnectorInfo {
@@ -1551,6 +1556,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     println!("[qcom-sc7180-mdss] phase 5/5: publishing native framebuffer");
 
     let graphics = Arc::new(Sc7180GraphicsDevice {
+        mdss_physical_address: mdss_resource.start,
         external: false,
         active: AtomicBool::new(true),
         config,

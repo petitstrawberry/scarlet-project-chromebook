@@ -580,6 +580,7 @@ impl DpController {
             map_scanout(&dma_context, &scanout[1])?,
         ];
         Ok(Arc::new(Sc7180GraphicsDevice {
+            mdss_physical_address: self.parent.mdss_physical_address,
             config,
             timing,
             ec: self.parent.ec.clone(),

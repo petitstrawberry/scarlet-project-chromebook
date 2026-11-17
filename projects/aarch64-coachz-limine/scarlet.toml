@@ -11,7 +11,7 @@ path = "bsp"
 package = "scarlet"
 
 [bsp.kernel]
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7da991683ec9fcdb8368773cc93e6d6044fd2b0e" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "703d6fe57e11561b3d06bdd97e11eea520878fb1" }
 features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = false }
 
 [modules]
@@ -69,17 +69,17 @@ output = ".scarlet/images/initramfs-aarch64-coachz.cpio"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7da991683ec9fcdb8368773cc93e6d6044fd2b0e" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "703d6fe57e11561b3d06bdd97e11eea520878fb1" }
 subdir = "bundles/sgfx-native"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7da991683ec9fcdb8368773cc93e6d6044fd2b0e" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "703d6fe57e11561b3d06bdd97e11eea520878fb1" }
 subdir = "bundles/base"
 
 [[images.initramfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7da991683ec9fcdb8368773cc93e6d6044fd2b0e" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "703d6fe57e11561b3d06bdd97e11eea520878fb1" }
 subdir = "bundles/cli-utils"
 
 # Kernel drivers use the global VFS, whose root remains the initramfs after
@@ -113,7 +113,7 @@ min-size-mib = 8192
 
 [[images.rootfs.layers]]
 kind = "bundle"
-source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7da991683ec9fcdb8368773cc93e6d6044fd2b0e" }
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "703d6fe57e11561b3d06bdd97e11eea520878fb1" }
 subdir = "bundles/full"
 
 [[images.rootfs.layers]]
