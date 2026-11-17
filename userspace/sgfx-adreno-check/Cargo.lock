@@ -7,9 +7,14 @@ name = "gpu-raw"
 version = "1.0.0"
 source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2#2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2"
 dependencies = [
- "scarlet-abi",
- "scarlet-os",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2)",
+ "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2)",
 ]
+
+[[package]]
+name = "scarlet-abi"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7#183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7"
 
 [[package]]
 name = "scarlet-abi"
@@ -19,10 +24,27 @@ source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7#183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7"
+dependencies = [
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7)",
+ "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7)",
+]
+
+[[package]]
+name = "scarlet-os"
+version = "1.0.0"
 source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2#2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2"
 dependencies = [
- "scarlet-abi",
- "scarlet-sys",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2)",
+ "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2)",
+]
+
+[[package]]
+name = "scarlet-sys"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7#183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7"
+dependencies = [
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7)",
 ]
 
 [[package]]
@@ -30,16 +52,16 @@ name = "scarlet-sys"
 version = "1.0.0"
 source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2#2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2"
 dependencies = [
- "scarlet-abi",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2)",
 ]
 
 [[package]]
 name = "scarlet-video-client"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2#2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7#183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7"
 dependencies = [
- "scarlet-abi",
- "scarlet-os",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7)",
+ "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7)",
 ]
 
 [[package]]
@@ -48,10 +70,10 @@ version = "1.0.0"
 source = "git+https://github.com/petitstrawberry/sgfx?rev=9dfbec263fae939e06985277d13f899a60fe3d63#9dfbec263fae939e06985277d13f899a60fe3d63"
 dependencies = [
  "gpu-raw",
- "scarlet-os",
+ "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2)",
  "sgfx-backend-abi 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=9dfbec263fae939e06985277d13f899a60fe3d63)",
  "sgfx-backend-loader",
- "sgfx-core",
+ "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1)",
 ]
 
 [[package]]
@@ -62,7 +84,7 @@ dependencies = [
  "sgfx",
  "sgfx-backend-abi 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=9dfbec263fae939e06985277d13f899a60fe3d63)",
  "sgfx-backend-loader",
- "sgfx-core",
+ "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=9dfbec263fae939e06985277d13f899a60fe3d63)",
 ]
 
 [[package]]
@@ -87,6 +109,14 @@ dependencies = [
 name = "sgfx-core"
 version = "1.0.0"
 source = "git+https://github.com/petitstrawberry/sgfx?rev=3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1#3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1"
+dependencies = [
+ "sgfx-backend-abi 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=040dbb5cf42b75489504e1765183d37f6131f54c)",
+]
+
+[[package]]
+name = "sgfx-core"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=9dfbec263fae939e06985277d13f899a60fe3d63#9dfbec263fae939e06985277d13f899a60fe3d63"
 dependencies = [
  "sgfx-backend-abi 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=040dbb5cf42b75489504e1765183d37f6131f54c)",
 ]

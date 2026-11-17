@@ -79,7 +79,7 @@ checksum = "5905ec755cc8386d7928353e4d356d2be3e89e81e5ca01fe630a1ca4d08dc175"
 [[package]]
 name = "gpu-raw"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2#2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7#183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7"
 dependencies = [
  "scarlet-abi",
  "scarlet-os",
@@ -195,12 +195,12 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2#2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7#183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7"
 
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2#2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7#183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7"
 dependencies = [
  "scarlet-abi",
  "scarlet-sys",
@@ -209,7 +209,7 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2#2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7#183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7"
 dependencies = [
  "scarlet-abi",
 ]
@@ -314,7 +314,7 @@ dependencies = [
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx?rev=3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1#3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=9dfbec263fae939e06985277d13f899a60fe3d63#9dfbec263fae939e06985277d13f899a60fe3d63"
 dependencies = [
  "sgfx-backend-abi 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=040dbb5cf42b75489504e1765183d37f6131f54c)",
 ]

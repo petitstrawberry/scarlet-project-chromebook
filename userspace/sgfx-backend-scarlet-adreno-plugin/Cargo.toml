@@ -14,7 +14,7 @@ programmable = ["sgfx-backend-scarlet-adreno/programmable"]
 
 [dependencies]
 sgfx-backend-abi = { git = "https://github.com/petitstrawberry/sgfx", rev = "9dfbec263fae939e06985277d13f899a60fe3d63" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1", features = ["backend-abi"] }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "9dfbec263fae939e06985277d13f899a60fe3d63", features = ["backend-abi"] }
 sgfx-backend-scarlet-adreno = { path = "../sgfx-backend-scarlet-adreno", default-features = false, features = ["std"] }
 sgfx-codegen-adreno-a6xx = { path = "../sgfx-codegen-adreno-a6xx" }
 

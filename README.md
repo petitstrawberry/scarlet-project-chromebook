@@ -73,10 +73,19 @@ nix develop --accept-flake-config -c ./scripts/build-coachz-limine-image.sh --sd
 
 The result is
 `projects/aarch64-coachz-limine/.scarlet/images/scarlet-aarch64-coachz-sd.img`.
-Its first partition is a 64 MiB EFI system partition and its second partition
+Its first partition is an EFI system partition and its second partition
 contains the full rootfs bundle. Insert the card before boot. U-Boot's existing
 EFI bootflow scans MMC devices; the kernel and initramfs use `boot():` paths
 so they are read from the same card that supplied Limine.
+
+Init also mounts the card's FAT32 EFI partition (`/dev/mmcblk1p1`) read-write at
+`/boot`. The USB variant uses `/dev/usbblk0p1`. These are selected explicitly
+by `boot=` and `bootfstype=fat32` in the respective Limine command lines; a
+failed boot-partition mount is reported without preventing root startup.
+The EFI partition itself contains a `boot/` directory, so the mounted kernel
+and initramfs are `/boot/boot/kernel` and `/boot/boot/initramfs-aarch64.cpio`. Replacing those
+files updates the next boot without rewriting the whole SD image. Finish file
+writes and shut down cleanly before removing the card.
 
 Writing the whole SD image replaces the card's partition table and files.
 Confirm the card's identity and back up anything needed before installation.

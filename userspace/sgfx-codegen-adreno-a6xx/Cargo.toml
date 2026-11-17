@@ -15,7 +15,7 @@ sgfx-shader-ir3 = { path = "../sgfx-shader-ir3", default-features = false, optio
 adreno-a6xx-layout = { path = "../../shared/adreno-a6xx-layout" }
 adreno-a6xx-pm4 = { path = "../../shared/adreno-a6xx-pm4" }
 adreno-a6xx-shader-pack = { path = "../../shared/adreno-a6xx-shader-pack" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "9dfbec263fae939e06985277d13f899a60fe3d63", default-features = false }
 
 [dev-dependencies]
 serde_json = "1"
