@@ -19,7 +19,7 @@ strict-command-validation = []
 
 [dependencies]
 fdt = "0.1.5"
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "183ddb0dbd3021eb8c51aaf3a7a6ec3c8be457b7", package = "scarlet", default-features = false }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "dca6e01a1b3f751e10ad42d01de6bad669bae5c3", package = "scarlet", default-features = false }
 scarlet-driver-qcom-sc7180-gpucc = { path = "../../clk/qcom-sc7180-gpucc" }
 scarlet-driver-qcom-cmd-db = { path = "../../soc/qcom-cmd-db" }
 qcom-sc7180-interconnect = { package = "scarlet-driver-qcom-sc7180-interconnect", path = "../../interconnect/qcom-sc7180" }
