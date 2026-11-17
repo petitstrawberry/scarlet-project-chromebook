@@ -16,12 +16,14 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use scarlet::{
     arch::mmio,
     device::{
         DeviceInfo,
         clk::ClkHandle,
+        events::InterruptCapableDevice,
         gpio::GpioController,
         manager::{DeviceManager, DriverPriority, probe_defer},
         platform::{
@@ -29,8 +31,9 @@ use scarlet::{
         },
         spi::{SpiBus, SpiError, SpiTransfer, SpiTransferFlags},
     },
+    interrupt::{InterruptId, InterruptResult},
     println,
-    sync::IrqSpinLock,
+    sync::{IrqSpinLock, Mutex, Waker},
     time, vm,
 };
 
@@ -102,11 +105,8 @@ const COMMAND_CANCELLED: u32 = 1 << 4;
 const COMMAND_ABORTED: u32 = 1 << 5;
 const RX_FIFO_READ_ERROR: u32 = 1 << 24;
 const RX_FIFO_WRITE_ERROR: u32 = 1 << 25;
-const RX_FIFO_WATERMARK: u32 = 1 << 26;
-const RX_FIFO_LAST: u32 = 1 << 27;
 const TX_FIFO_READ_ERROR: u32 = 1 << 28;
 const TX_FIFO_WRITE_ERROR: u32 = 1 << 29;
-const TX_FIFO_WATERMARK: u32 = 1 << 30;
 
 const COMMAND_ERROR_MASK: u32 = COMMAND_OVERRUN
     | ILLEGAL_COMMAND
@@ -115,23 +115,10 @@ const COMMAND_ERROR_MASK: u32 = COMMAND_OVERRUN
     | RX_FIFO_WRITE_ERROR
     | TX_FIFO_READ_ERROR
     | TX_FIFO_WRITE_ERROR;
-const MASTER_IRQS: u32 = COMMAND_DONE
-    | COMMAND_OVERRUN
-    | ILLEGAL_COMMAND
-    | COMMAND_FAILURE
-    | COMMAND_CANCELLED
-    | COMMAND_ABORTED
-    | (1 << 6)
-    | (1 << 22)
-    | (1 << 23)
-    | RX_FIFO_READ_ERROR
-    | RX_FIFO_WRITE_ERROR
-    | RX_FIFO_WATERMARK
-    | RX_FIFO_LAST
-    | TX_FIFO_READ_ERROR
-    | TX_FIFO_WRITE_ERROR
-    | TX_FIFO_WATERMARK;
-const SECONDARY_IRQS: u32 = (0x1f << 1) | (0x1f << 9) | (1 << 24) | (1 << 25);
+// FIFO commands fit wholly in the hardware FIFOs. Only completion/error
+// interrupts are needed; enabling a level watermark without an ISR draining
+// that FIFO would create an interrupt storm.
+const MASTER_IRQS: u32 = COMMAND_DONE | COMMAND_ERROR_MASK | COMMAND_CANCELLED | COMMAND_ABORTED;
 
 const MASTER_CANCEL: u32 = 1 << 2;
 const MASTER_ABORT: u32 = 1 << 1;
@@ -158,7 +145,7 @@ const PACKING_CONFIG_0: u32 = 0x0007_f8fe;
 const PACKING_CONFIG_1: u32 = 0x000f_fefe;
 
 const TRANSFER_TIMEOUT_US: u64 = 100_000;
-const CONTROL_TIMEOUT_US: u64 = 100;
+const CONTROL_TIMEOUT_US: u64 = 100_000;
 
 #[derive(Clone)]
 struct ExternalChipSelect {
@@ -182,7 +169,11 @@ pub struct QcomGeniSpi {
     rx_fifo_words: usize,
     chip_selects: Vec<ExternalChipSelect>,
     speed_hz: IrqSpinLock<u32>,
-    transfer_lock: IrqSpinLock<()>,
+    transfer_lock: Mutex<()>,
+    irq_lock: IrqSpinLock<()>,
+    irq_status: AtomicU32,
+    irq_waker: Waker,
+    interrupt_id: InterruptId,
     _serial_clock: Option<ClkHandle>,
 }
 
@@ -216,6 +207,7 @@ impl QcomGeniSpi {
         requested_speed_hz: u32,
         chip_selects: Vec<ExternalChipSelect>,
         serial_clock: Option<ClkHandle>,
+        interrupt_id: InterruptId,
     ) -> Result<Self, &'static str> {
         let protocol = (Self::read_at(base, GENI_FIRMWARE_REVISION) & FIRMWARE_PROTOCOL_MASK)
             >> FIRMWARE_PROTOCOL_SHIFT;
@@ -241,7 +233,11 @@ impl QcomGeniSpi {
             rx_fifo_words,
             chip_selects,
             speed_hz: IrqSpinLock::new(0),
-            transfer_lock: IrqSpinLock::new(()),
+            transfer_lock: Mutex::new(()),
+            irq_lock: IrqSpinLock::new(()),
+            irq_status: AtomicU32::new(0),
+            irq_waker: Waker::new_uninterruptible("geni-spi-completion"),
+            interrupt_id,
             _serial_clock: serial_clock,
         };
         controller.initialize_fifo_mode();
@@ -263,8 +259,8 @@ impl QcomGeniSpi {
         self.write(GENI_FORCE_DEFAULT, FORCE_DEFAULT);
         self.update(
             GENI_TOP_IRQ_ENABLE,
-            0,
-            TOP_MASTER_IRQ_ENABLE | TOP_SECONDARY_IRQ_ENABLE,
+            TOP_SECONDARY_IRQ_ENABLE,
+            TOP_MASTER_IRQ_ENABLE,
         );
         self.update(GENI_DMA_MODE_ENABLE, FIFO_DMA_MODE_ENABLE, 0);
         self.write(
@@ -276,7 +272,7 @@ impl QcomGeniSpi {
             self.rx_fifo_words.saturating_sub(2) as u32,
         );
         self.write(GENI_MASTER_IRQ_ENABLE, MASTER_IRQS);
-        self.write(GENI_SECONDARY_IRQ_ENABLE, SECONDARY_IRQS);
+        self.write(GENI_SECONDARY_IRQ_ENABLE, 0);
 
         self.write(SPI_LOOPBACK, 0);
         self.write(SPI_CLOCK_PHASE, 0);
@@ -315,25 +311,55 @@ impl QcomGeniSpi {
     }
 
     fn wait_for_control(&self, completion: u32, timeout_us: u64) -> Result<(), SpiError> {
-        for _ in 0..timeout_us {
-            let status = self.read(GENI_MASTER_IRQ_STATUS);
+        let deadline = time::current_time_ns().saturating_add(timeout_us.saturating_mul(1000));
+        loop {
+            let status = self.irq_status.load(Ordering::Acquire);
+            if status & COMMAND_ERROR_MASK != 0 {
+                return Err(SpiError::BusError);
+            }
             if status & completion != 0 {
-                self.write(GENI_MASTER_IRQ_CLEAR, status);
                 return Ok(());
             }
-            time::udelay(1);
+            let remaining = deadline.saturating_sub(time::current_time_ns());
+            if remaining == 0 {
+                return Err(SpiError::Timeout);
+            }
+            if let Some(task) = scarlet::task::mytask() {
+                // Register before rechecking the latched IRQ. Completion
+                // before/during registration must not be lost.
+                self.irq_waker.wait_with_condition(
+                    task.get_id(),
+                    task.get_trapframe(),
+                    Some(remaining),
+                    0,
+                    || {
+                        self.irq_status.load(Ordering::Acquire) & (completion | COMMAND_ERROR_MASK)
+                            != 0
+                    },
+                );
+            } else {
+                // Early bootstrap only; normal bus callers sleep above.
+                let _ = self.handle_interrupt();
+                time::udelay(1);
+            }
         }
-        Err(SpiError::Timeout)
+    }
+
+    fn start_control(&self, register: usize, value: u32) {
+        let _irq = self.irq_lock.lock();
+        self.write(GENI_MASTER_IRQ_CLEAR, u32::MAX);
+        self.irq_status.store(0, Ordering::Release);
+        self.write(register, value);
     }
 
     fn recover_command(&self) {
         self.write(GENI_TX_WATERMARK, 0);
-        self.write(GENI_MASTER_COMMAND_CONTROL, MASTER_CANCEL);
+        self.start_control(GENI_MASTER_COMMAND_CONTROL, MASTER_CANCEL);
         if self
             .wait_for_control(COMMAND_CANCELLED, CONTROL_TIMEOUT_US)
             .is_err()
         {
-            self.write(GENI_MASTER_COMMAND_CONTROL, MASTER_ABORT);
+            self.start_control(GENI_MASTER_COMMAND_CONTROL, MASTER_ABORT);
             let _ = self.wait_for_control(COMMAND_ABORTED, CONTROL_TIMEOUT_US);
         }
         self.write(GENI_MASTER_IRQ_CLEAR, u32::MAX);
@@ -349,8 +375,7 @@ impl QcomGeniSpi {
     }
 
     fn issue_chip_select_command(&self, opcode: u32) -> Result<(), SpiError> {
-        self.write(GENI_MASTER_IRQ_CLEAR, u32::MAX);
-        self.write(GENI_MASTER_COMMAND, Self::command_word(opcode, 0));
+        self.start_control(GENI_MASTER_COMMAND, Self::command_word(opcode, 0));
         let result = self.wait_for_control(COMMAND_DONE, CONTROL_TIMEOUT_US);
         if result.is_err() {
             self.recover_command();
@@ -413,6 +438,39 @@ impl QcomGeniSpi {
         let tx_len = tx.map_or(0, <[u8]>::len);
         let rx_len = rx.as_deref().map_or(0, <[u8]>::len);
         let length = tx_len.max(rx_len);
+        if length == 0
+            || length > TRANSFER_LENGTH_MAX
+            || (tx_len != 0 && rx_len != 0 && tx_len != rx_len)
+        {
+            return Err(SpiError::InvalidArg);
+        }
+
+        // The task sleeps while the serial engine keeps clocking.
+        // Bound each hardware command by FIFO capacity so all RX data fits
+        // even if we resume after COMMAND_DONE. Keep CS asserted between
+        // commands: these are still one atomic bus transaction.
+        let chunk_size = self
+            .tx_fifo_words
+            .saturating_sub(1)
+            .min(self.rx_fifo_words.saturating_sub(3))
+            * 4;
+        for offset in (0..length).step_by(chunk_size) {
+            let end = (offset + chunk_size).min(length);
+            let source = tx.map(|bytes| &bytes[offset..end]);
+            let destination = rx.as_deref_mut().map(|bytes| &mut bytes[offset..end]);
+            self.run_fifo_transfer(source, destination)?;
+        }
+        Ok(())
+    }
+
+    fn run_fifo_transfer(
+        &self,
+        tx: Option<&[u8]>,
+        mut rx: Option<&mut [u8]>,
+    ) -> Result<(), SpiError> {
+        let tx_len = tx.map_or(0, <[u8]>::len);
+        let rx_len = rx.as_deref().map_or(0, <[u8]>::len);
+        let length = tx_len.max(rx_len);
         if length == 0 || length > TRANSFER_LENGTH_MAX {
             return Err(SpiError::InvalidArg);
         }
@@ -426,58 +484,58 @@ impl QcomGeniSpi {
             (true, true) => SPI_FULL_DUPLEX,
             (false, false) => return Err(SpiError::InvalidArg),
         };
-        self.write(GENI_MASTER_IRQ_CLEAR, u32::MAX);
-        if tx_len != 0 {
-            self.write(SPI_TX_LENGTH, tx_len as u32);
-            self.write(GENI_TX_WATERMARK, 1);
-        }
-        if rx_len != 0 {
-            self.write(SPI_RX_LENGTH, rx_len as u32);
-        }
-        self.write(
-            GENI_MASTER_COMMAND,
-            Self::command_word(opcode, KEEP_CS_ASSERTED),
-        );
-
-        let mut tx_offset = 0usize;
-        let mut rx_offset = 0usize;
-        let mut completed = false;
-        for _ in 0..TRANSFER_TIMEOUT_US {
-            let status = self.read(GENI_MASTER_IRQ_STATUS);
-            if status == 0 {
-                time::udelay(1);
-                continue;
+        {
+            let _irq = self.irq_lock.lock();
+            self.write(GENI_MASTER_IRQ_CLEAR, u32::MAX);
+            self.irq_status.store(0, Ordering::Release);
+            if tx_len != 0 {
+                self.write(SPI_TX_LENGTH, tx_len as u32);
             }
-            if status & COMMAND_ERROR_MASK != 0 {
-                self.write(GENI_MASTER_IRQ_CLEAR, status);
-                self.recover_command();
-                return Err(SpiError::BusError);
+            if rx_len != 0 {
+                self.write(SPI_RX_LENGTH, rx_len as u32);
             }
-            if status & TX_FIFO_WATERMARK != 0
-                && let Some(source) = tx
-            {
-                tx_offset += self.fill_tx_fifo(&source[tx_offset..]);
-                if tx_offset == source.len() {
-                    self.write(GENI_TX_WATERMARK, 0);
-                }
-            }
-            if status & (RX_FIFO_WATERMARK | RX_FIFO_LAST) != 0
-                && let Some(destination) = rx.as_deref_mut()
-            {
-                rx_offset += self.drain_rx_fifo(&mut destination[rx_offset..]);
-            }
-            completed |= status & COMMAND_DONE != 0;
-            self.write(GENI_MASTER_IRQ_CLEAR, status);
-            if completed {
-                break;
+            self.write(GENI_TX_WATERMARK, 0);
+            self.write(
+                GENI_MASTER_COMMAND,
+                Self::command_word(opcode, KEEP_CS_ASSERTED),
+            );
+            // Each command fits in one TX FIFO load, and RX stays below the
+            // receive-flow-control watermark until the sleeping task resumes.
+            if let Some(source) = tx {
+                self.fill_tx_fifo(source);
             }
         }
-
-        if !completed || tx_offset != tx_len || rx_offset != rx_len {
+        if let Err(error) = self.wait_for_control(COMMAND_DONE, TRANSFER_TIMEOUT_US) {
             self.recover_command();
-            return Err(SpiError::Timeout);
+            return Err(error);
+        }
+        if let Some(destination) = rx.as_deref_mut() {
+            if self.drain_rx_fifo(destination) != rx_len {
+                self.recover_command();
+                return Err(SpiError::FifoError);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl InterruptCapableDevice for QcomGeniSpi {
+    fn handle_interrupt(&self) -> InterruptResult<()> {
+        let status = {
+            let _irq = self.irq_lock.lock();
+            let status = self.read(GENI_MASTER_IRQ_STATUS);
+            self.write(GENI_MASTER_IRQ_CLEAR, status);
+            self.irq_status.fetch_or(status, Ordering::Release);
+            status
+        };
+        if status & MASTER_IRQS != 0 {
+            self.irq_waker.wake_one();
         }
         Ok(())
+    }
+    fn interrupt_id(&self) -> Option<InterruptId> {
+        Some(self.interrupt_id)
     }
 }
 
@@ -645,17 +703,32 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .unwrap_or(1_010_000);
     let chip_selects = resolve_chip_selects(device)?;
 
+    let interrupt_resource = device
+        .get_resources()
+        .iter()
+        .find(|resource| resource.res_type == PlatformDeviceResourceType::IRQ)
+        .ok_or("qcom-geni-spi: missing interrupt resource")?;
+    let interrupt_id = scarlet::interrupt::resolve_platform_irq(interrupt_resource)
+        .map_err(|_| "qcom-geni-spi: failed to resolve interrupt")?;
     let controller = QcomGeniSpi::new(
         base,
         device.id() as u32,
         maximum_speed,
         chip_selects,
         serial_clock,
+        interrupt_id,
     )?;
     let speed = controller.bus_speed();
     let tx_words = controller.tx_fifo_words;
     let rx_words = controller.rx_fifo_words;
-    DeviceManager::get_manager().register_spi_bus(phandle, Arc::new(controller));
+    let controller = Arc::new(controller);
+    scarlet::interrupt::register_and_enable_platform_irq_device(
+        interrupt_resource,
+        controller.clone(),
+        scarlet::arch::get_cpu().get_cpuid() as u32,
+    )
+    .map_err(|_| "qcom-geni-spi: failed to enable interrupt")?;
+    DeviceManager::get_manager().register_spi_bus(phandle, controller);
     println!(
         "[qcom-geni-spi] registered {} Hz bus (phandle={:#x}, TX FIFO={} words, RX FIFO={} words)",
         speed, phandle, tx_words, rx_words

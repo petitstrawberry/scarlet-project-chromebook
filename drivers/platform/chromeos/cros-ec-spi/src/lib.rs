@@ -39,7 +39,7 @@ use scarlet::{
     },
     interrupt::{InterruptId, InterruptResult},
     println,
-    sync::{IrqSpinLock, Waker},
+    sync::{IrqSpinLock, Mutex, Waker},
     time,
 };
 
@@ -562,7 +562,10 @@ pub struct CrosEcSpi {
     primary: bool,
     chip_select: u8,
     speed_hz: u32,
-    command_lock: IrqSpinLock<()>,
+    // Commands run in task context; the IRQ handler only wakes the EC worker.
+    // A response can take tens of milliseconds, so do not mask interrupts
+    // while transferring or waiting for another command to finish.
+    command_lock: Mutex<()>,
     irq_gpio: Arc<dyn GpioController>,
     irq_pin: u32,
     active: AtomicBool,
@@ -588,7 +591,7 @@ impl CrosEcSpi {
             phandle,
             primary,
             chip_select,
-            command_lock: IrqSpinLock::new(()),
+            command_lock: Mutex::new(()),
             irq_gpio,
             irq_pin,
             active: AtomicBool::new(true),
