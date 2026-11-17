@@ -12,7 +12,7 @@ diagnostic-border-fill = []
 diagnostic-dsi-pattern = []
 
 [dependencies]
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "dca6e01a1b3f751e10ad42d01de6bad669bae5c3", package = "scarlet", default-features = false }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7da991683ec9fcdb8368773cc93e6d6044fd2b0e", package = "scarlet", default-features = false }
 scarlet-driver-ti-sn65dsi86 = { path = "../bridge/ti-sn65dsi86" }
 scarlet-driver-cros-ec-spi = { path = "../../platform/chromeos/cros-ec-spi" }
 scarlet-driver-qcom-sc7180-dispcc = { path = "../../clk/qcom-sc7180-dispcc" }

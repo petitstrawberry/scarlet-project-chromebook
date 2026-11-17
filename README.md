@@ -33,10 +33,12 @@ Working on CoachZ rev3:
 - Scarlet initramfs, `stemd`, login, and an interactive shell
 - SC7180 eMMC root storage and removable SD card support (`mmcblk0`/`mmcblk1`)
 - onboard WPA2-Personal/CCMP Wi-Fi on 2.4 GHz and 5 GHz, with DHCP/DNS
+- native internal display and Adreno GPU composition
+- native USB-C DisplayPort external output as an extended SWS display
 
 Still under development:
 
-- framebuffer and display output
+- per-output shell chrome, workspace presentation and display configuration
 - Scarlet-side SC7180 USB host, USB mass-storage, and CDC-NCM support
 - persistent USB root filesystem
 - further wireless PHY/security modes and GPU features
@@ -258,10 +260,9 @@ From the Nix development shell:
 cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
-The kernel, standard bundles and board drivers use merged Scarlet
-`5a502473899c8f74490ca174c85988bad67d2b2c`. Native UI and GPU clients share SDK source
-`2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2`, which is included in that merge;
-the SDK source and kernel APIs are unchanged between these snapshots. The standard bundles provide their pinned
+The kernel, standard bundles and board drivers use Scarlet
+`7da991683ec9fcdb8368773cc93e6d6044fd2b0e`.
+The standard bundles provide their pinned
 SGFX, native Vulkan and ScarletUI dependencies; the project's SGFX dependency
 matches the bundle's `9dfbec263fae939e06985277d13f899a60fe3d63` revision
 (core API revision `3a6a987aaa5284056d4b1dcb0cd45326d30b3fe1`). Native clients use the published

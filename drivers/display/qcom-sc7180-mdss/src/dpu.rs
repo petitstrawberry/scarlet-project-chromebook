@@ -105,6 +105,7 @@ pub(crate) enum VsyncInterruptClaim {
 
 pub(crate) struct Dpu {
     registers: RegisterWindow,
+    external: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -135,17 +136,65 @@ pub(crate) struct DpuDiagnosticSnapshot {
 
 impl Dpu {
     pub(crate) const fn new(registers: RegisterWindow) -> Self {
-        Self { registers }
+        Self {
+            registers,
+            external: false,
+        }
     }
 
+    pub(crate) fn external(&self) -> Self {
+        Self {
+            registers: self.registers,
+            external: true,
+        }
+    }
+    fn base(&self, base: usize) -> usize {
+        if !self.external {
+            return base;
+        }
+        match base {
+            CONTROL_BASE => 0x02200,
+            SOURCE_PIPE_BASE => 0x25000,
+            LAYER_MIXER_BASE => 0x46000,
+            INTERFACE_BASE => 0x6b000,
+            _ => base,
+        }
+    }
     fn write(&self, base: usize, offset: usize, value: u32) {
-        self.registers.write(base + offset, value)
+        let offset = if self.external && base == CONTROL_BASE && offset == CONTROL_LAYER0 {
+            4
+        } else {
+            offset
+        };
+        self.registers.write(self.base(base) + offset, value)
     }
-
     fn read(&self, base: usize, offset: usize) -> u32 {
-        self.registers.read(base + offset)
+        self.registers.read(self.base(base) + offset)
     }
-
+    fn vsync_bit(&self) -> u32 {
+        if self.external {
+            1 << 25
+        } else {
+            INTERFACE1_VSYNC_INTERRUPT
+        }
+    }
+    fn set_vsync_mask(&self, enabled: bool) {
+        let old = self.read(TOP_BASE, TOP_INTERRUPT_ENABLE);
+        self.write(
+            TOP_BASE,
+            TOP_INTERRUPT_ENABLE,
+            if enabled {
+                old | self.vsync_bit()
+            } else {
+                old & !self.vsync_bit()
+            },
+        );
+        arch::io_wmb();
+    }
+    pub(crate) fn stop(&self) {
+        self.write(INTERFACE_BASE, INTERFACE_TIMING_ENABLE, 0);
+        arch::io_wmb();
+    }
     fn configure_timing_generator(&self, timing: DisplayTiming) {
         let horizontal_total = timing.horizontal_total();
         let vertical_total = timing.vertical_total();
@@ -186,7 +235,15 @@ impl Dpu {
         self.write(INTERFACE_BASE, INTERFACE_HSYNC_SKEW, 0);
         // MSM DSI cannot consume active-low sync signals, so Linux forces both
         // DPU interface polarities to active high regardless of panel flags.
-        self.write(INTERFACE_BASE, INTERFACE_POLARITY_CONTROL, 0);
+        self.write(
+            INTERFACE_BASE,
+            INTERFACE_POLARITY_CONTROL,
+            if self.external {
+                u32::from(!timing.hsync_positive) | (u32::from(!timing.vsync_positive) << 1)
+            } else {
+                0
+            },
+        );
         self.write(INTERFACE_BASE, INTERFACE_FRAME_LINE_COUNT_ENABLE, 3);
         // Linux rebuilds INTF_CONFIG from zero for every mode. This is
         // important on a firmware handoff: bit 23 is DSI_VIDEO_STOP_MODE and
@@ -200,6 +257,26 @@ impl Dpu {
         );
         self.write(INTERFACE_BASE, INTERFACE_ACTIVE_DATA_HCONTROL, 0);
         self.write(INTERFACE_BASE, INTERFACE_CONFIG2, DATA_HCONTROL_ENABLE);
+        if self.external {
+            // DP samples only active data; its vertical window includes the
+            // horizontal sync/back porch and excludes the final front porch.
+            let start = display_vstart + hsync_start;
+            let end = display_vend - u32::from(timing.hsync_offset);
+            self.write(INTERFACE_BASE, INTERFACE_DISPLAY_VSTART, start);
+            self.write(INTERFACE_BASE, INTERFACE_DISPLAY_VEND, end);
+            self.write(
+                INTERFACE_BASE,
+                INTERFACE_ACTIVE_HCONTROL,
+                (hsync_end << 16) | hsync_start,
+            );
+            self.write(INTERFACE_BASE, INTERFACE_ACTIVE_VSTART, start);
+            self.write(
+                INTERFACE_BASE,
+                INTERFACE_ACTIVE_VEND,
+                start + u32::from(timing.vactive) * horizontal_total - 1,
+            );
+            self.write(INTERFACE_BASE, INTERFACE_CONFIG, (1 << 29) | (1 << 30));
+        }
     }
 
     fn configure_fetch_start(&self, timing: DisplayTiming) {
@@ -300,23 +377,53 @@ impl Dpu {
         self.write(
             CONTROL_BASE,
             CONTROL_LAYER0,
-            LAYER_BORDER_OUTPUT | LAYER_VIG0_OUTPUT,
+            LAYER_BORDER_OUTPUT
+                | if self.external {
+                    1 << 18
+                } else {
+                    LAYER_VIG0_OUTPUT
+                },
         );
         // SC7180 advertises DPU_CTL_ACTIVE_CFG: video-mode routing lives in
         // CTL_INTF_ACTIVE, while CTL_TOP only carries the mode selector and is
         // zero for video mode. The legacy `(INTF_1 << 4)` encoding does not
         // apply to this CTL generation.
+        if self.external {
+            for offset in [0x44, 0x74, 0xa4] {
+                self.write(CONTROL_BASE, offset, 0);
+            }
+        }
         self.write(CONTROL_BASE, CONTROL_TOP, 0);
-        self.write(CONTROL_BASE, CONTROL_INTERFACE_ACTIVE, INTERFACE1_ACTIVE);
-        self.write(INTERFACE_BASE, INTERFACE_MUX, 0x000f_0000);
+        self.write(
+            CONTROL_BASE,
+            CONTROL_INTERFACE_ACTIVE,
+            if self.external { 1 } else { INTERFACE1_ACTIVE },
+        );
+        self.write(
+            INTERFACE_BASE,
+            INTERFACE_MUX,
+            if self.external {
+                0x000f_0001
+            } else {
+                0x000f_0000
+            },
+        );
     }
 
     fn flush(&self) {
-        self.write(CONTROL_BASE, CONTROL_INTERFACE_FLUSH, INTERFACE1_FLUSH);
+        self.write(
+            CONTROL_BASE,
+            CONTROL_INTERFACE_FLUSH,
+            if self.external { 1 } else { INTERFACE1_FLUSH },
+        );
         #[cfg(feature = "diagnostic-border-fill")]
         let flush = FLUSH_MIXER0 | FLUSH_CONTROL | FLUSH_INTERFACE;
         #[cfg(not(feature = "diagnostic-border-fill"))]
-        let flush = FLUSH_VIG0 | FLUSH_MIXER0 | FLUSH_CONTROL | FLUSH_INTERFACE;
+        let flush = if self.external {
+            (1 << 11) | (1 << 7) | FLUSH_CONTROL | FLUSH_INTERFACE
+        } else {
+            FLUSH_VIG0 | FLUSH_MIXER0 | FLUSH_CONTROL | FLUSH_INTERFACE
+        };
         self.write(CONTROL_BASE, CONTROL_FLUSH, flush);
         arch::io_wmb();
     }
@@ -330,7 +437,9 @@ impl Dpu {
             .map_err(|_| "qcom-sc7180-mdss: scanout address exceeds 32 bits")?;
         self.configure_timing_generator(timing);
         self.configure_fetch_start(timing);
-        self.configure_vbif();
+        if !self.external {
+            self.configure_vbif();
+        }
         self.configure_source(timing, framebuffer);
         self.configure_mixer_and_control(timing);
         Ok(())
@@ -380,12 +489,23 @@ impl Dpu {
         Ok(())
     }
 
+    pub(crate) fn frame_counts(&self) -> (u32, u32) {
+        (
+            self.read(INTERFACE_BASE, 0xac),
+            self.read(INTERFACE_BASE, 0xb0),
+        )
+    }
+
     pub(crate) fn pending_flush(&self) -> u32 {
         arch::io_rmb();
         self.read(CONTROL_BASE, CONTROL_FLUSH)
     }
 
     pub(crate) fn mask_interrupts(&self) {
+        if self.external {
+            self.set_vsync_mask(false);
+            return;
+        }
         self.write(TOP_BASE, TOP_INTERRUPT_ENABLE, 0);
         self.write(TOP_BASE, TOP_INTERRUPT2_ENABLE, 0);
         self.write(TOP_BASE, TOP_HISTOGRAM_INTERRUPT_ENABLE, 0);
@@ -393,6 +513,10 @@ impl Dpu {
     }
 
     pub(crate) fn clear_pending_interrupts(&self) {
+        if self.external {
+            self.clear_vsync_interrupt();
+            return;
+        }
         self.write(TOP_BASE, TOP_INTERRUPT_CLEAR, u32::MAX);
         self.write(TOP_BASE, TOP_INTERRUPT2_CLEAR, u32::MAX);
         self.write(TOP_BASE, TOP_HISTOGRAM_INTERRUPT_CLEAR, u32::MAX);
@@ -400,31 +524,29 @@ impl Dpu {
     }
 
     pub(crate) fn unmask_vsync_interrupt(&self) {
-        self.write(TOP_BASE, TOP_INTERRUPT_ENABLE, INTERFACE1_VSYNC_INTERRUPT);
-        arch::io_wmb();
+        self.set_vsync_mask(true);
     }
 
     pub(crate) fn mask_vsync_interrupt(&self) {
-        self.write(TOP_BASE, TOP_INTERRUPT_ENABLE, 0);
-        arch::io_wmb();
+        self.set_vsync_mask(false);
     }
 
     pub(crate) fn clear_vsync_interrupt(&self) {
-        self.write(TOP_BASE, TOP_INTERRUPT_CLEAR, INTERFACE1_VSYNC_INTERRUPT);
+        self.write(TOP_BASE, TOP_INTERRUPT_CLEAR, self.vsync_bit());
         arch::io_wmb();
     }
 
     pub(crate) fn claim_vsync_interrupt(&self) -> VsyncInterruptClaim {
         arch::io_rmb();
         let status = self.read(TOP_BASE, TOP_INTERRUPT_STATUS);
-        if status & INTERFACE1_VSYNC_INTERRUPT == 0 {
+        if status & self.vsync_bit() == 0 {
             return VsyncInterruptClaim::NotMine;
         }
 
         let flush_pending = self.pending_flush() != 0;
-        self.write(TOP_BASE, TOP_INTERRUPT_CLEAR, INTERFACE1_VSYNC_INTERRUPT);
+        self.write(TOP_BASE, TOP_INTERRUPT_CLEAR, self.vsync_bit());
         if !flush_pending {
-            self.write(TOP_BASE, TOP_INTERRUPT_ENABLE, 0);
+            self.set_vsync_mask(false);
         }
         arch::io_wmb();
         if flush_pending {

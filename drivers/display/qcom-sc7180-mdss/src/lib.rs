@@ -9,6 +9,9 @@
 //!
 //! `DPU VIG0 → LM0 → INTF1 → DSI0/10nm PHY → SN65DSI86 → eDP panel`.
 //!
+//! A second connector uses `DMA0 → LM1 → INTF0 → native DP → QMP v3`.
+//! Chrome EC firmware negotiates Type-C; the DP worker observes its result.
+//!
 //! # Provenance
 //!
 //! Register programming and PHY calculations are adapted from coreboot's
@@ -25,6 +28,7 @@ extern crate alloc;
 ))]
 compile_error!("display diagnostic modes are mutually exclusive");
 
+mod dp;
 mod dpu;
 mod dsi;
 mod phy;
@@ -95,16 +99,18 @@ struct GpioSpecifier {
     flags: u32,
 }
 
+static MDSS_INTERRUPT_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
+
 struct Sc7180DisplayEngine {
     dpu: Dpu,
-    interrupt_lock: IrqSpinLock<()>,
+    interrupt_lock: &'static IrqSpinLock<()>,
 }
 
 impl Sc7180DisplayEngine {
     fn new(mdss: RegisterWindow) -> Self {
         Self {
             dpu: Dpu::new(mdss),
-            interrupt_lock: IrqSpinLock::new(()),
+            interrupt_lock: &MDSS_INTERRUPT_LOCK,
         }
     }
 
@@ -461,6 +467,8 @@ impl Sc7180DisplayEngine {
 }
 
 pub struct Sc7180GraphicsDevice {
+    external: bool,
+    active: AtomicBool,
     config: FramebufferConfig,
     timing: DisplayTiming,
     ec: Arc<CrosEcSpi>,
@@ -585,6 +593,10 @@ impl GpuStagingState {
 
 impl Sc7180GraphicsDevice {
     fn present_dma(&self, dma_address: usize) -> Result<(), &'static str> {
+        if self.external && !self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         self.engine.present(
             dma_address,
             &self.present_pending,
@@ -836,15 +848,30 @@ impl InterruptSource for Sc7180GraphicsDevice {
     }
 
     fn claim_interrupt(&self) -> InterruptResult<InterruptClaim> {
-        match self.engine.claim_vsync_interrupt() {
-            VsyncInterruptClaim::NotMine => return Ok(InterruptClaim::NotMine),
-            VsyncInterruptClaim::FlushPending | VsyncInterruptClaim::Complete => {}
+        let mut claimed = false;
+        if self.engine.claim_vsync_interrupt() != VsyncInterruptClaim::NotMine {
+            self.vblank_count.fetch_add(1, Ordering::Release);
+            if self.present_pending.load(Ordering::Acquire) {
+                self.vblank_waker.wake_one();
+            }
+            claimed = true;
         }
-        self.vblank_count.fetch_add(1, Ordering::Release);
-        if self.present_pending.load(Ordering::Acquire) {
-            self.vblank_waker.wake_one();
+        if !self.external {
+            if let Some(display) = dp::controller().and_then(|dp| dp.display()) {
+                if display.engine.claim_vsync_interrupt() != VsyncInterruptClaim::NotMine {
+                    display.vblank_count.fetch_add(1, Ordering::Release);
+                    if display.present_pending.load(Ordering::Acquire) {
+                        display.vblank_waker.wake_one();
+                    }
+                    claimed = true;
+                }
+            }
         }
-        Ok(InterruptClaim::Handled)
+        Ok(if claimed {
+            InterruptClaim::Handled
+        } else {
+            InterruptClaim::NotMine
+        })
     }
 }
 
@@ -865,17 +892,126 @@ impl MaskableInterruptSource for Sc7180GraphicsDevice {
 }
 
 impl GraphicsDevice for Sc7180GraphicsDevice {
+    fn connectors(&self) -> Vec<scarlet::device::graphics::output::ConnectorInfo> {
+        use scarlet::device::graphics::output::{ConnectorInfo, ConnectorKind};
+        let mut outputs = vec![ConnectorInfo {
+            index: 0,
+            name: alloc::string::String::from("internal-panel"),
+            kind: ConnectorKind::Internal,
+            connected: true,
+            width: self.config.width,
+            height: self.config.height,
+            refresh_mhz: (u64::from(self.timing.pixel_clock_khz) * 1_000_000
+                / u64::from(self.timing.horizontal_total())
+                / u64::from(self.timing.vertical_total())) as u32,
+            physical_size_mm: None,
+        }];
+        if !self.external {
+            let dp = dp::controller();
+            let display = dp.as_ref().and_then(|dp| dp.display());
+            let connected = dp.as_ref().is_some_and(|dp| dp.connected());
+            outputs.push(ConnectorInfo {
+                index: 1,
+                name: alloc::string::String::from("dp0"),
+                kind: ConnectorKind::External,
+                connected,
+                width: if connected {
+                    display.as_ref().map_or(0, |d| d.config.width)
+                } else {
+                    0
+                },
+                height: if connected {
+                    display.as_ref().map_or(0, |d| d.config.height)
+                } else {
+                    0
+                },
+                refresh_mhz: if connected {
+                    display.as_ref().map_or(0, |d| {
+                        (u64::from(d.timing.pixel_clock_khz) * 1_000_000
+                            / u64::from(d.timing.horizontal_total())
+                            / u64::from(d.timing.vertical_total())) as u32
+                    })
+                } else {
+                    0
+                },
+                physical_size_mm: None,
+            });
+        }
+        outputs
+    }
+    fn connector_framebuffer_info(
+        &self,
+        index: u32,
+    ) -> Result<(FramebufferConfig, u64), &'static str> {
+        if index == 0 {
+            return self.get_framebuffer_info();
+        }
+        if index != 1 || self.external {
+            return Err("Invalid display connector");
+        }
+        dp::controller()
+            .and_then(|dp| dp.display())
+            .ok_or("DP monitor is not connected")?
+            .get_framebuffer_info()
+    }
+    fn present_connector_framebuffer_region(
+        &self,
+        index: u32,
+        region: DisplayRegion,
+    ) -> Result<(), &'static str> {
+        if index == 0 {
+            return self.present_current_framebuffer_region(region);
+        }
+        if index != 1 || self.external {
+            return Err("Invalid display connector");
+        }
+        dp::controller()
+            .and_then(|dp| dp.display())
+            .ok_or("DP monitor is not connected")?
+            .present_current_framebuffer_region(region)
+    }
+    fn present_connector_gpu_resource_region(
+        &self,
+        index: u32,
+        resource: GpuDisplayResource,
+        region: DisplayRegion,
+        options: GpuPresentOptions,
+    ) -> Result<(), &'static str> {
+        if index == 0 {
+            return self.present_gpu_resource_region_with_options(resource, region, options);
+        }
+        if index != 1 || self.external {
+            return Err("Invalid display connector");
+        }
+        dp::controller()
+            .and_then(|dp| dp.display())
+            .ok_or("DP monitor is not connected")?
+            .present_gpu_resource_region_with_options(resource, region, options)
+    }
+
     fn get_display_name(&self) -> &'static str {
-        "coachz-internal-panel"
+        if self.external {
+            "coachz-displayport"
+        } else {
+            "coachz-internal-panel"
+        }
     }
 
     fn get_brightness_percent(&self) -> Result<u8, &'static str> {
+        if self.external {
+            return Err("External display has no EC backlight");
+        }
+
         self.ec
             .get_display_backlight_percent()
             .map_err(|_| "qcom-sc7180-mdss: failed to read EC display brightness")
     }
 
     fn set_brightness_percent(&self, percent: u8) -> Result<(), &'static str> {
+        if self.external {
+            return Err("External display has no EC backlight");
+        }
+
         if percent > 100 {
             return Err("qcom-sc7180-mdss: display brightness must be in the range 0..=100");
         }
@@ -1415,6 +1551,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     println!("[qcom-sc7180-mdss] phase 5/5: publishing native framebuffer");
 
     let graphics = Arc::new(Sc7180GraphicsDevice {
+        external: false,
+        active: AtomicBool::new(true),
         config,
         timing,
         ec,
@@ -1445,6 +1583,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         return Err(error);
     }
 
+    dp::set_primary(graphics.clone());
     if scarlet::earlyfb::is_initialized() {
         scarlet::earlyfb::deactivate();
     }
@@ -1478,6 +1617,7 @@ fn register_driver() {
         vec!["qcom,sc7180-mdss"],
     );
     DeviceManager::get_manager().register_driver(Box::new(driver), DriverPriority::Late);
+    dp::register();
 }
 
 scarlet::driver_initcall!(register_driver);

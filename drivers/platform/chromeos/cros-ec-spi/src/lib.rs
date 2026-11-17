@@ -17,6 +17,8 @@ extern crate alloc;
 mod event_drain;
 mod power;
 mod power_decode;
+mod typec;
+pub use typec::CrosEcTypecState;
 
 use alloc::{
     boxed::Box,

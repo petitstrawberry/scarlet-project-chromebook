@@ -15,6 +15,7 @@
 //! programming also follows coreboot's SC7180 display clock implementation.
 
 extern crate alloc;
+mod clocks;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 
@@ -182,9 +183,7 @@ impl Sc7180DispCc {
         let inherited_on = self.gdsc_is_on();
         println!(
             "[qcom-sc7180-dispcc] MDSS GDSC handoff: control={:#010x} status={:#010x} on={}",
-            inherited_control,
-            inherited_status,
-            inherited_on,
+            inherited_control, inherited_status, inherited_on,
         );
 
         // Keep the domain under software control while Scarlet reconstructs
@@ -246,8 +245,7 @@ impl Sc7180DispCc {
         if self.branch_is_running(branch) {
             println!(
                 "[qcom-sc7180-dispcc] preserving live clock branch {:#x} value={:#010x}",
-                branch,
-                inherited,
+                branch, inherited,
             );
             Ok(())
         } else {
@@ -314,6 +312,66 @@ impl Sc7180DispCc {
         self.enable_branch(PCLK0_BRANCH)?;
         self.enable_branch(BYTE0_BRANCH)?;
         self.enable_branch(BYTE0_INTERFACE_BRANCH)
+    }
+
+    /// Enable the DP AUX programming clock without disturbing DSI roots.
+    pub fn enable_dp_aux(&self) -> Result<(), &'static str> {
+        let _guard = self.lock.lock();
+        self.configure_root(0x21dc, SOURCE_XO, 1, 0, 0, 0);
+        self.enable_branch(0x2054)
+    }
+
+    /// Select the DP PLL outputs and synthesize the negotiated pixel clock.
+    pub fn enable_dp_link(
+        &self,
+        link_rate_mbps: u32,
+        pixel_clock_khz: u32,
+    ) -> Result<(), &'static str> {
+        let parent_khz = match link_rate_mbps {
+            1620 => 810_000u32,
+            2700 | 5400 => 1_350_000u32,
+            _ => return Err("qcom-sc7180-dispcc: invalid DP link rate"),
+        };
+        if pixel_clock_khz == 0 || pixel_clock_khz > parent_khz {
+            return Err("qcom-sc7180-dispcc: invalid DP pixel rate");
+        }
+        let mut a = parent_khz;
+        let mut b = pixel_clock_khz;
+        while b != 0 {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        let (m, n) = (pixel_clock_khz / a, parent_khz / a);
+        if n > 0xffff {
+            return Err("qcom-sc7180-dispcc: DP pixel divider exceeds hardware range");
+        }
+        let _guard = self.lock.lock();
+        self.configure_root(0x2178, 1, 1, 0, 0, 0);
+        // The DP interface consumes LCLK/4, matching CONFIGURATION_CTRL's
+        // LSCLK_DIV setting. The hardware reset encoding is 3 (divide by 4).
+        self.registers.update(0x2190, 3, 3);
+        self.configure_root(0x21ac, 2, 1, m, n, n);
+        for branch in [0x2040, 0x2044, 0x204c] {
+            self.enable_branch(branch)?;
+        }
+        Ok(())
+    }
+
+    /// Stop DP stream/link consumers before retuning their PLL parent.
+    pub fn disable_dp_link(&self) {
+        let _guard = self.lock.lock();
+        for branch in [0x204c, 0x2044, 0x2040] {
+            self.registers.update(branch, BRANCH_ENABLE, 0);
+        }
+    }
+
+    /// Gate only DP-specific branches; the internal panel remains active.
+    pub fn disable_dp(&self) {
+        let _guard = self.lock.lock();
+        for branch in [0x204c, 0x2044, 0x2040, 0x2054] {
+            self.registers.update(branch, BRANCH_ENABLE, 0);
+        }
     }
 
     /// Capture the complete DISP_CC state feeding DSI0 without modifying it.
@@ -399,11 +457,11 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let controller = Arc::new(Sc7180DispCc::new(base, phandle));
     PowerManager::register_domain(phandle, Arc::clone(&controller) as Arc<dyn PowerDomain>);
     CONTROLLERS.lock().push(Arc::clone(&controller));
+    clocks::register(controller.clone());
 
     println!(
         "[qcom-sc7180-dispcc] registered phandle={:#x} paddr={:#x}",
-        phandle,
-        resource.start,
+        phandle, resource.start,
     );
     Ok(())
 }

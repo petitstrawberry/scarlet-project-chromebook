@@ -4,14 +4,16 @@
 
 //! Qualcomm SC7180 QMP USB3/DisplayPort combo PHY.
 //!
-//! This driver exposes the USB3 lane of the combo block to Scarlet's PHY
-//! subsystem. DisplayPort programming remains owned by the display path; the
-//! shared mode register is kept in USB3+DP mode throughout USB operation.
+//! This driver exposes USB3 and DisplayPort PHY handles with a shared power
+//! lifetime. DP link rate and electrical levels are configured by the native
+//! display controller without resetting the USB half while it is active.
 //! Hardware sequencing is adapted from the GPL-2.0 ChromeOS Linux 6.6 QMP
 //! combo PHY driver, expressed through Scarlet's clock, reset, and PHY APIs.
 
 extern crate alloc;
 
+mod clocks;
+mod dp;
 mod registers;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
@@ -29,7 +31,7 @@ use scarlet::{
         reset::ResetHandle,
     },
     println,
-    sync::IrqSpinLock,
+    sync::Mutex,
     time, vm,
 };
 
@@ -75,6 +77,8 @@ impl RegisterWindow {
 
 struct Usb3State {
     powered: bool,
+    dp_powered: bool,
+    dp_config: scarlet::device::phy::DisplayPortConfig,
     mode: Option<PhyMode>,
     orientation: PhyOrientation,
 }
@@ -84,7 +88,7 @@ struct Sc7180QmpUsb3 {
     common_clocks: Vec<ClkHandle>,
     pipe_clock: ClkHandle,
     phy_reset: ResetHandle,
-    state: IrqSpinLock<Usb3State>,
+    state: Mutex<Usb3State>,
 }
 
 impl Sc7180QmpUsb3 {
@@ -276,11 +280,15 @@ impl Phy for Sc7180QmpUsb3 {
             "[qcom-qmp-usb3-dp] power_on begin mode={:?} orientation={:?}",
             state.mode, state.orientation,
         );
-        self.enable_common(state.orientation)?;
+        if !state.dp_powered {
+            self.enable_common(state.orientation)?;
+        }
         if let Err(error) = self.configure_usb3() {
             println!("[qcom-qmp-usb3-dp] power_on failed: {:?}", error);
             self.stop_usb3("rollback");
-            self.disable_common();
+            if !state.dp_powered {
+                self.disable_common();
+            }
             println!(
                 "[qcom-qmp-usb3-dp] rollback complete: PCS reset asserted, PCS/SerDes stopped, PCS power-down asserted, common disabled"
             );
@@ -297,14 +305,16 @@ impl Phy for Sc7180QmpUsb3 {
             return Ok(());
         }
         self.stop_usb3("power-off");
-        self.disable_common();
+        if !state.dp_powered {
+            self.disable_common();
+        }
         state.powered = false;
         Ok(())
     }
 
     fn reset(&self) -> Result<(), PhyError> {
         let state = self.state.lock();
-        if state.powered {
+        if state.powered || state.dp_powered {
             return Err(PhyError::Busy);
         }
         self.phy_reset.reset().map_err(|_| PhyError::ResetFailed)
@@ -326,7 +336,7 @@ impl Phy for Sc7180QmpUsb3 {
 
     fn set_orientation(&self, orientation: PhyOrientation) -> Result<(), PhyError> {
         let mut state = self.state.lock();
-        if state.powered && state.orientation != orientation {
+        if (state.powered || state.dp_powered) && state.orientation != orientation {
             // A live port-select change requires resetting the shared combo
             // block. Require the USB consumer to quiesce first so an active DP
             // link is never reset as a side effect of changing USB orientation.
@@ -343,6 +353,7 @@ impl Phy for Sc7180QmpUsb3 {
 
 struct Sc7180QmpProvider {
     usb3: PhyHandle,
+    dp: PhyHandle,
 }
 
 impl PhyProvider for Sc7180QmpProvider {
@@ -357,6 +368,7 @@ impl PhyProvider for Sc7180QmpProvider {
     fn get_phy(&self, spec: &[u32]) -> Result<PhyHandle, PhyError> {
         match spec {
             [QMP_USB43DP_USB3_PHY] => Ok(self.usb3.clone()),
+            [1] => Ok(self.dp.clone()),
             _ => Err(PhyError::NotFound),
         }
     }
@@ -406,19 +418,28 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     let base = vm::ioremap(resource.start, REGISTER_WINDOW_SIZE)
         .map_err(|_| "qcom-qmp-usb3-dp: ioremap failed")?;
-    let usb3: Arc<dyn Phy> = Arc::new(Sc7180QmpUsb3 {
+    let combo = Arc::new(Sc7180QmpUsb3 {
         registers: RegisterWindow::new(base),
         common_clocks,
         pipe_clock,
         phy_reset,
-        state: IrqSpinLock::new(Usb3State {
+        state: Mutex::new(Usb3State {
             powered: false,
+            dp_powered: false,
+            dp_config: scarlet::device::phy::DisplayPortConfig {
+                link_rate_mbps: 1620,
+                lanes: 2,
+                voltage: [0; 4],
+                pre_emphasis: [0; 4],
+            },
             mode: None,
             orientation: PhyOrientation::Normal,
         }),
     });
+    clocks::register(phandle, combo.clone());
     let provider = Arc::new(Sc7180QmpProvider {
-        usb3: PhyHandle::new(usb3),
+        usb3: PhyHandle::new(combo.clone()),
+        dp: PhyHandle::new(Arc::new(dp::Sc7180DpPhy(combo))),
     });
     manager.register_phy_provider(phandle, provider);
 

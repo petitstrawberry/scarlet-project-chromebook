@@ -7,4 +7,4 @@ edition = "2024"
 path = "src/lib.rs"
 
 [dependencies]
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "dca6e01a1b3f751e10ad42d01de6bad669bae5c3", package = "scarlet", default-features = false }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7da991683ec9fcdb8368773cc93e6d6044fd2b0e", package = "scarlet", default-features = false }

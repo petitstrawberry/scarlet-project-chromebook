@@ -242,6 +242,8 @@ impl Sc7180Tlmm {
     fn named_function(pin: u32, function: &str) -> Option<u8> {
         match function {
             "gpio" if pin < PIN_COUNT as u32 => Some(0),
+            // SC7180 GPIO117 routes the EC's DP HPD signal in mux slot 1.
+            "dp_hot" if pin == 117 => Some(1),
             // Linux's SC7180 PINGROUP table places QUP wrap0 SE4 I2C in mux
             // slot 1 for GPIO115 (SDA) and GPIO116 (SCL).
             "qup04_i2c" if matches!(pin, 115 | 116) => Some(1),

@@ -293,6 +293,16 @@ impl Sn65dsi86Edid {
             .as_bytes()
             .get(DETAILED_TIMING_OFFSET..DETAILED_TIMING_OFFSET + DETAILED_TIMING_SIZE)
             .ok_or(Sn65dsi86LinkError::InvalidTiming)?;
+        DisplayTiming::from_edid_descriptor(descriptor)
+    }
+}
+
+impl DisplayTiming {
+    /// Decode one progressive EDID detailed timing descriptor.
+    pub fn from_edid_descriptor(descriptor: &[u8]) -> Result<Self, Sn65dsi86LinkError> {
+        if descriptor.len() != 18 || descriptor[17] & 0x80 != 0 {
+            return Err(Sn65dsi86LinkError::InvalidTiming);
+        }
         let pixel_clock_khz = u32::from(u16::from_le_bytes([descriptor[0], descriptor[1]])) * 10;
         let hactive = u16::from(descriptor[2]) | (u16::from(descriptor[4] & 0xf0) << 4);
         let hblank = u16::from(descriptor[3]) | (u16::from(descriptor[4] & 0x0f) << 8);
