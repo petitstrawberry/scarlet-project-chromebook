@@ -405,15 +405,15 @@ impl Sc7180DisplayEngine {
                 break Ok(());
             }
 
+            let elapsed = time::current_time().saturating_sub(start);
+            if elapsed >= PRESENT_TIMEOUT_US {
+                break Err("qcom-sc7180-mdss: timeout waiting for page flip");
+            }
+
             let current_vblank = vblank_count.load(Ordering::Acquire);
             if current_vblank != observed_vblank {
                 observed_vblank = current_vblank;
                 continue;
-            }
-
-            let elapsed = time::current_time().saturating_sub(start);
-            if elapsed >= PRESENT_TIMEOUT_US {
-                break Err("qcom-sc7180-mdss: timeout waiting for page flip");
             }
             if let Some(task) = scarlet::task::mytask() {
                 let wait_us = PRESENT_TIMEOUT_US
@@ -460,21 +460,24 @@ impl Sc7180DisplayEngine {
         self.dpu.clear_pending_interrupts();
     }
 
-    fn claim_vsync_interrupt(&self) -> VsyncInterruptClaim {
+    fn claim_vsync_interrupt(&self, active: &AtomicBool) -> VsyncInterruptClaim {
         let _interrupt = self.interrupt_lock.lock();
+        // The shared IRQ remains live for the panel after external link clocks
+        // stop. Check under the same lock used to mask and clear the old IRQ.
+        if !active.load(Ordering::Acquire) { return VsyncInterruptClaim::NotMine; }
         self.dpu.claim_vsync_interrupt()
     }
 }
 
 pub struct Sc7180GraphicsDevice {
     mdss_physical_address: u64,
+    monitor_identity: Option<scarlet::device::graphics::monitor::MonitorIdentity>,
     external: bool,
     active: AtomicBool,
     config: FramebufferConfig,
     timing: DisplayTiming,
     ec: Arc<CrosEcSpi>,
-    scanout: [ContiguousPages; SCANOUT_BUFFER_COUNT],
-    scanout_dma: [DmaMapping; SCANOUT_BUFFER_COUNT],
+    scanout: Arc<ScanoutBuffers>,
     dma_context: DmaContext,
     gpu_direct: Mutex<GpuDirectScanoutState>,
     gpu_staging: Mutex<GpuStagingState>,
@@ -486,6 +489,25 @@ pub struct Sc7180GraphicsDevice {
     vblank_count: AtomicUsize,
     vblank_waker: Waker,
     engine: Sc7180DisplayEngine,
+}
+
+// The backing belongs to the connector. Mode-specific device instances keep
+// their own geometry and hold the backing alive for existing mappings.
+struct ScanoutBuffers {
+    dma: [DmaMapping; SCANOUT_BUFFER_COUNT],
+    pages: [ContiguousPages; SCANOUT_BUFFER_COUNT],
+}
+
+impl ScanoutBuffers {
+    fn new(size: usize, context: &DmaContext) -> Result<Arc<Self>, &'static str> {
+        let pages = [allocate_scanout(size)?, allocate_scanout(size)?];
+        let dma = [map_scanout(context, &pages[0])?, map_scanout(context, &pages[1])?];
+        Ok(Arc::new(Self { dma, pages }))
+    }
+
+    fn capacity(&self) -> usize {
+        self.pages[0].len() * PAGE_SIZE
+    }
 }
 
 struct GpuStagingState {
@@ -850,7 +872,7 @@ impl InterruptSource for Sc7180GraphicsDevice {
 
     fn claim_interrupt(&self) -> InterruptResult<InterruptClaim> {
         let mut claimed = false;
-        if self.engine.claim_vsync_interrupt() != VsyncInterruptClaim::NotMine {
+        if self.engine.claim_vsync_interrupt(&self.active) != VsyncInterruptClaim::NotMine {
             self.vblank_count.fetch_add(1, Ordering::Release);
             if self.present_pending.load(Ordering::Acquire) {
                 self.vblank_waker.wake_one();
@@ -858,8 +880,10 @@ impl InterruptSource for Sc7180GraphicsDevice {
             claimed = true;
         }
         if !self.external {
-            if let Some(display) = dp::controller().and_then(|dp| dp.display()) {
-                if display.engine.claim_vsync_interrupt() != VsyncInterruptClaim::NotMine {
+            let controller = dp::controller();
+            if let Some(dp) = &controller { claimed |= dp.claim_hpd_interrupt(); }
+            if let Some(display) = controller.and_then(|dp| dp.display()) {
+                if display.engine.claim_vsync_interrupt(&display.active) != VsyncInterruptClaim::NotMine {
                     display.vblank_count.fetch_add(1, Ordering::Release);
                     if display.present_pending.load(Ordering::Acquire) {
                         display.vblank_waker.wake_one();
@@ -893,6 +917,28 @@ impl MaskableInterruptSource for Sc7180GraphicsDevice {
 }
 
 impl GraphicsDevice for Sc7180GraphicsDevice {
+    fn connector_modes(&self, connector: u32) -> Vec<scarlet::device::graphics::output::DisplayMode> {
+        if connector == 1 && !self.external {
+            return dp::controller().map_or_else(Vec::new, |dp| dp.modes());
+        }
+        self.connectors().into_iter().filter(|c| c.index == connector && c.connected)
+            .map(|c| scarlet::device::graphics::output::DisplayMode { width: c.width, height: c.height, refresh_millihz: c.refresh_mhz }).collect()
+    }
+    fn request_connector_mode(&self, connector: u32, mode: scarlet::device::graphics::output::DisplayMode) -> Result<(), &'static str> {
+        if connector != 1 || self.external { return Err("Panel mode is fixed"); }
+        dp::controller().ok_or("DP unavailable")?.request_mode(mode)
+    }
+    fn connector_mapping_device(&self, connector: u32) -> Result<Option<Arc<dyn Device>>, &'static str> {
+        if connector != 1 || self.external { return Ok(None); }
+        let display = dp::controller().and_then(|dp| dp.display()).ok_or("DP disconnected")?;
+        Ok(Some(display))
+    }
+    fn connector_monitor_identity(&self, connector: u32) -> Option<scarlet::device::graphics::monitor::MonitorIdentity> {
+        if connector == 0 { self.monitor_identity.clone() }
+        else if connector == 1 && !self.external { dp::controller().and_then(|controller| controller.monitor_identity()) }
+        else { None }
+    }
+
     fn display_device_key(&self) -> Option<alloc::string::String> {
         Some(alloc::format!("platform:{:x}", self.mdss_physical_address))
     }
@@ -909,12 +955,12 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
             refresh_mhz: (u64::from(self.timing.pixel_clock_khz) * 1_000_000
                 / u64::from(self.timing.horizontal_total())
                 / u64::from(self.timing.vertical_total())) as u32,
-            physical_size_mm: None,
+            physical_size_mm: self.monitor_identity.as_ref().and_then(|identity| identity.physical_size_mm),
         }];
         if !self.external {
             let dp = dp::controller();
             let display = dp.as_ref().and_then(|dp| dp.display());
-            let connected = dp.as_ref().is_some_and(|dp| dp.connected());
+            let connected = dp.as_ref().is_some_and(|dp| dp.available());
             outputs.push(ConnectorInfo {
                 index: 1,
                 name: alloc::string::String::from("dp0"),
@@ -1031,7 +1077,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
 
     fn get_framebuffer_address(&self) -> Result<u64, &'static str> {
         let back = self.front.load(Ordering::Acquire) ^ 1;
-        Ok(self.scanout[back].as_paddr())
+        Ok(self.scanout.pages[back].as_paddr())
     }
 
     fn present_framebuffer_region(
@@ -1043,11 +1089,11 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         self.validate_config(config)?;
         let _present = self.present_lock.lock();
         let back = self.front.load(Ordering::Acquire) ^ 1;
-        if physical_addr != self.scanout[back].as_paddr() {
+        if physical_addr != self.scanout.pages[back].as_paddr() {
             return Err("qcom-sc7180-mdss: framebuffer does not match back scanout");
         }
-        self.clean_regions(&self.scanout[back], &[region])?;
-        self.present_dma(dpu_dma_address(&self.scanout_dma[back])?)?;
+        self.clean_regions(&self.scanout.pages[back], &[region])?;
+        self.present_dma(dpu_dma_address(&self.scanout.dma[back])?)?;
         self.gpu_direct.lock().mark_staged();
         self.gpu_staging.lock().reset();
         self.front.store(back, Ordering::Release);
@@ -1055,7 +1101,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
     }
 
     fn scanout_buffer_count(&self) -> usize {
-        self.scanout.len()
+        self.scanout.pages.len()
     }
 
     fn front_scanout_buffer(&self) -> Option<usize> {
@@ -1068,6 +1114,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
     ) -> Result<(FramebufferConfig, u64), &'static str> {
         let scanout = self
             .scanout
+            .pages
             .get(index)
             .ok_or("qcom-sc7180-mdss: invalid scanout index")?;
         Ok((self.config.clone(), scanout.as_paddr()))
@@ -1084,10 +1131,12 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
     ) -> Result<(), &'static str> {
         let scanout = self
             .scanout
+            .pages
             .get(index)
             .ok_or("qcom-sc7180-mdss: invalid scanout index")?;
         let scanout_dma = self
-            .scanout_dma
+            .scanout
+            .dma
             .get(index)
             .ok_or("qcom-sc7180-mdss: invalid scanout DMA index")?;
         let _present = self.present_lock.lock();
@@ -1126,6 +1175,9 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
             .clamp_region(region)
             .ok_or("qcom-sc7180-mdss: GPU damage region is empty")?;
         let _present = self.present_lock.lock();
+        if self.external && !self.active.load(Ordering::Acquire) {
+            return Err("qcom-sc7180-mdss: display mode is no longer active");
+        }
         if options.is_swapchain_buffer() && self.present_direct_gpu_backing(&backing)? {
             self.gpu_staging.lock().reset();
             return Ok(());
@@ -1163,7 +1215,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         #[cfg(debug_assertions)]
         let mut copied_regions = 0usize;
         for copy_region in copy_regions.into_iter().flatten() {
-            self.copy_gpu_region_to_scanout(&backing, &self.scanout[back], copy_region)?;
+            self.copy_gpu_region_to_scanout(&backing, &self.scanout.pages[back], copy_region)?;
             #[cfg(debug_assertions)]
             {
                 copied_pixels = copied_pixels.saturating_add(
@@ -1176,7 +1228,7 @@ impl GraphicsDevice for Sc7180GraphicsDevice {
         let copy_us = time::current_time().saturating_sub(copy_start);
         #[cfg(debug_assertions)]
         let flip_start = time::current_time();
-        self.present_dma(dpu_dma_address(&self.scanout_dma[back])?)?;
+        self.present_dma(dpu_dma_address(&self.scanout.dma[back])?)?;
         self.gpu_direct.lock().mark_staged();
         #[cfg(debug_assertions)]
         let flip_us = time::current_time().saturating_sub(flip_start);
@@ -1354,27 +1406,13 @@ fn power_panel_path() -> Result<Option<GpioSpecifier>, &'static str> {
     Ok(compatible_gpio("pwm-backlight", "enable-gpios"))
 }
 
-fn allocate_scanout(config: &FramebufferConfig) -> Result<ContiguousPages, &'static str> {
-    let pages = config
-        .size()
+fn allocate_scanout(size: usize) -> Result<ContiguousPages, &'static str> {
+    let pages = size
         .checked_add(PAGE_SIZE - 1)
         .map(|size| size / PAGE_SIZE)
         .ok_or("qcom-sc7180-mdss: scanout size overflow")?;
-    let mut scanout = ContiguousPages::new(pages)
-        .ok_or("qcom-sc7180-mdss: failed to allocate contiguous scanout")?;
-    let last_byte = u64::try_from(config.size().saturating_sub(1))
-        .map_err(|_| "qcom-sc7180-mdss: scanout size exceeds u64")?;
-    let end = scanout
-        .as_paddr()
-        .checked_add(last_byte)
-        .ok_or("qcom-sc7180-mdss: scanout range overflow")?;
-    if end > MAXIMUM_SCANOUT_ADDRESS {
-        return Err("qcom-sc7180-mdss: PMM did not provide a DMA32 scanout");
-    }
-
-    // SAFETY: `scanout` owns `pages` contiguous, CPU-mapped pages and the
-    // write is bounded by that exact allocation.
-    unsafe { ptr::write_bytes(scanout.as_ptr().cast::<u8>(), 0, pages * PAGE_SIZE) };
+    let mut scanout = ContiguousPages::new_below(pages, MAXIMUM_SCANOUT_ADDRESS)
+        .ok_or("qcom-sc7180-mdss: no contiguous DMA32 scanout available")?;
     // `/dev/fb0` and `/dev/display0` expose scanout pages as DeviceBurstable.
     // Keep the kernel direct-map alias at the same attribute, matching the
     // Apple DCP driver and Scarlet's direct-map aliasing contract.
@@ -1486,8 +1524,6 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         format: PixelFormat::BGRA8888,
         stride: u32::from(timing.hactive) * 4,
     };
-    let scanout = [allocate_scanout(&config)?, allocate_scanout(&config)?];
-
     let dma_context = DeviceManager::get_manager().resolve_platform_dma_context(
         device,
         IommuDomainConfig {
@@ -1496,11 +1532,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             iova_size: 0,
         },
     )?;
-    let scanout_dma = [
-        map_scanout(&dma_context, &scanout[0])?,
-        map_scanout(&dma_context, &scanout[1])?,
-    ];
-    let scanout_dma_addr = dpu_dma_address(&scanout_dma[0])?;
+    let scanout = ScanoutBuffers::new(config.size(), &dma_context)?;
+    let scanout_dma_addr = dpu_dma_address(&scanout.dma[0])?;
 
     let mdss_resource = device
         .get_resources()
@@ -1523,8 +1556,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let engine = Sc7180DisplayEngine::new(mdss);
 
     println!("[qcom-sc7180-mdss] phase 3/5: programming DSI PHY, bridge link, and DPU");
-    if scanout[0].memory_attribute() == MemoryAttribute::Normal {
-        arch::clean_dcache_to_poc_range(scanout[0].as_vaddr(), config.size());
+    if scanout.pages[0].memory_attribute() == MemoryAttribute::Normal {
+        arch::clean_dcache_to_poc_range(scanout.pages[0].as_vaddr(), config.size());
     } else {
         arch::io_wmb();
     }
@@ -1557,13 +1590,21 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     let graphics = Arc::new(Sc7180GraphicsDevice {
         mdss_physical_address: mdss_resource.start,
+        monitor_identity: bridge.read_edid().ok().and_then(|edid| scarlet::device::graphics::monitor::MonitorIdentity::from_edid(edid.as_bytes()))
+            .map(|mut identity| {
+                // The soldered-in panel cannot move between connectors. Its
+                // board identity is stable even when EDID has no serial.
+                if !identity.has_serial { identity.key = String::from("builtin:coachz-panel"); identity.has_serial = true; }
+                identity.name = String::from("Built-in display");
+                identity
+            })
+            .or_else(|| Some(scarlet::device::graphics::monitor::MonitorIdentity { key: String::from("builtin:coachz-panel"), name: String::from("Built-in display"), has_serial: true, physical_size_mm: None })),
         external: false,
         active: AtomicBool::new(true),
         config,
         timing,
         ec,
         scanout,
-        scanout_dma,
         dma_context,
         gpu_direct: Mutex::new(GpuDirectScanoutState::new()),
         gpu_staging: Mutex::new(GpuStagingState::new()),
@@ -1598,10 +1639,10 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         graphics.timing.hactive,
         graphics.timing.vactive,
         graphics.timing.pixel_clock_khz,
-        graphics.scanout[0].as_paddr(),
-        graphics.scanout[1].as_paddr(),
-        graphics.scanout_dma[0].dma_addr(),
-        graphics.scanout_dma[1].dma_addr(),
+        graphics.scanout.pages[0].as_paddr(),
+        graphics.scanout.pages[1].as_paddr(),
+        graphics.scanout.dma[0].dma_addr(),
+        graphics.scanout.dma[1].dma_addr(),
         graphics.config.size(),
         u64::from(graphics.timing.pixel_clock_khz) * 1_000_000
             / u64::from(graphics.timing.horizontal_total())

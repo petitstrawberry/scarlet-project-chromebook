@@ -3,12 +3,17 @@
 //! 6.6 cc1a33bf3fcee271d9f66ccd9fbbc7b06eacdabd, msm/dp/dp_{aux,catalog,ctrl}.c.
 //! EC firmware owns Type-C negotiation; this driver only observes its result.
 use super::*;
+use scarlet::device::graphics::output::DisplayMode;
 use scarlet::device::phy::{DisplayPortConfig, PhyHandle, PhyMode, PhyOrientation};
-use scarlet_driver_cros_ec_spi::CrosEcTypecState;
+use scarlet_driver_cros_ec_spi::{CrosEcEventListener, CrosEcTypecState};
 
 const AUX: usize = 0x200;
 const LINK: usize = 0x400;
 const AUX_DONE: u32 = 1 << 3;
+const HPD_EVENTS: u32 = 0x0f;
+const HPD_IRQ: usize = 1 << 1;
+// ec_commands.h: host-event numbers are one-based bit positions.
+const TYPEC_HOST_EVENTS: u64 = (1 << (22 - 1)) | (1 << (28 - 1));
 const AUX_EVENTS: u32 = (1 << 3)
     | (1 << 6)
     | (1 << 9)
@@ -28,6 +33,13 @@ pub(super) struct DpController {
     phy: PhyHandle,
     clocks: Arc<Sc7180DispCc>,
     connected: AtomicBool,
+    modes: IrqSpinLock<Vec<DisplayTiming>>,
+    requested_mode: IrqSpinLock<Option<DisplayMode>>,
+    modesetting: AtomicBool,
+    hpd_events: AtomicUsize,
+    link_lanes: AtomicUsize,
+    link_rate: AtomicUsize,
+    monitor_identity: IrqSpinLock<Option<scarlet::device::graphics::monitor::MonitorIdentity>>,
     aux_powered: AtomicBool,
     link_powered: AtomicBool,
     display: IrqSpinLock<Option<Arc<Sc7180GraphicsDevice>>>,
@@ -39,10 +51,60 @@ pub(super) fn set_primary(display: Arc<Sc7180GraphicsDevice>) {
 pub(super) fn controller() -> Option<Arc<DpController>> {
     CONTROLLER.lock().clone()
 }
+impl CrosEcEventListener for DpController {
+    fn on_cros_ec_event(&self, event_type: u8, data: &[u8]) -> bool {
+        let events = match (event_type, data.len()) {
+            (1, 4) => u64::from(u32::from_le_bytes(data.try_into().unwrap())),
+            (7, 8) => u64::from_le_bytes(data.try_into().unwrap()),
+            _ => return true,
+        };
+        if events & TYPEC_HOST_EVENTS != 0 {
+            // No EC commands or link training in the shared event callback.
+            WORKER_WAKER.wake_one();
+        }
+        true
+    }
+}
 impl DpController {
+    fn mode(t: DisplayTiming) -> DisplayMode {
+        DisplayMode { width: u32::from(t.hactive), height: u32::from(t.vactive),
+            refresh_millihz: (u64::from(t.pixel_clock_khz) * 1_000_000 / u64::from(t.horizontal_total()) / u64::from(t.vertical_total())) as u32 }
+    }
+    pub(super) fn modes(&self) -> Vec<DisplayMode> {
+        if !self.connected() { return Vec::new(); }
+        let mut modes = Vec::new();
+        for timing in self.modes.lock().iter() {
+            let mode = Self::mode(*timing);
+            if !modes.contains(&mode) { modes.push(mode); }
+        }
+        modes
+    }
+    pub(super) fn request_mode(&self, mode: DisplayMode) -> Result<(), &'static str> {
+        if !self.modes().contains(&mode) { return Err("DP: unsupported mode"); }
+        self.modesetting.store(true, Ordering::Release);
+        *self.requested_mode.lock() = Some(mode);
+        WORKER_WAKER.wake_one();
+        Ok(())
+    }
+    pub(super) fn claim_hpd_interrupt(&self) -> bool {
+        let _interrupt = MDSS_INTERRUPT_LOCK.lock();
+        if !self.aux_powered.load(Ordering::Acquire) { return false; }
+        let status = self.registers.read(AUX + 4) & HPD_EVENTS;
+        let pending = status & self.registers.read(AUX + 0x0c);
+        if pending == 0 { return false; }
+        self.registers.write(AUX + 8, status);
+        self.hpd_events.fetch_or(pending as usize, Ordering::Release);
+        WORKER_WAKER.wake_one();
+        true
+    }
     pub(super) fn display(&self) -> Option<Arc<Sc7180GraphicsDevice>> {
         self.display.lock().clone()
     }
+    pub(super) fn monitor_identity(&self) -> Option<scarlet::device::graphics::monitor::MonitorIdentity> {
+        if !self.available() { return None; }
+        self.monitor_identity.lock().clone()
+    }
+    pub(super) fn available(&self) -> bool { self.connected() || self.modesetting.load(Ordering::Acquire) }
     pub(super) fn connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
     }
@@ -168,6 +230,7 @@ impl DpController {
         if bytes[..8] != [0, 255, 255, 255, 255, 255, 255, 0] {
             return Err("DP: invalid EDID header");
         }
+        *self.monitor_identity.lock() = scarlet::device::graphics::monitor::MonitorIdentity::from_edid(&bytes);
         let mut modes = Vec::new();
         for descriptor in bytes[54..126].chunks_exact(18) {
             if let Ok(mode) = DisplayTiming::from_edid_descriptor(descriptor) {
@@ -364,11 +427,10 @@ impl DpController {
             .set_mode(PhyMode::DisplayPort)
             .map_err(|_| "DP: invalid PHY mode")?;
         self.phy
-            .set_orientation(if port.reverse {
-                PhyOrientation::Reverse
-            } else {
-                PhyOrientation::Normal
-            })
+            // CoachZ's EC-controlled PS8751 muxes normalize cable orientation
+            // before the shared AP DP PHY. Reversing the AP lanes a second time
+            // sends DP onto the USB lane pair (ChromeOS keeps this PHY normal).
+            .set_orientation(PhyOrientation::Normal)
             .map_err(|_| "DP: PHY orientation is busy")?;
         self.phy
             .configure_displayport(DisplayPortConfig {
@@ -391,10 +453,15 @@ impl DpController {
         self.registers.write(AUX + 0x30, 1);
         self.registers.write(AUX + 0x3c, 0xffff);
         self.registers.write(AUX + 0x40, 0xffff);
+        {
+            let _interrupt = MDSS_INTERRUPT_LOCK.lock();
+            self.registers.write(AUX + 8, HPD_EVENTS);
+            self.registers.write(AUX + 0x0c, HPD_EVENTS);
+        }
         Ok(())
     }
-    fn connect(&self, port: CrosEcTypecState) -> Result<(), &'static str> {
-        self.enable_aux(port)?;
+    fn connect(&self, port: CrosEcTypecState, requested: Option<DisplayMode>) -> Result<(), &'static str> {
+        if !self.aux_powered.load(Ordering::Acquire) { self.enable_aux(port)?; }
         let start = time::current_time();
         while self.registers.read(AUX + 4) & 0x40000000 == 0 {
             if time::current_time().saturating_sub(start) > 2_000_000 {
@@ -428,80 +495,28 @@ impl DpController {
         }
         let modes = self.edid()?;
         let lanes = (caps[2] & 31).min(2);
-        let max_rate = u32::from(caps[1]) * 270;
-        let retained = self.display();
-        let timing = if let Some(display) = &retained {
-            modes
-                .iter()
-                .copied()
-                .find(|t| {
-                    t.hactive == display.timing.hactive
-                        && t.vactive == display.timing.vactive
-                        && t.pixel_clock_khz == display.timing.pixel_clock_khz
-                })
-                .ok_or("DP: replacement monitor does not support the active scanout mode")?
-        } else {
-            modes
-                .iter()
-                .copied()
-                .find(|t| {
-                    u64::from(t.pixel_clock_khz) * 24
-                        <= u64::from(max_rate.min(5400)) * u64::from(lanes) * 800
-                        && t.hactive <= 2560
-                        && t.vactive <= 2160
-                })
-                .ok_or("DP: no supported progressive EDID mode within link bandwidth")?
-        };
+        let max_rate = (u32::from(caps[1]) * 270).min(5400);
+        // One DPU mixer supports at most 2560 pixels. Only expose modes that
+        // fit this pipeline and its two-lane DP link, including blanking.
+        let modes: Vec<_> = modes.into_iter().filter(|t| {
+            t.hactive <= 2560 && t.vactive <= 2160
+                && u64::from(t.pixel_clock_khz) * 24 <= u64::from(max_rate) * u64::from(lanes) * 800
+        }).collect();
+        *self.modes.lock() = modes.clone();
+        let candidates: Vec<_> = modes.into_iter().filter(|t| requested.is_none_or(|mode| Self::mode(*t) == mode)).collect();
         let mut chosen = None;
-        for rate in [5400, 2700, 1620] {
-            if rate > max_rate
-                || u64::from(timing.pixel_clock_khz) * 24 > u64::from(rate) * u64::from(lanes) * 800
-            {
-                continue;
-            }
-            match self.train(
-                rate,
-                lanes,
-                caps[2] & 0x80 != 0,
-                caps[2] & 0x40 != 0,
-                caps[14],
-                timing.pixel_clock_khz,
-            ) {
-                Ok(()) => {
-                    chosen = Some(rate);
-                    break;
+        'modes: for timing in candidates {
+            for rate in [5400, 2700, 1620] {
+                if rate > max_rate || u64::from(timing.pixel_clock_khz) * 24 > u64::from(rate) * u64::from(lanes) * 800 { continue; }
+                match self.train(rate, lanes, caps[2] & 0x80 != 0, caps[2] & 0x40 != 0, caps[14], timing.pixel_clock_khz) {
+                    Ok(()) => { chosen = Some((timing, rate)); break 'modes; }
+                    Err(error) => println!("[sc7180-dp] mode={}x{} rate={} lanes={} {}", timing.hactive, timing.vactive, rate, lanes, error),
                 }
-                Err(error) => println!("[sc7180-dp] rate={} lanes={} {}", rate, lanes, error),
             }
         }
-        let rate = chosen.ok_or("DP: no link rate trained successfully")?;
-        let display = match retained {
-            Some(display) => display,
-            None => self.make_display(timing)?,
-        };
-        self.configure_stream(timing, rate, lanes)?;
-        {
-            let _present = display.present_lock.lock();
-            display.engine.dpu.configure(
-                timing,
-                dpu_dma_address(&display.scanout_dma[display.front.load(Ordering::Acquire)])?,
-            )?;
-            display.engine.dpu.start();
-            display.gpu_direct.lock().mark_staged();
-            display.gpu_staging.lock().reset();
-            display.active.store(true, Ordering::Release);
-        }
-        self.registers.write(LINK + 4, 0x80);
-        let start = time::current_time();
-        while self.registers.read(LINK + 0x40) & 1 == 0 {
-            if time::current_time().saturating_sub(start) > 50_000 {
-                display.active.store(false, Ordering::Release);
-                display.engine.dpu.stop();
-                time::udelay(20_000);
-                return Err("DP: video stream not ready");
-            }
-            time::udelay(100);
-        }
+        let (timing, rate) = chosen.ok_or("DP: no supported mode trained successfully")?;
+        let display = self.make_display(timing, true)?;
+        self.start_stream(&display, rate, lanes)?;
         println!(
             "[sc7180-dp] port={} reverse={} sink={:02x} link={}x{} mode={}x{} clock={}kHz",
             port.port,
@@ -533,10 +548,88 @@ impl DpController {
             status_result
         );
         *self.display.lock() = Some(display);
+        self.link_rate.store(rate as usize, Ordering::Release);
+        self.link_lanes.store(usize::from(lanes), Ordering::Release);
         self.connected.store(true, Ordering::Release);
         Ok(())
     }
+    fn start_stream(&self, display: &Sc7180GraphicsDevice, rate: u32, lanes: u8) -> Result<(), &'static str> {
+        let timing = display.timing;
+        self.configure_stream(timing, rate, lanes)?;
+        {
+            let _present = display.present_lock.lock();
+            display.engine.dpu.configure(
+                timing,
+                dpu_dma_address(&display.scanout.dma[display.front.load(Ordering::Acquire)])?,
+            )?;
+            display.engine.dpu.start();
+            display.gpu_direct.lock().mark_staged();
+            display.gpu_staging.lock().reset();
+            display.active.store(true, Ordering::Release);
+        }
+        self.registers.write(LINK + 4, 0x80);
+        let start = time::current_time();
+        while self.registers.read(LINK + 0x40) & 1 == 0 {
+            if time::current_time().saturating_sub(start) > 50_000 {
+                display.active.store(false, Ordering::Release);
+                display.engine.dpu.stop();
+                time::udelay(20_000);
+                return Err("DP: video stream not ready");
+            }
+            time::udelay(100);
+        }
+        Ok(())
+    }
+
+    fn switch_stream(&self, next: Arc<Sc7180GraphicsDevice>) -> Result<(), &'static str> {
+        let old = self.display().ok_or("DP: missing active stream")?;
+        let timing = next.timing;
+        let rate = self.link_rate.load(Ordering::Acquire) as u32;
+        let lanes = self.link_lanes.load(Ordering::Acquire) as u8;
+        if !self.connected() || u64::from(timing.pixel_clock_khz) * 24 > u64::from(rate) * u64::from(lanes) * 800 {
+            return Err("DP: current link cannot carry selected mode");
+        }
+        {
+            let _present = old.present_lock.lock();
+            // Stop sending pixels but retain the trained link, HPD and AUX.
+            self.registers.write(0x24, 1 << 4); // acknowledge any previous idle pattern
+            self.registers.write(LINK + 4, 0x100); // PUSH_IDLE
+            let start = time::current_time();
+            while self.registers.read(0x24) & (1 << 3) == 0 {
+                if time::current_time().saturating_sub(start) >= 50_000 {
+                    return Err("DP: timeout waiting for idle pattern");
+                }
+                time::udelay(100);
+            }
+            self.registers.write(0x24, 1 << 4);
+            if Arc::ptr_eq(&old.scanout, &next.scanout) {
+                next.front.store(old.front.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            let _interrupt = MDSS_INTERRUPT_LOCK.lock();
+            old.active.store(false, Ordering::Release);
+            old.engine.dpu.mask_vsync_interrupt();
+            old.engine.dpu.clear_vsync_interrupt();
+            old.engine.dpu.stop();
+        }
+        time::udelay(20_000);
+        self.registers.write(LINK + 4, 0);
+        self.clocks.enable_dp_link(rate, timing.pixel_clock_khz)?;
+        self.start_stream(&next, rate, lanes)?;
+        println!(
+            "[sc7180-dp] stream resized to {}x{} at {} mHz",
+            timing.hactive, timing.vactive, Self::mode(timing).refresh_millihz,
+        );
+        *self.display.lock() = Some(next);
+        Ok(())
+    }
     fn disconnect(&self) {
+        {
+            let _interrupt = MDSS_INTERRUPT_LOCK.lock();
+            if self.aux_powered.load(Ordering::Acquire) {
+                self.registers.write(AUX + 0x0c, 0);
+                self.registers.write(AUX + 8, HPD_EVENTS);
+            }
+        }
         self.connected.store(false, Ordering::Release);
         // A failed AUX-only probe has no running pixel/link clock. Touching
         // the retained DPU interface in that state can stall the MMIO bus.
@@ -557,7 +650,11 @@ impl DpController {
             self.registers.update(LINK, 1, 0);
             self.reset_controller();
         }
-        if self.aux_powered.swap(false, Ordering::AcqRel) {
+        let aux_powered = {
+            let _interrupt = MDSS_INTERRUPT_LOCK.lock();
+            self.aux_powered.swap(false, Ordering::AcqRel)
+        };
+        if aux_powered {
             self.registers.write(AUX + 0x30, 0);
             self.clocks.disable_dp();
         }
@@ -566,6 +663,7 @@ impl DpController {
     fn make_display(
         &self,
         timing: DisplayTiming,
+        reserve_modes: bool,
     ) -> Result<Arc<Sc7180GraphicsDevice>, &'static str> {
         let config = FramebufferConfig {
             width: u32::from(timing.hactive),
@@ -573,19 +671,38 @@ impl DpController {
             format: PixelFormat::BGRA8888,
             stride: u32::from(timing.hactive) * 4,
         };
-        let scanout = [allocate_scanout(&config)?, allocate_scanout(&config)?];
         let dma_context = self.parent.dma_context.clone();
-        let scanout_dma = [
-            map_scanout(&dma_context, &scanout[0])?,
-            map_scanout(&dma_context, &scanout[1])?,
-        ];
+        let current = self.display().map(|display| display.scanout.clone());
+        let needed = config.size();
+        let preferred = if reserve_modes {
+            self.modes.lock().iter()
+                .map(|mode| usize::from(mode.hactive) * usize::from(mode.vactive) * 4)
+                .max().unwrap_or(needed)
+        } else {
+            needed
+        };
+        let scanout = match current.as_ref().filter(|buffers| buffers.capacity() >= preferred) {
+            Some(buffers) => buffers.clone(),
+            None => match ScanoutBuffers::new(preferred, &dma_context) {
+                Ok(buffers) => buffers,
+                Err(error) if preferred > needed => {
+                    // A smaller current mode can still run if the optional
+                    // reservation for larger advertised modes fails.
+                    match current.filter(|buffers| buffers.capacity() >= needed) {
+                        Some(buffers) => buffers,
+                        None => ScanoutBuffers::new(needed, &dma_context).map_err(|_| error)?,
+                    }
+                }
+                Err(error) => return Err(error),
+            },
+        };
         Ok(Arc::new(Sc7180GraphicsDevice {
             mdss_physical_address: self.parent.mdss_physical_address,
+            monitor_identity: self.monitor_identity.lock().clone(),
             config,
             timing,
             ec: self.parent.ec.clone(),
             scanout,
-            scanout_dma,
             dma_context,
             gpu_direct: Mutex::new(GpuDirectScanoutState::new()),
             gpu_staging: Mutex::new(GpuStagingState::new()),
@@ -703,58 +820,97 @@ fn transfer_unit(
 }
 
 fn worker() {
-    let Some(dp) = controller() else {
-        return;
-    };
+    let Some(dp) = controller() else { return; };
     let mut previous = None;
-    let mut retry_at = 0;
+    let mut ports = None;
     loop {
-        let mut active = None;
-        let mut complete = true;
-        match dp.parent.ec.typec_port_count() {
-            Ok(ports) => {
-                for port in 0..ports {
-                    match dp.parent.ec.typec_state(port) {
-                        Ok(state) => {
-                            if state.displayport_enabled && !state.safe_mode {
-                                active = Some(state);
-                            }
-                        }
-                        Err(_) => complete = false,
-                    }
+        // Startup, a Type-C/HPD event, or a failed-operation retry. Stable
+        // connections and unattached ports have no timer and issue no SPI IO.
+        let result = (|| -> Result<(), &'static str> {
+            let count = match ports {
+                Some(count) => count,
+                None => {
+                    let count = dp.parent.ec.typec_port_count().map_err(|_| "DP: EC port query failed")?;
+                    ports = Some(count);
+                    count
                 }
+            };
+            let mut active = None;
+            for port in 0..count {
+                let state = dp.parent.ec.typec_state(port).map_err(|_| "DP: EC mux query failed")?;
+                if state.displayport_enabled && !state.safe_mode { active = Some(state); }
             }
-            Err(_) => complete = false,
-        }
-        if complete {
             let identity = active.map(|state| (state.port, state.reverse));
             if identity != previous {
                 println!("[sc7180-dp] Type-C {:?}", active);
-                if previous.is_some() || dp.connected() {
-                    dp.disconnect();
-                }
-                previous = identity;
-                retry_at = 0;
-            }
-            if dp.connected() && dp.registers.read(AUX + 4) & 0xe0000000 != 0x40000000 {
-                println!("[sc7180-dp] monitor HPD disconnected");
                 dp.disconnect();
-                retry_at = 0;
+                previous = identity;
             }
-            if let Some(port) = active {
-                if !dp.connected() && time::current_time_ns() >= retry_at {
-                    if let Err(error) = dp.connect(port) {
-                        println!("[sc7180-dp] {}", error);
+            let events = dp.hpd_events.swap(0, Ordering::AcqRel);
+            let Some(port) = active else {
+                dp.requested_mode.lock().take();
+                dp.modesetting.store(false, Ordering::Release);
+                return Ok(());
+            };
+            if !dp.aux_powered.load(Ordering::Acquire) { dp.enable_aux(port)?; }
+            let hpd = dp.registers.read(AUX + 4) & 0xe0000000;
+            if hpd != 0x40000000 {
+                dp.requested_mode.lock().take();
+                dp.modesetting.store(false, Ordering::Release);
+                if dp.connected() {
+                    println!("[sc7180-dp] monitor HPD disconnected");
+                    dp.disconnect();
+                    // The dock remains attached. Keep HPD detection powered
+                    // so plugging its monitor back in can generate an IRQ.
+                    dp.enable_aux(port)?;
+                }
+                return Ok(());
+            }
+            if dp.connected() && events & HPD_IRQ != 0 {
+                let mut status = [0; 6];
+                dp.read_dpcd(0x202, &mut status)?;
+                let healthy = status[2] & 1 != 0 && (0..dp.link_lanes.load(Ordering::Acquire))
+                    .all(|lane| DpController::lane_status(&status, lane) & 7 == 7);
+                if !healthy { dp.disconnect(); }
+            }
+            let requested = dp.requested_mode.lock().take();
+            if let Some(mode) = requested {
+                let previous_mode = dp.display().map(|display| DpController::mode(display.timing));
+                if previous_mode != Some(mode) {
+                    let timing = dp.modes.lock().iter().copied().find(|t| DpController::mode(*t) == mode);
+                    let next = timing.ok_or("DP: requested timing disappeared")
+                        .and_then(|timing| dp.make_display(timing, false));
+                    let next = match next {
+                        Ok(display) => display,
+                        Err(error) => {
+                            println!("[sc7180-dp] keeping active mode: {}", error);
+                            dp.modesetting.store(false, Ordering::Release);
+                            return Ok(());
+                        }
+                    };
+                    if let Err(error) = dp.switch_stream(next) {
+                        println!("[sc7180-dp] stream switch failed: {}; retraining", error);
                         dp.disconnect();
-                        retry_at = time::current_time_ns() + 5_000_000_000;
+                        if let Err(error) = dp.connect(port, Some(mode)) {
+                            println!("[sc7180-dp] modeset failed: {}; restoring previous mode", error);
+                            dp.disconnect();
+                            dp.connect(port, previous_mode)?;
+                        }
                     }
                 }
-            }
-        }
-        let Some(task) = scarlet::task::mytask() else {
-            scarlet::arch::instruction::idle();
-        };
-        WORKER_WAKER.wait_with_timeout(task.get_id(), task.get_trapframe(), Some(500_000_000));
+            } else if !dp.connected() { dp.connect(port, None)?; }
+            dp.modesetting.store(false, Ordering::Release);
+            Ok(())
+        })();
+        let retry = if let Err(error) = result {
+            println!("[sc7180-dp] {}", error);
+            dp.modesetting.store(false, Ordering::Release);
+            dp.disconnect();
+            Some(5_000_000_000)
+        } else { None };
+        let Some(task) = scarlet::task::mytask() else { scarlet::arch::instruction::idle(); };
+        // Waker latches notifications that arrive before queue insertion.
+        WORKER_WAKER.wait_with_timeout(task.get_id(), task.get_trapframe(), retry);
     }
 }
 
@@ -780,16 +936,26 @@ fn probe(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find(|r| r.res_type == PlatformDeviceResourceType::MEM)
         .ok_or("DP: missing MMIO")?;
     let base = vm::ioremap(memory.start, 0x1800).map_err(|_| "DP: MMIO mapping failed")?;
-    *CONTROLLER.lock() = Some(Arc::new(DpController {
+    let dp = Arc::new(DpController {
         registers: RegisterWindow::new(base),
         parent,
         phy,
         clocks,
         connected: AtomicBool::new(false),
+        modes: IrqSpinLock::new(Vec::new()),
+        requested_mode: IrqSpinLock::new(None),
+        modesetting: AtomicBool::new(false),
+        hpd_events: AtomicUsize::new(0),
+        link_lanes: AtomicUsize::new(0),
+        link_rate: AtomicUsize::new(0),
+        monitor_identity: IrqSpinLock::new(None),
         aux_powered: AtomicBool::new(false),
         link_powered: AtomicBool::new(false),
         display: IrqSpinLock::new(None),
-    }));
+    });
+    *CONTROLLER.lock() = Some(dp.clone());
+    let listener: Arc<dyn CrosEcEventListener> = dp.clone();
+    dp.parent.ec.register_event_listener(Arc::downgrade(&listener));
     let task = scarlet::task::new_kernel_task("sc7180-dp-hotplug".into(), 1, worker);
     task.init();
     scarlet::sched::scheduler::add_task(task, arch::get_cpu().get_cpuid());
