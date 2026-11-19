@@ -139,7 +139,7 @@ package; no sibling Scarlet checkout is required. The project-owned Adreno
 driver bundle is built from this checkout so its userspace and kernel
 dependencies stay aligned. The kernel, standard bundles, and driver dependencies
 use the Scarlet revision recorded in `projects/aarch64-coachz-limine/scarlet.toml`
-and `scarlet.lock`. This tracks Scarlet `dev` at `9d7268d333cae6e524549ce7c7298acc07ebda35`;
+and `scarlet.lock`. This tracks Scarlet `dev` at `d22c1a6b912ce76081ed4c63f88f7b62f103c9b2`;
 Android is excluded from `experimental` and remains an explicit opt-in bundle.
 The SDK and Rust toolchain are pinned in `flake.lock`. The Adreno backend uses the bundled SGFX revision
 `61e5ddd0f0e31309d2468ace3c4afe67d949fa72`. Release builds disable `sync-debug`,
@@ -261,7 +261,7 @@ cargo scarlet image --project projects/aarch64-coachz-limine --release
 ```
 
 The kernel, standard bundles and board drivers use Scarlet
-`9d7268d333cae6e524549ce7c7298acc07ebda35`.
+`d22c1a6b912ce76081ed4c63f88f7b62f103c9b2`.
 The standard bundles provide their pinned
 SGFX, native Vulkan and ScarletUI dependencies; the project's SGFX dependency
 matches the bundle's `61e5ddd0f0e31309d2468ace3c4afe67d949fa72` revision.

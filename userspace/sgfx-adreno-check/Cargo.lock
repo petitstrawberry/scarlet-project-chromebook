@@ -19,7 +19,7 @@ source = "git+https://github.com/petitstrawberry/Scarlet?rev=9531dfe3ad00856095b
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35#9d7268d333cae6e524549ce7c7298acc07ebda35"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2#d22c1a6b912ce76081ed4c63f88f7b62f103c9b2"
 
 [[package]]
 name = "scarlet-os"
@@ -33,10 +33,10 @@ dependencies = [
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35#9d7268d333cae6e524549ce7c7298acc07ebda35"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2#d22c1a6b912ce76081ed4c63f88f7b62f103c9b2"
 dependencies = [
- "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35)",
- "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35)",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2)",
+ "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2)",
 ]
 
 [[package]]
@@ -50,18 +50,18 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35#9d7268d333cae6e524549ce7c7298acc07ebda35"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2#d22c1a6b912ce76081ed4c63f88f7b62f103c9b2"
 dependencies = [
- "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35)",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2)",
 ]
 
 [[package]]
 name = "scarlet-video-client"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35#9d7268d333cae6e524549ce7c7298acc07ebda35"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2#d22c1a6b912ce76081ed4c63f88f7b62f103c9b2"
 dependencies = [
- "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35)",
- "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=9d7268d333cae6e524549ce7c7298acc07ebda35)",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2)",
+ "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d22c1a6b912ce76081ed4c63f88f7b62f103c9b2)",
 ]
 
 [[package]]
