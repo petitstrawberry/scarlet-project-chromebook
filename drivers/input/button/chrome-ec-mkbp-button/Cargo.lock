@@ -266,7 +266,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=5a502473899c8f74490ca174c85988bad67d2b2c#5a502473899c8f74490ca174c85988bad67d2b2c"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=fbaacb832f38729f8a8210bbcd1b2c25dad45b99#fbaacb832f38729f8a8210bbcd1b2c25dad45b99"
 dependencies = [
  "aes",
  "ccm",
@@ -284,7 +284,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=5a502473899c8f74490ca174c85988bad67d2b2c#5a502473899c8f74490ca174c85988bad67d2b2c"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=fbaacb832f38729f8a8210bbcd1b2c25dad45b99#fbaacb832f38729f8a8210bbcd1b2c25dad45b99"
 
 [[package]]
 name = "scarlet-driver-chrome-ec-mkbp-button"

@@ -8,4 +8,4 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-scarlet-abi = { git = "https://github.com/petitstrawberry/Scarlet", rev = "2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2" }
+scarlet-abi = { git = "https://github.com/petitstrawberry/Scarlet", rev = "fbaacb832f38729f8a8210bbcd1b2c25dad45b99" }

@@ -298,7 +298,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=703d6fe57e11561b3d06bdd97e11eea520878fb1#703d6fe57e11561b3d06bdd97e11eea520878fb1"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=fbaacb832f38729f8a8210bbcd1b2c25dad45b99#fbaacb832f38729f8a8210bbcd1b2c25dad45b99"
 dependencies = [
  "aes",
  "ccm",
@@ -317,7 +317,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=703d6fe57e11561b3d06bdd97e11eea520878fb1#703d6fe57e11561b3d06bdd97e11eea520878fb1"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=fbaacb832f38729f8a8210bbcd1b2c25dad45b99#fbaacb832f38729f8a8210bbcd1b2c25dad45b99"
 
 [[package]]
 name = "scarlet-driver-chrome-ec-mkbp-button"
@@ -747,6 +747,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "zeroize"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"

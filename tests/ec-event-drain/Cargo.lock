@@ -12,4 +12,4 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=2c81d4ce2ab5ddf03d872baf2f57bfc77e54c211#2c81d4ce2ab5ddf03d872baf2f57bfc77e54c211"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=fbaacb832f38729f8a8210bbcd1b2c25dad45b99#fbaacb832f38729f8a8210bbcd1b2c25dad45b99"
