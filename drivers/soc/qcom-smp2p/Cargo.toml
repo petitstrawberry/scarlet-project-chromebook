@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
 [dependencies]
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "fbaacb832f38729f8a8210bbcd1b2c25dad45b99", default-features = false }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "9d7268d333cae6e524549ce7c7298acc07ebda35", default-features = false }
 qcom-smem = { package = "scarlet-driver-qcom-smem", path = "../qcom-smem" }
